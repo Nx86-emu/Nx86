@@ -11,6 +11,8 @@ pub struct SyntheticArm64Test {
     pub program: SyntheticProgram,
     #[serde(default)]
     pub expected: ExpectedState,
+    #[serde(default)]
+    pub framebuffer: Option<FramebufferSpec>,
 }
 
 impl SyntheticArm64Test {
@@ -113,6 +115,56 @@ impl ExpectedMemoryRange {
     }
 }
 
+/// A guest framebuffer region the synthetic program is expected to draw into.
+///
+/// Pixels are 32-bit little-endian RGBA words: storing `0xAABBGGRR` writes the
+/// bytes `RR GG BB AA`, which display as red `RR`, green `GG`, blue `BB`, alpha
+/// `AA`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct FramebufferSpec {
+    pub base: String,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub format: FramebufferFormat,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FramebufferFormat {
+    #[default]
+    Rgba8,
+}
+
+impl FramebufferSpec {
+    pub fn base_u64(&self) -> Result<u64, SyntheticTestError> {
+        parse_u64(&self.base).map_err(|value| SyntheticTestError::InvalidMemoryAddress { value })
+    }
+
+    /// Length of the framebuffer in bytes (4 bytes per RGBA8 pixel).
+    #[must_use]
+    pub const fn byte_len(&self) -> usize {
+        (self.width as usize) * (self.height as usize) * 4
+    }
+}
+
+/// A rendered framebuffer produced by running a synthetic test.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Framebuffer {
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// A mismatch between an expected memory range and what a run produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryDiff {
+    pub address: u64,
+    pub expected: Vec<u8>,
+    pub actual: Vec<u8>,
+}
+
 #[derive(Debug, Error)]
 pub enum SyntheticTestError {
     #[error("failed to read synthetic test {path}: {source}")]
@@ -211,6 +263,46 @@ mod tests {
                 .expect("address should parse"),
             0x1000
         );
+    }
+
+    #[test]
+    fn synthetic_test_parses_framebuffer_section() {
+        let source = r#"
+            [metadata]
+            name = "draw"
+
+            [program]
+            arm64-hex = ""
+
+            [framebuffer]
+            base = "0x10000"
+            width = 4
+            height = 2
+        "#;
+
+        let test = SyntheticArm64Test::parse(source).expect("test should parse");
+        let framebuffer = test.framebuffer.expect("framebuffer should be present");
+
+        assert_eq!(framebuffer.base_u64().expect("base should parse"), 0x10000);
+        assert_eq!(framebuffer.width, 4);
+        assert_eq!(framebuffer.height, 2);
+        assert_eq!(framebuffer.byte_len(), 4 * 2 * 4);
+        assert_eq!(framebuffer.format, super::FramebufferFormat::Rgba8);
+    }
+
+    #[test]
+    fn synthetic_test_without_framebuffer_defaults_to_none() {
+        let source = r#"
+            [metadata]
+            name = "no-fb"
+
+            [program]
+            arm64-hex = ""
+        "#;
+
+        let test = SyntheticArm64Test::parse(source).expect("test should parse");
+
+        assert!(test.framebuffer.is_none());
     }
 
     #[test]

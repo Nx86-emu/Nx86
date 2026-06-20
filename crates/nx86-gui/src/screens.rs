@@ -80,6 +80,12 @@ pub struct TestUiState {
     pub run_status: Option<String>,
     pub register_diffs: Vec<String>,
     pub memory_dumps: Vec<String>,
+    /// Rendered framebuffer pixels `(width, height, rgba8 bytes)` from the last
+    /// run, if the loaded test declared a `[framebuffer]`.
+    pub framebuffer: Option<(u32, u32, Vec<u8>)>,
+    /// Cached GPU texture for [`Self::framebuffer`]; rebuilt when the pixels
+    /// change (cleared by the analysis step).
+    pub framebuffer_texture: Option<egui::TextureHandle>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,7 +309,7 @@ pub fn compile(ui: &mut egui::Ui, state: &mut CompileUiState) -> CompileAction {
 }
 
 pub fn tests(ui: &mut egui::Ui, state: &mut TestUiState) -> TestAction {
-    screen_header(ui, "Synthetic ARM64 Tests", "Phases 6-10");
+    screen_header(ui, "Synthetic ARM64 Tests", "Phases 6-11");
     let mut action = TestAction::None;
 
     ui.horizontal(|ui| {
@@ -369,6 +375,28 @@ pub fn tests(ui: &mut egui::Ui, state: &mut TestUiState) -> TestAction {
             ui.strong("VMM memory dumps");
             for dump in &state.memory_dumps {
                 ui.monospace(dump);
+            }
+        }
+
+        if let Some((width, height, bytes)) = &state.framebuffer {
+            ui.add_space(10.0);
+            ui.strong("Framebuffer");
+            ui.monospace(format!("{width}x{height} RGBA8"));
+            if state.framebuffer_texture.is_none() && !bytes.is_empty() {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [*width as usize, *height as usize],
+                    bytes,
+                );
+                state.framebuffer_texture = Some(ui.ctx().load_texture(
+                    "nx86-framebuffer",
+                    image,
+                    egui::TextureOptions::NEAREST,
+                ));
+            }
+            if let Some(texture) = &state.framebuffer_texture {
+                let scale = 24.0;
+                let size = egui::vec2(*width as f32 * scale, *height as f32 * scale);
+                ui.image(egui::load::SizedTexture::new(texture.id(), size));
             }
         }
 

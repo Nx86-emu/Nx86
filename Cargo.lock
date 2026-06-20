@@ -1700,6 +1700,7 @@ dependencies = [
  "nx86-arm64-decode",
  "nx86-core",
  "nx86-testsuite",
+ "nx86-vmm",
  "thiserror 2.0.18",
 ]
 

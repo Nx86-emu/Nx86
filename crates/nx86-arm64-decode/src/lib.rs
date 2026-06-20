@@ -68,16 +68,40 @@ pub enum InstructionClass {
     DataProcessingImmediate,
     Branch,
     Exception,
+    LoadStore,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum InstructionKind {
-    MovZ { rd: u8, imm: u64, shift: u8 },
-    AddImmediate { rd: u8, rn: u8, imm: u64 },
-    SubImmediate { rd: u8, rn: u8, imm: u64 },
-    Branch { offset: i64, target: u64 },
-    Svc { imm: u16 },
+    MovZ {
+        rd: u8,
+        imm: u64,
+        shift: u8,
+    },
+    AddImmediate {
+        rd: u8,
+        rn: u8,
+        imm: u64,
+    },
+    SubImmediate {
+        rd: u8,
+        rn: u8,
+        imm: u64,
+    },
+    Branch {
+        offset: i64,
+        target: u64,
+    },
+    Svc {
+        imm: u16,
+    },
+    /// `STR Wt, [Xn, #offset]` — store the low 32 bits of `rt` at `rn + offset`.
+    StoreWord {
+        rt: u8,
+        rn: u8,
+        offset: u64,
+    },
 }
 
 impl InstructionKind {
@@ -89,6 +113,7 @@ impl InstructionKind {
             }
             Self::Branch { .. } => InstructionClass::Branch,
             Self::Svc { .. } => InstructionClass::Exception,
+            Self::StoreWord { .. } => InstructionClass::LoadStore,
         }
     }
 
@@ -109,6 +134,9 @@ impl InstructionKind {
             }
             Self::Branch { target, .. } => format!("b {target:#x}"),
             Self::Svc { imm } => format!("svc #{imm:#x}"),
+            Self::StoreWord { rt, rn, offset } => {
+                format!("str w{rt}, [{}, #{offset:#x}]", gp_or_sp(*rn))
+            }
         }
     }
 }
@@ -152,6 +180,14 @@ fn decode_kind(word: u32, address: u64) -> Result<InstructionKind, DecodeError> 
         return Ok(InstructionKind::Svc {
             imm: bits(word, 5, 16) as u16,
         });
+    }
+
+    // STR (immediate, unsigned offset), 32-bit variant: size=10, V=0, opc=00.
+    if (word & 0xFFC0_0000) == 0xB900_0000 {
+        let rt = bits(word, 0, 5) as u8;
+        let rn = bits(word, 5, 5) as u8;
+        let offset = u64::from(bits(word, 10, 12)) << 2;
+        return Ok(InstructionKind::StoreWord { rt, rn, offset });
     }
 
     Err(DecodeError::UnsupportedInstruction { address, word })
@@ -252,6 +288,33 @@ mod tests {
         assert_eq!(decoded[4].class, InstructionClass::Exception);
         assert_eq!(decoded[0].raw_bytes, [0x20, 0x00, 0x80, 0xD2]);
         assert_eq!(decoded[0].disassembly, "mov x0, #0x1");
+    }
+
+    #[test]
+    fn decodes_str_word_unsigned_offset() {
+        // str w0, [x1, #0]
+        let decoded = decode_program(&[0x20, 0x00, 0x00, 0xB9], 0x2000).expect("str should decode");
+        assert_eq!(
+            decoded[0].kind,
+            InstructionKind::StoreWord {
+                rt: 0,
+                rn: 1,
+                offset: 0
+            }
+        );
+        assert_eq!(decoded[0].class, InstructionClass::LoadStore);
+        assert_eq!(decoded[0].disassembly, "str w0, [x1, #0x0]");
+
+        // str w2, [x3, #4]
+        let decoded = decode_program(&[0x62, 0x04, 0x00, 0xB9], 0).expect("str should decode");
+        assert_eq!(
+            decoded[0].kind,
+            InstructionKind::StoreWord {
+                rt: 2,
+                rn: 3,
+                offset: 4
+            }
+        );
     }
 
     #[test]

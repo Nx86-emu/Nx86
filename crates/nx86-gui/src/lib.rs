@@ -497,6 +497,8 @@ impl Nx86App {
         self.test_ui.run_status = None;
         self.test_ui.register_diffs.clear();
         self.test_ui.memory_dumps.clear();
+        self.test_ui.framebuffer = None;
+        self.test_ui.framebuffer_texture = None;
 
         match test.entry_point() {
             Ok(entry) => match decode_program(&test.program.bytes, entry) {
@@ -540,6 +542,9 @@ impl Nx86App {
                         )
                     })
                     .collect();
+                self.test_ui.framebuffer = result
+                    .framebuffer
+                    .map(|framebuffer| (framebuffer.width, framebuffer.height, framebuffer.bytes));
             }
             Err(error) => {
                 self.test_ui.run_status = Some(format!("interpreter failed: {error}"));

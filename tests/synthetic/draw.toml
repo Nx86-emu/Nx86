@@ -1,0 +1,46 @@
+# Phase 11 drawing demo.
+#
+# A tiny AArch64 program writes an opaque-blue 2x2 image into a guest
+# framebuffer region, then halts on SVC. Load it from the Tests screen
+# (Open / Load) to see the framebuffer rendered.
+#
+# Pixels are 32-bit little-endian RGBA words. The program builds
+# x0 = 0xffff0000 with `movz x0, #0xffff, lsl #16`, so each stored word lays
+# down the bytes 00 00 ff ff = red 0, green 0, blue 255, alpha 255.
+
+[metadata]
+name = "draw 2x2 blue"
+description = "Writes four opaque-blue pixels into the framebuffer."
+entry-point = "0x0"
+
+[program]
+# movz x0, #0xffff, lsl #16   ; pixel value 0xffff0000 (opaque blue)
+# movz x1, #1, lsl #16        ; framebuffer base 0x10000
+# str  w0, [x1, #0]
+# str  w0, [x1, #4]
+# str  w0, [x1, #8]
+# str  w0, [x1, #12]
+# svc  #0
+arm64-hex = """
+E0 FF BF D2
+21 00 A0 D2
+20 00 00 B9
+20 04 00 B9
+20 08 00 B9
+20 0C 00 B9
+01 00 00 D4
+"""
+
+[framebuffer]
+base = "0x10000"
+width = 2
+height = 2
+
+[expected.registers]
+x0 = "0xffff0000"
+x1 = "0x10000"
+halted = "true"
+
+[[expected.memory]]
+address = "0x10000"
+bytes-hex = "00 00 FF FF 00 00 FF FF 00 00 FF FF 00 00 FF FF"

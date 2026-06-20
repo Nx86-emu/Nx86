@@ -1,6 +1,7 @@
 use nx86_arm64_decode::{DecodeError, DecodedInstruction, InstructionKind, decode_program};
 use nx86_core::guest::{CpuState, CpuStateDiff};
-use nx86_testsuite::{SyntheticArm64Test, SyntheticTestError};
+use nx86_testsuite::{Framebuffer, MemoryDiff, SyntheticArm64Test, SyntheticTestError};
+use nx86_vmm::{GuestAddress, GuestMemory, PAGE_SIZE, PagePermissions, VmmFault};
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
@@ -29,7 +30,22 @@ impl TinyInterpreter {
         self
     }
 
-    pub fn run(&self, mut state: CpuState) -> Result<InterpreterResult, InterpreterError> {
+    /// Run the program against a fresh, empty guest memory.
+    ///
+    /// Programs that perform memory operations should use [`Self::run_in`] with
+    /// a memory that has the relevant pages mapped.
+    pub fn run(&self, state: CpuState) -> Result<InterpreterResult, InterpreterError> {
+        let mut memory = GuestMemory::new_logical();
+        self.run_in(state, &mut memory)
+    }
+
+    /// Run the program against a caller-provided guest memory so stores and
+    /// loads are observable after execution.
+    pub fn run_in(
+        &self,
+        mut state: CpuState,
+        memory: &mut GuestMemory,
+    ) -> Result<InterpreterResult, InterpreterError> {
         let mut trace = Vec::new();
 
         for _ in 0..self.max_steps {
@@ -46,7 +62,7 @@ impl TinyInterpreter {
                 pc,
                 disassembly: instruction.disassembly.clone(),
             });
-            self.execute(instruction, &mut state)?;
+            self.execute(instruction, &mut state, memory)?;
         }
 
         Err(InterpreterError::StepLimit {
@@ -72,6 +88,7 @@ impl TinyInterpreter {
         &self,
         instruction: &DecodedInstruction,
         state: &mut CpuState,
+        memory: &mut GuestMemory,
     ) -> Result<(), InterpreterError> {
         let next_pc = instruction.address + 4;
         match instruction.kind {
@@ -102,6 +119,12 @@ impl TinyInterpreter {
                 state.set_pc(next_pc);
                 state.halt(format!("svc #{imm:#x}"));
             }
+            InstructionKind::StoreWord { rt, rn, offset } => {
+                let address = state.read_gp_or_sp(rn).wrapping_add(offset);
+                let value = state.x(rt) as u32;
+                memory.write(GuestAddress(address), &value.to_le_bytes())?;
+                state.set_pc(next_pc);
+            }
         }
         Ok(())
     }
@@ -123,6 +146,8 @@ pub struct TraceStep {
 pub struct SyntheticRunResult {
     pub interpreter: InterpreterResult,
     pub register_diffs: Vec<CpuStateDiff>,
+    pub memory_diffs: Vec<MemoryDiff>,
+    pub framebuffer: Option<Framebuffer>,
 }
 
 pub fn run_synthetic_test(
@@ -133,13 +158,75 @@ pub fn run_synthetic_test(
     let mut state = CpuState::new();
     state.set_pc(entry_point);
 
-    let interpreter = TinyInterpreter::new(instructions).run(state)?;
+    let mut memory = GuestMemory::new_logical();
+    // Map any framebuffer and expected-memory regions read-write so the program
+    // can store into them and the results can be read back afterward.
+    if let Some(spec) = &test.framebuffer {
+        map_region(&mut memory, spec.base_u64()?, spec.byte_len())?;
+    }
+    for range in &test.expected.memory {
+        map_region(&mut memory, range.address_u64()?, range.bytes.len())?;
+    }
+
+    let interpreter = TinyInterpreter::new(instructions).run_in(state, &mut memory)?;
     let register_diffs = test.expected.compare_cpu_state(&interpreter.final_state)?;
+    let memory_diffs = compare_expected_memory(&memory, test)?;
+    let framebuffer = read_framebuffer(&memory, test)?;
 
     Ok(SyntheticRunResult {
         interpreter,
         register_diffs,
+        memory_diffs,
+        framebuffer,
     })
+}
+
+/// Map every 4 KiB page that overlaps `[base, base + len)` read-write.
+fn map_region(memory: &mut GuestMemory, base: u64, len: usize) -> Result<(), InterpreterError> {
+    if len == 0 {
+        return Ok(());
+    }
+    let end = base.saturating_add(len as u64);
+    let mut page = GuestAddress(base).page_base();
+    while page < end {
+        memory.map_page(GuestAddress(page), PagePermissions::READ_WRITE)?;
+        page += PAGE_SIZE;
+    }
+    Ok(())
+}
+
+fn compare_expected_memory(
+    memory: &GuestMemory,
+    test: &SyntheticArm64Test,
+) -> Result<Vec<MemoryDiff>, InterpreterError> {
+    let mut diffs = Vec::new();
+    for range in &test.expected.memory {
+        let address = range.address_u64()?;
+        let actual = memory.read(GuestAddress(address), range.bytes.len())?;
+        if actual != range.bytes {
+            diffs.push(MemoryDiff {
+                address,
+                expected: range.bytes.clone(),
+                actual,
+            });
+        }
+    }
+    Ok(diffs)
+}
+
+fn read_framebuffer(
+    memory: &GuestMemory,
+    test: &SyntheticArm64Test,
+) -> Result<Option<Framebuffer>, InterpreterError> {
+    let Some(spec) = &test.framebuffer else {
+        return Ok(None);
+    };
+    let bytes = memory.read(GuestAddress(spec.base_u64()?), spec.byte_len())?;
+    Ok(Some(Framebuffer {
+        width: spec.width,
+        height: spec.height,
+        bytes,
+    }))
 }
 
 #[derive(Debug, Error)]
@@ -148,6 +235,8 @@ pub enum InterpreterError {
     Decode(#[from] DecodeError),
     #[error("synthetic test error: {0}")]
     Synthetic(#[from] SyntheticTestError),
+    #[error("memory fault: {0}")]
+    Memory(#[from] VmmFault),
     #[error("pc {pc:#x} is outside the decoded program")]
     PcOutOfProgram { pc: u64 },
     #[error("branch at {pc:#x} targets {target:#x}, outside decoded program")]
@@ -246,6 +335,38 @@ mod tests {
         let result = run_synthetic_test(&test).expect("test should run");
 
         assert_eq!(result.register_diffs.len(), 1);
+    }
+
+    #[test]
+    fn synthetic_program_draws_framebuffer() {
+        // movz x0, #0xffff, lsl #16 ; movz x1, #1, lsl #16 ; str w0 to four
+        // 2x2 pixels ; svc #0. x0 = 0xffff0000 stores little-endian as the RGBA
+        // bytes 00 00 ff ff (opaque blue).
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "draw"
+            entry-point = "0x0"
+
+            [program]
+            arm64-hex = "E0 FF BF D2 21 00 A0 D2 20 00 00 B9 20 04 00 B9 20 08 00 B9 20 0C 00 B9 01 00 00 D4"
+
+            [framebuffer]
+            base = "0x10000"
+            width = 2
+            height = 2
+            "#,
+        )
+        .expect("test should parse");
+
+        let result = run_synthetic_test(&test).expect("test should run");
+        let framebuffer = result.framebuffer.expect("framebuffer should be present");
+
+        assert_eq!(framebuffer.width, 2);
+        assert_eq!(framebuffer.height, 2);
+        assert_eq!(framebuffer.bytes, [0x00, 0x00, 0xFF, 0xFF].repeat(4));
+        assert!(result.interpreter.final_state.halted());
+        assert!(result.memory_diffs.is_empty());
     }
 
     #[test]

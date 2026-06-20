@@ -9,6 +9,7 @@ rust-version.workspace = true
 nx86-arm64-decode = { path = "../nx86-arm64-decode" }
 nx86-core = { path = "../nx86-core" }
 nx86-testsuite = { path = "../nx86-testsuite" }
+nx86-vmm = { path = "../nx86-vmm" }
 thiserror.workspace = true
 
 [lints]
