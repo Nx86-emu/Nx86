@@ -12,24 +12,30 @@ synthetic ARM64 test display, guest CPU state, a narrow AArch64 decoder, a tiny
 synthetic interpreter, and a VMM skeleton. It does not implement real title
 import, compilation, Switch runtime execution, JIT/AOT, graphics, or rendering.
 
-## Active Phase 0-10 Crates
+## Active Phase 0-15 Crates
 
 - `nx86-app`: binary entrypoint, logging setup, config load, GUI launch.
-- `nx86-gui`: egui shell, wizard, theme, navigation, title list, worker progress, synthetic test display, decode display, and tiny interpreter status.
-- `nx86-core`: shared config, storage layout, IPC model, guest CPU state, and Linux XDG-backed persistence.
+- `nx86-gui`: egui shell, wizard, theme, navigation, title list, worker progress, synthetic test display, decode display, tiny interpreter status, framebuffer rendering, and NxIR dump/agreement.
+- `nx86-core`: shared config, storage layout, IPC model, guest CPU state, flag (NZCV) and condition-code semantics, and Linux XDG-backed persistence.
 - `nx86-title-db`: SQLite title database, deterministic title folder creation, and TOML sidecars.
-- `nx86-arm64-decode`: narrow MOV/ADD/SUB/B/SVC decoder for synthetic programs.
-- `nx86-runtime`: tiny synthetic interpreter and expected-register result reporting.
+- `nx86-arm64-decode`: narrow decoder for MOV/ADD/SUB/logical/loads/stores/B/B.cond/ADDS/SUBS/SVC.
+- `nx86-ir`: NxIR data model (module/function/block/SSA values) and the verifier.
+- `nx86-arm64-lift`: AArch64 → NxIR lifter with basic-block CFG construction.
+- `nx86-ir-opt`: NxIR optimization passes (dead-flag elimination).
+- `nx86-runtime`: tiny synthetic interpreter (with guest memory), NxIR evaluator, and the differential synthetic-test harness.
 - `nx86-vmm`: 64 GiB guest memory arena boundary and software page-table helpers.
 - `nx86-debug`: tracing-based logging setup.
-- `nx86-testsuite`: synthetic ARM64 test file format.
+- `nx86-testsuite`: synthetic ARM64 test file format, framebuffer spec, and result diffs.
 - `nx86-vulkan`: internal safe boundary around `ash`.
 
 ## Skeleton Crates
 
 The remaining crates compile as placeholders so the workspace layout matches
 the specification while later phases can fill them in without reshaping the
-repository.
+repository. The x86_64 backend crates (`nx86-x64-asm`, `nx86-x64-v4`,
+`nx86-regalloc`, `nx86-jit`, `nx86-object`) are deferred to Phases 16+, where
+native code generation must be `cfg(target_arch = "x86_64")`-gated and verified
+in CI because the development host is Apple Silicon.
 
 ## Vulkan Policy
 
