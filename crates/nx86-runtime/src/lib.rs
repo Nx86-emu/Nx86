@@ -1,8 +1,15 @@
-use nx86_arm64_decode::{DecodeError, DecodedInstruction, InstructionKind, decode_program};
+use nx86_arm64_decode::{
+    DecodeError, DecodedInstruction, InstructionKind, LogicalOp, MemSize, decode_program,
+};
+use nx86_arm64_lift::lift_program;
 use nx86_core::guest::{CpuState, CpuStateDiff};
 use nx86_testsuite::{Framebuffer, MemoryDiff, SyntheticArm64Test, SyntheticTestError};
 use nx86_vmm::{GuestAddress, GuestMemory, PAGE_SIZE, PagePermissions, VmmFault};
 use thiserror::Error;
+
+mod eval;
+
+pub use eval::{EvalError, evaluate};
 
 #[derive(Clone, Debug)]
 pub struct TinyInterpreter {
@@ -115,14 +122,61 @@ impl TinyInterpreter {
                 }
                 state.set_pc(target);
             }
+            InstructionKind::LogicalReg { op, rd, rn, rm } => {
+                let lhs = state.x(rn);
+                let rhs = state.x(rm);
+                let value = match op {
+                    LogicalOp::And => lhs & rhs,
+                    LogicalOp::Or => lhs | rhs,
+                    LogicalOp::Xor => lhs ^ rhs,
+                };
+                state.set_x(rd, value);
+                state.set_pc(next_pc);
+            }
             InstructionKind::Svc { imm } => {
                 state.set_pc(next_pc);
                 state.halt(format!("svc #{imm:#x}"));
             }
-            InstructionKind::StoreWord { rt, rn, offset } => {
+            InstructionKind::Store {
+                rt,
+                rn,
+                offset,
+                size,
+            } => {
                 let address = state.read_gp_or_sp(rn).wrapping_add(offset);
-                let value = state.x(rt) as u32;
-                memory.write(GuestAddress(address), &value.to_le_bytes())?;
+                let value = state.x(rt);
+                match size {
+                    MemSize::Word => {
+                        memory.write(GuestAddress(address), &(value as u32).to_le_bytes())?;
+                    }
+                    MemSize::Double => {
+                        memory.write(GuestAddress(address), &value.to_le_bytes())?;
+                    }
+                }
+                state.set_pc(next_pc);
+            }
+            InstructionKind::Load {
+                rt,
+                rn,
+                offset,
+                size,
+            } => {
+                let address = state.read_gp_or_sp(rn).wrapping_add(offset);
+                let value = match size {
+                    MemSize::Word => {
+                        let bytes = memory.read(GuestAddress(address), 4)?;
+                        let mut word = [0u8; 4];
+                        word.copy_from_slice(&bytes);
+                        u64::from(u32::from_le_bytes(word))
+                    }
+                    MemSize::Double => {
+                        let bytes = memory.read(GuestAddress(address), 8)?;
+                        let mut word = [0u8; 8];
+                        word.copy_from_slice(&bytes);
+                        u64::from_le_bytes(word)
+                    }
+                };
+                state.set_x(rt, value);
                 state.set_pc(next_pc);
             }
         }
@@ -148,6 +202,34 @@ pub struct SyntheticRunResult {
     pub register_diffs: Vec<CpuStateDiff>,
     pub memory_diffs: Vec<MemoryDiff>,
     pub framebuffer: Option<Framebuffer>,
+    /// Result of lifting the program to NxIR and evaluating it as a differential
+    /// cross-check against the AArch64 interpreter.
+    pub nxir: NxirOutcome,
+}
+
+/// Outcome of the NxIR differential cross-check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NxirOutcome {
+    /// Human-readable NxIR text dump (empty if lifting failed).
+    pub dump: String,
+    /// Whether the NxIR evaluation agrees with the interpreter on final state
+    /// and observable memory.
+    pub agrees: bool,
+    /// Lift/verify/evaluation error, if any.
+    pub error: Option<String>,
+    /// Final guest state from NxIR evaluation, if it ran.
+    pub final_state: Option<CpuState>,
+}
+
+impl NxirOutcome {
+    fn failed(error: impl ToString) -> Self {
+        Self {
+            dump: String::new(),
+            agrees: false,
+            error: Some(error.to_string()),
+            final_state: None,
+        }
+    }
 }
 
 pub fn run_synthetic_test(
@@ -159,26 +241,115 @@ pub fn run_synthetic_test(
     state.set_pc(entry_point);
 
     let mut memory = GuestMemory::new_logical();
-    // Map any framebuffer and expected-memory regions read-write so the program
-    // can store into them and the results can be read back afterward.
-    if let Some(spec) = &test.framebuffer {
-        map_region(&mut memory, spec.base_u64()?, spec.byte_len())?;
-    }
-    for range in &test.expected.memory {
-        map_region(&mut memory, range.address_u64()?, range.bytes.len())?;
-    }
+    map_regions(&mut memory, test)?;
 
-    let interpreter = TinyInterpreter::new(instructions).run_in(state, &mut memory)?;
+    let interpreter = TinyInterpreter::new(instructions.clone()).run_in(state, &mut memory)?;
     let register_diffs = test.expected.compare_cpu_state(&interpreter.final_state)?;
     let memory_diffs = compare_expected_memory(&memory, test)?;
     let framebuffer = read_framebuffer(&memory, test)?;
+
+    let nxir = run_nxir_differential(
+        test,
+        &instructions,
+        entry_point,
+        &interpreter.final_state,
+        &memory,
+    );
 
     Ok(SyntheticRunResult {
         interpreter,
         register_diffs,
         memory_diffs,
         framebuffer,
+        nxir,
     })
+}
+
+/// Lift the program to NxIR, verify it, evaluate it on a fresh memory, and
+/// compare the result with the interpreter. This is best-effort: any failure is
+/// captured in [`NxirOutcome::error`] rather than propagated, so the GUI still
+/// shows interpreter results for programs the lifter cannot yet handle.
+fn run_nxir_differential(
+    test: &SyntheticArm64Test,
+    instructions: &[DecodedInstruction],
+    entry_point: u64,
+    interpreter_state: &CpuState,
+    interpreter_memory: &GuestMemory,
+) -> NxirOutcome {
+    let function = match lift_program("synthetic", instructions, entry_point) {
+        Ok(function) => function,
+        Err(error) => return NxirOutcome::failed(error),
+    };
+    let dump = function.dump();
+
+    let mut memory = GuestMemory::new_logical();
+    if let Err(error) = map_regions(&mut memory, test) {
+        return NxirOutcome {
+            dump,
+            agrees: false,
+            error: Some(error.to_string()),
+            final_state: None,
+        };
+    }
+
+    let nxir_state = match evaluate(&function, &mut memory) {
+        Ok(state) => state,
+        Err(error) => {
+            return NxirOutcome {
+                dump,
+                agrees: false,
+                error: Some(error.to_string()),
+                final_state: None,
+            };
+        }
+    };
+
+    let memory_agrees = match (
+        read_observable_regions(interpreter_memory, test),
+        read_observable_regions(&memory, test),
+    ) {
+        (Ok(interpreter_regions), Ok(nxir_regions)) => interpreter_regions == nxir_regions,
+        _ => false,
+    };
+    let agrees = &nxir_state == interpreter_state && memory_agrees;
+
+    NxirOutcome {
+        dump,
+        agrees,
+        error: None,
+        final_state: Some(nxir_state),
+    }
+}
+
+/// Map any framebuffer and expected-memory regions read-write so a program can
+/// store into them and the results can be read back afterward.
+fn map_regions(
+    memory: &mut GuestMemory,
+    test: &SyntheticArm64Test,
+) -> Result<(), InterpreterError> {
+    if let Some(spec) = &test.framebuffer {
+        map_region(memory, spec.base_u64()?, spec.byte_len())?;
+    }
+    for range in &test.expected.memory {
+        map_region(memory, range.address_u64()?, range.bytes.len())?;
+    }
+    Ok(())
+}
+
+/// Read the framebuffer and expected-memory regions, used to compare what each
+/// execution engine wrote to memory.
+fn read_observable_regions(
+    memory: &GuestMemory,
+    test: &SyntheticArm64Test,
+) -> Result<Vec<Vec<u8>>, InterpreterError> {
+    let mut regions = Vec::new();
+    if let Some(spec) = &test.framebuffer {
+        regions.push(memory.read(GuestAddress(spec.base_u64()?), spec.byte_len())?);
+    }
+    for range in &test.expected.memory {
+        regions.push(memory.read(GuestAddress(range.address_u64()?), range.bytes.len())?);
+    }
+    Ok(regions)
 }
 
 /// Map every 4 KiB page that overlaps `[base, base + len)` read-write.
@@ -367,6 +538,98 @@ mod tests {
         assert_eq!(framebuffer.bytes, [0x00, 0x00, 0xFF, 0xFF].repeat(4));
         assert!(result.interpreter.final_state.halted());
         assert!(result.memory_diffs.is_empty());
+        assert!(result.nxir.error.is_none(), "{:?}", result.nxir.error);
+        assert!(result.nxir.agrees);
+    }
+
+    #[test]
+    fn interpreter_and_nxir_agree_on_integer_program() {
+        // mov x0, #5 ; add x1, x0, #3 ; sub x2, x1, #1 ; orr x3, x1, x0 ; svc #0
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "integer"
+            entry-point = "0x0"
+
+            [program]
+            arm64-hex = "A0 00 80 D2 01 0C 00 91 22 04 00 D1 23 00 00 AA 01 00 00 D4"
+
+            [expected.registers]
+            x0 = "0x5"
+            x1 = "0x8"
+            x2 = "0x7"
+            x3 = "0xd"
+            halted = "true"
+            "#,
+        )
+        .expect("test should parse");
+
+        let result = run_synthetic_test(&test).expect("test should run");
+
+        assert!(result.register_diffs.is_empty());
+        assert!(result.nxir.error.is_none(), "{:?}", result.nxir.error);
+        assert!(result.nxir.agrees);
+        assert_eq!(
+            result.nxir.final_state.as_ref(),
+            Some(&result.interpreter.final_state)
+        );
+    }
+
+    #[test]
+    fn interpreter_and_nxir_agree_on_memory_program() {
+        // mov x0, #0xab ; mov x1, #1, lsl #16 ; str x0, [x1] ; ldr x2, [x1] ; svc
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "memory"
+            entry-point = "0x0"
+
+            [program]
+            arm64-hex = "60 15 80 D2 21 00 A0 D2 20 00 00 F9 22 00 40 F9 01 00 00 D4"
+
+            [expected.registers]
+            x2 = "0xab"
+            halted = "true"
+
+            [[expected.memory]]
+            address = "0x10000"
+            bytes-hex = "AB 00 00 00 00 00 00 00"
+            "#,
+        )
+        .expect("test should parse");
+
+        let result = run_synthetic_test(&test).expect("test should run");
+
+        assert!(result.register_diffs.is_empty());
+        assert!(result.memory_diffs.is_empty());
+        assert!(result.nxir.error.is_none(), "{:?}", result.nxir.error);
+        assert!(result.nxir.agrees);
+    }
+
+    #[test]
+    fn interpreter_and_nxir_agree_across_branches() {
+        // mov x0, #1 ; b +8 ; mov x0, #2 ; svc #0  (the second mov is skipped)
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "branch"
+            entry-point = "0x0"
+
+            [program]
+            arm64-hex = "20 00 80 D2 02 00 00 14 40 00 80 D2 01 00 00 D4"
+
+            [expected.registers]
+            x0 = "0x1"
+            halted = "true"
+            "#,
+        )
+        .expect("test should parse");
+
+        let result = run_synthetic_test(&test).expect("test should run");
+
+        assert!(result.register_diffs.is_empty());
+        assert!(result.nxir.error.is_none(), "{:?}", result.nxir.error);
+        assert!(result.nxir.agrees);
     }
 
     #[test]

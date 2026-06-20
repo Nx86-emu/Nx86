@@ -66,9 +66,40 @@ pub struct DecodedInstruction {
 #[serde(rename_all = "kebab-case")]
 pub enum InstructionClass {
     DataProcessingImmediate,
+    DataProcessingRegister,
     Branch,
     Exception,
     LoadStore,
+}
+
+/// Access width of a load/store.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MemSize {
+    /// 32-bit `Wt` access.
+    Word,
+    /// 64-bit `Xt` access.
+    Double,
+}
+
+impl MemSize {
+    /// Access width in bytes.
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        match self {
+            Self::Word => 4,
+            Self::Double => 8,
+        }
+    }
+}
+
+/// Logical (register) operation.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogicalOp {
+    And,
+    Or,
+    Xor,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +120,13 @@ pub enum InstructionKind {
         rn: u8,
         imm: u64,
     },
+    /// `AND`/`ORR`/`EOR` (shifted register, `LSL #0`), 64-bit.
+    LogicalReg {
+        op: LogicalOp,
+        rd: u8,
+        rn: u8,
+        rm: u8,
+    },
     Branch {
         offset: i64,
         target: u64,
@@ -96,11 +134,19 @@ pub enum InstructionKind {
     Svc {
         imm: u16,
     },
-    /// `STR Wt, [Xn, #offset]` — store the low 32 bits of `rt` at `rn + offset`.
-    StoreWord {
+    /// `STR Wt|Xt, [Xn|SP, #offset]` (unsigned offset).
+    Store {
         rt: u8,
         rn: u8,
         offset: u64,
+        size: MemSize,
+    },
+    /// `LDR Wt|Xt, [Xn|SP, #offset]` (unsigned offset).
+    Load {
+        rt: u8,
+        rn: u8,
+        offset: u64,
+        size: MemSize,
     },
 }
 
@@ -111,9 +157,10 @@ impl InstructionKind {
             Self::MovZ { .. } | Self::AddImmediate { .. } | Self::SubImmediate { .. } => {
                 InstructionClass::DataProcessingImmediate
             }
+            Self::LogicalReg { .. } => InstructionClass::DataProcessingRegister,
             Self::Branch { .. } => InstructionClass::Branch,
             Self::Svc { .. } => InstructionClass::Exception,
-            Self::StoreWord { .. } => InstructionClass::LoadStore,
+            Self::Store { .. } | Self::Load { .. } => InstructionClass::LoadStore,
         }
     }
 
@@ -132,13 +179,55 @@ impl InstructionKind {
             Self::SubImmediate { rd, rn, imm } => {
                 format!("sub {}, {}, #{imm:#x}", gp_or_sp(*rd), gp_or_sp(*rn))
             }
+            Self::LogicalReg { op, rd, rn, rm } => {
+                let mnemonic = match op {
+                    LogicalOp::And => "and",
+                    LogicalOp::Or => "orr",
+                    LogicalOp::Xor => "eor",
+                };
+                format!(
+                    "{mnemonic} {}, {}, {}",
+                    gp_or_zr(*rd),
+                    gp_or_zr(*rn),
+                    gp_or_zr(*rm)
+                )
+            }
             Self::Branch { target, .. } => format!("b {target:#x}"),
             Self::Svc { imm } => format!("svc #{imm:#x}"),
-            Self::StoreWord { rt, rn, offset } => {
-                format!("str w{rt}, [{}, #{offset:#x}]", gp_or_sp(*rn))
+            Self::Store {
+                rt,
+                rn,
+                offset,
+                size,
+            } => {
+                format!(
+                    "str {}, [{}, #{offset:#x}]",
+                    reg_for_size(*rt, *size),
+                    gp_or_sp(*rn)
+                )
+            }
+            Self::Load {
+                rt,
+                rn,
+                offset,
+                size,
+            } => {
+                format!(
+                    "ldr {}, [{}, #{offset:#x}]",
+                    reg_for_size(*rt, *size),
+                    gp_or_sp(*rn)
+                )
             }
         }
     }
+}
+
+fn reg_for_size(register: u8, size: MemSize) -> String {
+    let prefix = match size {
+        MemSize::Word => 'w',
+        MemSize::Double => 'x',
+    };
+    format!("{prefix}{register}")
 }
 
 fn decode_kind(word: u32, address: u64) -> Result<InstructionKind, DecodeError> {
@@ -182,15 +271,64 @@ fn decode_kind(word: u32, address: u64) -> Result<InstructionKind, DecodeError> 
         });
     }
 
-    // STR (immediate, unsigned offset), 32-bit variant: size=10, V=0, opc=00.
+    // Logical (shifted register), 64-bit, LSL #0, N=0: AND/ORR/EOR.
+    if (word & 0xFFE0_FC00) == 0x8A00_0000 {
+        return Ok(logical_reg(LogicalOp::And, word));
+    }
+    if (word & 0xFFE0_FC00) == 0xAA00_0000 {
+        return Ok(logical_reg(LogicalOp::Or, word));
+    }
+    if (word & 0xFFE0_FC00) == 0xCA00_0000 {
+        return Ok(logical_reg(LogicalOp::Xor, word));
+    }
+
+    // STR/LDR (immediate, unsigned offset). size 10=32-bit, 11=64-bit;
+    // opc 00=STR, 01=LDR. Offset is scaled by the access size.
     if (word & 0xFFC0_0000) == 0xB900_0000 {
-        let rt = bits(word, 0, 5) as u8;
-        let rn = bits(word, 5, 5) as u8;
-        let offset = u64::from(bits(word, 10, 12)) << 2;
-        return Ok(InstructionKind::StoreWord { rt, rn, offset });
+        return Ok(load_store(false, MemSize::Word, word));
+    }
+    if (word & 0xFFC0_0000) == 0xF900_0000 {
+        return Ok(load_store(false, MemSize::Double, word));
+    }
+    if (word & 0xFFC0_0000) == 0xB940_0000 {
+        return Ok(load_store(true, MemSize::Word, word));
+    }
+    if (word & 0xFFC0_0000) == 0xF940_0000 {
+        return Ok(load_store(true, MemSize::Double, word));
     }
 
     Err(DecodeError::UnsupportedInstruction { address, word })
+}
+
+fn logical_reg(op: LogicalOp, word: u32) -> InstructionKind {
+    InstructionKind::LogicalReg {
+        op,
+        rd: bits(word, 0, 5) as u8,
+        rn: bits(word, 5, 5) as u8,
+        rm: bits(word, 16, 5) as u8,
+    }
+}
+
+fn load_store(is_load: bool, size: MemSize, word: u32) -> InstructionKind {
+    let rt = bits(word, 0, 5) as u8;
+    let rn = bits(word, 5, 5) as u8;
+    let scale = size.bytes().trailing_zeros();
+    let offset = u64::from(bits(word, 10, 12)) << scale;
+    if is_load {
+        InstructionKind::Load {
+            rt,
+            rn,
+            offset,
+            size,
+        }
+    } else {
+        InstructionKind::Store {
+            rt,
+            rn,
+            offset,
+            size,
+        }
+    }
 }
 
 fn gp_or_sp(register: u8) -> String {
@@ -239,7 +377,9 @@ pub enum DecodeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodeError, InstructionClass, InstructionKind, decode_program};
+    use super::{
+        DecodeError, InstructionClass, InstructionKind, LogicalOp, MemSize, decode_program,
+    };
 
     #[test]
     fn decodes_mov_add_sub_b_svc() {
@@ -296,23 +436,106 @@ mod tests {
         let decoded = decode_program(&[0x20, 0x00, 0x00, 0xB9], 0x2000).expect("str should decode");
         assert_eq!(
             decoded[0].kind,
-            InstructionKind::StoreWord {
+            InstructionKind::Store {
                 rt: 0,
                 rn: 1,
-                offset: 0
+                offset: 0,
+                size: MemSize::Word,
             }
         );
         assert_eq!(decoded[0].class, InstructionClass::LoadStore);
         assert_eq!(decoded[0].disassembly, "str w0, [x1, #0x0]");
 
-        // str w2, [x3, #4]
+        // str w2, [x3, #4] (imm12 = 1, scaled by 4)
         let decoded = decode_program(&[0x62, 0x04, 0x00, 0xB9], 0).expect("str should decode");
         assert_eq!(
             decoded[0].kind,
-            InstructionKind::StoreWord {
+            InstructionKind::Store {
                 rt: 2,
                 rn: 3,
-                offset: 4
+                offset: 4,
+                size: MemSize::Word,
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_ldr_str_double_and_ldr_word() {
+        // ldr x0, [x1, #8] (size=11, opc=01, imm12=1 scaled by 8)
+        let decoded = decode_program(&[0x20, 0x04, 0x40, 0xF9], 0).expect("ldr should decode");
+        assert_eq!(
+            decoded[0].kind,
+            InstructionKind::Load {
+                rt: 0,
+                rn: 1,
+                offset: 8,
+                size: MemSize::Double,
+            }
+        );
+        assert_eq!(decoded[0].disassembly, "ldr x0, [x1, #0x8]");
+
+        // str x2, [x3, #0]
+        let decoded = decode_program(&[0x62, 0x00, 0x00, 0xF9], 0).expect("str should decode");
+        assert_eq!(
+            decoded[0].kind,
+            InstructionKind::Store {
+                rt: 2,
+                rn: 3,
+                offset: 0,
+                size: MemSize::Double,
+            }
+        );
+
+        // ldr w4, [x5, #4]
+        let decoded = decode_program(&[0xA4, 0x04, 0x40, 0xB9], 0).expect("ldr should decode");
+        assert_eq!(
+            decoded[0].kind,
+            InstructionKind::Load {
+                rt: 4,
+                rn: 5,
+                offset: 4,
+                size: MemSize::Word,
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_logical_register_ops() {
+        // and x0, x1, x2 ; orr x3, x4, x5 ; eor x6, x7, x8
+        let bytes = [
+            0x20, 0x00, 0x02, 0x8A, // and x0, x1, x2
+            0x83, 0x00, 0x05, 0xAA, // orr x3, x4, x5
+            0xE6, 0x00, 0x08, 0xCA, // eor x6, x7, x8
+        ];
+        let decoded = decode_program(&bytes, 0).expect("logical ops should decode");
+
+        assert_eq!(
+            decoded[0].kind,
+            InstructionKind::LogicalReg {
+                op: LogicalOp::And,
+                rd: 0,
+                rn: 1,
+                rm: 2,
+            }
+        );
+        assert_eq!(decoded[0].class, InstructionClass::DataProcessingRegister);
+        assert_eq!(decoded[0].disassembly, "and x0, x1, x2");
+        assert_eq!(
+            decoded[1].kind,
+            InstructionKind::LogicalReg {
+                op: LogicalOp::Or,
+                rd: 3,
+                rn: 4,
+                rm: 5,
+            }
+        );
+        assert_eq!(
+            decoded[2].kind,
+            InstructionKind::LogicalReg {
+                op: LogicalOp::Xor,
+                rd: 6,
+                rn: 7,
+                rm: 8,
             }
         );
     }

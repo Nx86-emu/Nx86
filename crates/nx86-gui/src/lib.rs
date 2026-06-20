@@ -499,6 +499,8 @@ impl Nx86App {
         self.test_ui.memory_dumps.clear();
         self.test_ui.framebuffer = None;
         self.test_ui.framebuffer_texture = None;
+        self.test_ui.nxir_status = None;
+        self.test_ui.nxir_dump = None;
 
         match test.entry_point() {
             Ok(entry) => match decode_program(&test.program.bytes, entry) {
@@ -545,6 +547,13 @@ impl Nx86App {
                 self.test_ui.framebuffer = result
                     .framebuffer
                     .map(|framebuffer| (framebuffer.width, framebuffer.height, framebuffer.bytes));
+                self.test_ui.nxir_status = Some(match (&result.nxir.error, result.nxir.agrees) {
+                    (Some(error), _) => format!("unavailable: {error}"),
+                    (None, true) => "matches interpreter".to_owned(),
+                    (None, false) => "disagrees with interpreter".to_owned(),
+                });
+                self.test_ui.nxir_dump =
+                    (!result.nxir.dump.is_empty()).then(|| result.nxir.dump.clone());
             }
             Err(error) => {
                 self.test_ui.run_status = Some(format!("interpreter failed: {error}"));

@@ -86,6 +86,10 @@ pub struct TestUiState {
     /// Cached GPU texture for [`Self::framebuffer`]; rebuilt when the pixels
     /// change (cleared by the analysis step).
     pub framebuffer_texture: Option<egui::TextureHandle>,
+    /// Whether NxIR evaluation agreed with the interpreter, as a status line.
+    pub nxir_status: Option<String>,
+    /// NxIR text dump from the last run, if lifting succeeded.
+    pub nxir_dump: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,6 +401,20 @@ pub fn tests(ui: &mut egui::Ui, state: &mut TestUiState) -> TestAction {
                 let scale = 24.0;
                 let size = egui::vec2(*width as f32 * scale, *height as f32 * scale);
                 ui.image(egui::load::SizedTexture::new(texture.id(), size));
+            }
+        }
+
+        if let Some(status) = &state.nxir_status {
+            ui.add_space(10.0);
+            ui.strong("NxIR");
+            ui.monospace(status);
+            if let Some(dump) = &state.nxir_dump {
+                egui::ScrollArea::vertical()
+                    .id_salt("nxir-dump")
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        ui.monospace(dump);
+                    });
             }
         }
 
