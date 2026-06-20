@@ -2,7 +2,7 @@ use nx86_arm64_decode::{
     DecodeError, DecodedInstruction, InstructionKind, LogicalOp, MemSize, decode_program,
 };
 use nx86_arm64_lift::lift_program;
-use nx86_core::guest::{CpuState, CpuStateDiff};
+use nx86_core::guest::{CpuState, CpuStateDiff, Nzcv};
 use nx86_testsuite::{Framebuffer, MemoryDiff, SyntheticArm64Test, SyntheticTestError};
 use nx86_vmm::{GuestAddress, GuestMemory, PAGE_SIZE, PagePermissions, VmmFault};
 use thiserror::Error;
@@ -113,6 +113,18 @@ impl TinyInterpreter {
                 state.write_gp_or_sp(rd, value);
                 state.set_pc(next_pc);
             }
+            InstructionKind::AddsImmediate { rd, rn, imm } => {
+                let lhs = state.read_gp_or_sp(rn);
+                state.set_nzcv(Nzcv::from_add(lhs, imm));
+                state.set_x(rd, lhs.wrapping_add(imm));
+                state.set_pc(next_pc);
+            }
+            InstructionKind::SubsImmediate { rd, rn, imm } => {
+                let lhs = state.read_gp_or_sp(rn);
+                state.set_nzcv(Nzcv::from_sub(lhs, imm));
+                state.set_x(rd, lhs.wrapping_sub(imm));
+                state.set_pc(next_pc);
+            }
             InstructionKind::Branch { target, .. } => {
                 if self.instruction_at(target).is_err() {
                     return Err(InterpreterError::BranchOutOfProgram {
@@ -121,6 +133,19 @@ impl TinyInterpreter {
                     });
                 }
                 state.set_pc(target);
+            }
+            InstructionKind::CondBranch { cond, target, .. } => {
+                if state.nzcv().satisfies(cond) {
+                    if self.instruction_at(target).is_err() {
+                        return Err(InterpreterError::BranchOutOfProgram {
+                            pc: instruction.address,
+                            target,
+                        });
+                    }
+                    state.set_pc(target);
+                } else {
+                    state.set_pc(next_pc);
+                }
             }
             InstructionKind::LogicalReg { op, rd, rn, rm } => {
                 let lhs = state.x(rn);
@@ -276,10 +301,17 @@ fn run_nxir_differential(
     interpreter_state: &CpuState,
     interpreter_memory: &GuestMemory,
 ) -> NxirOutcome {
-    let function = match lift_program("synthetic", instructions, entry_point) {
+    let mut function = match lift_program("synthetic", instructions, entry_point) {
         Ok(function) => function,
         Err(error) => return NxirOutcome::failed(error),
     };
+
+    // Run the dead-flag pass and re-verify (SPEC §21.5: the verifier runs after
+    // every optimization pass).
+    nx86_ir_opt::eliminate_dead_flags(&mut function);
+    if let Err(error) = nx86_ir::verify::verify(&function) {
+        return NxirOutcome::failed(error);
+    }
     let dump = function.dump();
 
     let mut memory = GuestMemory::new_logical();
@@ -604,6 +636,90 @@ mod tests {
         assert!(result.memory_diffs.is_empty());
         assert!(result.nxir.error.is_none(), "{:?}", result.nxir.error);
         assert!(result.nxir.agrees);
+    }
+
+    #[test]
+    fn conditional_branch_taken_agrees_through_lazy_flags() {
+        // mov x0,#5 ; cmp x0,#5 ; b.eq +8 ; mov x1,#2 ; svc  (eq taken, x1 stays 0)
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "beq-taken"
+            entry-point = "0x0"
+
+            [program]
+            arm64-hex = "A0 00 80 D2 1F 14 00 F1 40 00 00 54 41 00 80 D2 01 00 00 D4"
+
+            [expected.registers]
+            x0 = "0x5"
+            x1 = "0x0"
+            halted = "true"
+            "#,
+        )
+        .expect("test should parse");
+
+        let result = run_synthetic_test(&test).expect("test should run");
+
+        assert!(result.register_diffs.is_empty());
+        assert!(result.nxir.error.is_none(), "{:?}", result.nxir.error);
+        assert!(result.nxir.agrees);
+    }
+
+    #[test]
+    fn conditional_branch_not_taken_agrees_through_lazy_flags() {
+        // mov x0,#5 ; cmp x0,#6 ; b.eq +8 ; mov x1,#2 ; svc  (eq not taken, x1=2)
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "beq-not-taken"
+            entry-point = "0x0"
+
+            [program]
+            arm64-hex = "A0 00 80 D2 1F 18 00 F1 40 00 00 54 41 00 80 D2 01 00 00 D4"
+
+            [expected.registers]
+            x0 = "0x5"
+            x1 = "0x2"
+            halted = "true"
+            "#,
+        )
+        .expect("test should parse");
+
+        let result = run_synthetic_test(&test).expect("test should run");
+
+        assert!(result.register_diffs.is_empty());
+        assert!(result.nxir.error.is_none(), "{:?}", result.nxir.error);
+        assert!(result.nxir.agrees);
+    }
+
+    #[test]
+    fn overwritten_flags_are_eliminated_and_still_agree() {
+        // mov x0,#5 ; cmp x0,#6 ; cmp x0,#5 ; b.eq +8 ; mov x1,#9 ; svc
+        // The first cmp's flags are overwritten; the dead-flag pass drops them.
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "overwritten-flags"
+            entry-point = "0x0"
+
+            [program]
+            arm64-hex = "A0 00 80 D2 1F 18 00 F1 1F 14 00 F1 40 00 00 54 21 01 80 D2 01 00 00 D4"
+
+            [expected.registers]
+            x0 = "0x5"
+            x1 = "0x0"
+            halted = "true"
+            "#,
+        )
+        .expect("test should parse");
+
+        let result = run_synthetic_test(&test).expect("test should run");
+
+        assert!(result.register_diffs.is_empty());
+        assert!(result.nxir.error.is_none(), "{:?}", result.nxir.error);
+        assert!(result.nxir.agrees);
+        // Both CMPs lift to SetFlags, but the dead-flag pass leaves only one.
+        assert_eq!(result.nxir.dump.matches("setflags").count(), 1);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use nx86_core::guest::Cond;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -120,6 +121,18 @@ pub enum InstructionKind {
         rn: u8,
         imm: u64,
     },
+    /// `ADDS`/`CMN` (immediate), 64-bit — flag-setting add.
+    AddsImmediate {
+        rd: u8,
+        rn: u8,
+        imm: u64,
+    },
+    /// `SUBS`/`CMP` (immediate), 64-bit — flag-setting subtract.
+    SubsImmediate {
+        rd: u8,
+        rn: u8,
+        imm: u64,
+    },
     /// `AND`/`ORR`/`EOR` (shifted register, `LSL #0`), 64-bit.
     LogicalReg {
         op: LogicalOp,
@@ -128,6 +141,12 @@ pub enum InstructionKind {
         rm: u8,
     },
     Branch {
+        offset: i64,
+        target: u64,
+    },
+    /// `B.cond` — conditional branch.
+    CondBranch {
+        cond: Cond,
         offset: i64,
         target: u64,
     },
@@ -154,11 +173,13 @@ impl InstructionKind {
     #[must_use]
     pub const fn class(&self) -> InstructionClass {
         match self {
-            Self::MovZ { .. } | Self::AddImmediate { .. } | Self::SubImmediate { .. } => {
-                InstructionClass::DataProcessingImmediate
-            }
+            Self::MovZ { .. }
+            | Self::AddImmediate { .. }
+            | Self::SubImmediate { .. }
+            | Self::AddsImmediate { .. }
+            | Self::SubsImmediate { .. } => InstructionClass::DataProcessingImmediate,
             Self::LogicalReg { .. } => InstructionClass::DataProcessingRegister,
-            Self::Branch { .. } => InstructionClass::Branch,
+            Self::Branch { .. } | Self::CondBranch { .. } => InstructionClass::Branch,
             Self::Svc { .. } => InstructionClass::Exception,
             Self::Store { .. } | Self::Load { .. } => InstructionClass::LoadStore,
         }
@@ -179,6 +200,18 @@ impl InstructionKind {
             Self::SubImmediate { rd, rn, imm } => {
                 format!("sub {}, {}, #{imm:#x}", gp_or_sp(*rd), gp_or_sp(*rn))
             }
+            Self::AddsImmediate { rd, rn, imm } if *rd == 31 => {
+                format!("cmn {}, #{imm:#x}", gp_or_sp(*rn))
+            }
+            Self::AddsImmediate { rd, rn, imm } => {
+                format!("adds {}, {}, #{imm:#x}", gp_or_zr(*rd), gp_or_sp(*rn))
+            }
+            Self::SubsImmediate { rd, rn, imm } if *rd == 31 => {
+                format!("cmp {}, #{imm:#x}", gp_or_sp(*rn))
+            }
+            Self::SubsImmediate { rd, rn, imm } => {
+                format!("subs {}, {}, #{imm:#x}", gp_or_zr(*rd), gp_or_sp(*rn))
+            }
             Self::LogicalReg { op, rd, rn, rm } => {
                 let mnemonic = match op {
                     LogicalOp::And => "and",
@@ -193,6 +226,9 @@ impl InstructionKind {
                 )
             }
             Self::Branch { target, .. } => format!("b {target:#x}"),
+            Self::CondBranch { cond, target, .. } => {
+                format!("b.{} {target:#x}", cond.suffix())
+            }
             Self::Svc { imm } => format!("svc #{imm:#x}"),
             Self::Store {
                 rt,
@@ -258,11 +294,40 @@ fn decode_kind(word: u32, address: u64) -> Result<InstructionKind, DecodeError> 
         return Ok(InstructionKind::SubImmediate { rd, rn, imm });
     }
 
+    if (word & 0xFF00_0000) == 0xB100_0000 {
+        let rd = bits(word, 0, 5) as u8;
+        let rn = bits(word, 5, 5) as u8;
+        let shift = if bit(word, 22) { 12 } else { 0 };
+        let imm = u64::from(bits(word, 10, 12)) << shift;
+        return Ok(InstructionKind::AddsImmediate { rd, rn, imm });
+    }
+
+    if (word & 0xFF00_0000) == 0xF100_0000 {
+        let rd = bits(word, 0, 5) as u8;
+        let rn = bits(word, 5, 5) as u8;
+        let shift = if bit(word, 22) { 12 } else { 0 };
+        let imm = u64::from(bits(word, 10, 12)) << shift;
+        return Ok(InstructionKind::SubsImmediate { rd, rn, imm });
+    }
+
     if (word & 0xFC00_0000) == 0x1400_0000 {
         let imm26 = u64::from(word & 0x03FF_FFFF);
         let offset = sign_extend(imm26 << 2, 28);
         let target = address.wrapping_add_signed(offset);
         return Ok(InstructionKind::Branch { offset, target });
+    }
+
+    // B.cond: 0101010 0 imm19 0 cond.
+    if (word & 0xFF00_0010) == 0x5400_0000 {
+        let cond = Cond::from_bits(bits(word, 0, 4) as u8);
+        let imm19 = u64::from(bits(word, 5, 19));
+        let offset = sign_extend(imm19 << 2, 21);
+        let target = address.wrapping_add_signed(offset);
+        return Ok(InstructionKind::CondBranch {
+            cond,
+            offset,
+            target,
+        });
     }
 
     if (word & 0xFFE0_001F) == 0xD400_0001 {
@@ -497,6 +562,58 @@ mod tests {
                 size: MemSize::Word,
             }
         );
+    }
+
+    #[test]
+    fn decodes_flag_setting_and_conditional_branch() {
+        use nx86_core::guest::Cond;
+
+        // adds x0, x1, #1 ; cmp x1, #2 (subs xzr,x1,#2) ; subs x2, x3, #1 ; b.eq +8
+        let bytes = [
+            0x20, 0x04, 0x00, 0xB1, // adds x0, x1, #1
+            0x3F, 0x08, 0x00, 0xF1, // cmp x1, #2
+            0x62, 0x04, 0x00, 0xF1, // subs x2, x3, #1
+            0x40, 0x00, 0x00, 0x54, // b.eq +8
+        ];
+        let decoded = decode_program(&bytes, 0x100).expect("program should decode");
+
+        assert_eq!(
+            decoded[0].kind,
+            InstructionKind::AddsImmediate {
+                rd: 0,
+                rn: 1,
+                imm: 1,
+            }
+        );
+        assert_eq!(decoded[0].disassembly, "adds x0, x1, #0x1");
+        assert_eq!(
+            decoded[1].kind,
+            InstructionKind::SubsImmediate {
+                rd: 31,
+                rn: 1,
+                imm: 2,
+            }
+        );
+        assert_eq!(decoded[1].disassembly, "cmp x1, #0x2");
+        assert_eq!(
+            decoded[2].kind,
+            InstructionKind::SubsImmediate {
+                rd: 2,
+                rn: 3,
+                imm: 1,
+            }
+        );
+        // b.eq is at 0x100 + 12 = 0x10c; target = 0x10c + 8 = 0x114.
+        assert_eq!(
+            decoded[3].kind,
+            InstructionKind::CondBranch {
+                cond: Cond::Eq,
+                offset: 8,
+                target: 0x114,
+            }
+        );
+        assert_eq!(decoded[3].class, InstructionClass::Branch);
+        assert_eq!(decoded[3].disassembly, "b.eq 0x114");
     }
 
     #[test]

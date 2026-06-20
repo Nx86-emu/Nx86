@@ -6,6 +6,7 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+nx86-core = { path = "../nx86-core" }
 serde.workspace = true
 thiserror.workspace = true
 

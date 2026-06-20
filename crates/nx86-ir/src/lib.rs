@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod verify;
 
+/// AArch64 condition codes, re-exported so NxIR consumers can name conditions
+/// without depending on `nx86-core` directly.
+pub use nx86_core::guest::Cond;
+
 /// An SSA value: defined exactly once, referenced by later instructions.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
@@ -55,6 +59,14 @@ pub enum BinaryOp {
     Xor,
 }
 
+/// The flag-producing operation recorded by a lazy [`Op::SetFlags`].
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FlagOp {
+    Add,
+    Sub,
+}
+
 /// An NxIR operation. Operations either define a value (e.g. [`Op::Binary`]) or
 /// produce a side effect (e.g. [`Op::SetReg`]).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,6 +97,9 @@ pub enum Op {
         address: Value,
         value: Value,
     },
+    /// Lazily record the NZCV flag source for `lhs <op> rhs` (Phase 15). NZCV is
+    /// not computed here; a later flag consumer materializes it. Side effect.
+    SetFlags { op: FlagOp, lhs: Value, rhs: Value },
 }
 
 impl Op {
@@ -95,14 +110,17 @@ impl Op {
             Self::Const { ty, .. } | Self::Binary { ty, .. } | Self::Load { ty, .. } => Some(*ty),
             Self::GetReg { .. } | Self::ZeroExtend { .. } => Some(Type::I64),
             Self::Trunc { .. } => Some(Type::I32),
-            Self::SetReg { .. } | Self::Store { .. } => None,
+            Self::SetReg { .. } | Self::Store { .. } | Self::SetFlags { .. } => None,
         }
     }
 
     /// Whether this op has a side effect beyond defining its value.
     #[must_use]
     pub const fn is_side_effect(&self) -> bool {
-        matches!(self, Self::SetReg { .. } | Self::Store { .. })
+        matches!(
+            self,
+            Self::SetReg { .. } | Self::Store { .. } | Self::SetFlags { .. }
+        )
     }
 
     /// The operands this op consumes, with the type each operand must have.
@@ -116,6 +134,7 @@ impl Op {
             Self::ZeroExtend { value } => vec![(*value, Type::I32)],
             Self::Load { address, .. } => vec![(*address, Type::I64)],
             Self::Store { ty, address, value } => vec![(*address, Type::I64), (*value, *ty)],
+            Self::SetFlags { lhs, rhs, .. } => vec![(*lhs, Type::I64), (*rhs, Type::I64)],
         }
     }
 
@@ -145,6 +164,13 @@ pub struct Inst {
 pub enum Terminator {
     /// Unconditional branch to another block.
     Branch { target: BlockId },
+    /// Conditional branch that materializes NZCV from the current lazy flag
+    /// source and tests `cond` (Phase 15).
+    CondBranch {
+        cond: Cond,
+        if_true: BlockId,
+        if_false: BlockId,
+    },
     /// Synthetic program exit (guest `SVC`). `pc` becomes the address after the
     /// halting instruction.
     Halt { reason: String },
@@ -158,6 +184,9 @@ impl Terminator {
     pub fn successors(&self) -> Vec<BlockId> {
         match self {
             Self::Branch { target } => vec![*target],
+            Self::CondBranch {
+                if_true, if_false, ..
+            } => vec![*if_true, *if_false],
             Self::Halt { .. } | Self::Return => Vec::new(),
         }
     }
@@ -277,12 +306,29 @@ fn format_op(op: &Op) -> String {
         Op::ZeroExtend { value } => format!("zext.i64 {value}"),
         Op::Load { ty, address } => format!("load.{ty} [{address}]"),
         Op::Store { ty, address, value } => format!("store.{ty} [{address}], {value}"),
+        Op::SetFlags { op, lhs, rhs } => {
+            let mnemonic = match op {
+                FlagOp::Add => "adds",
+                FlagOp::Sub => "subs",
+            };
+            format!("setflags.{mnemonic} {lhs}, {rhs}")
+        }
     }
 }
 
 fn format_terminator(terminator: &Terminator) -> String {
     match terminator {
         Terminator::Branch { target } => format!("br block{}", target.0),
+        Terminator::CondBranch {
+            cond,
+            if_true,
+            if_false,
+        } => format!(
+            "br.{} block{} else block{}",
+            cond.suffix(),
+            if_true.0,
+            if_false.0
+        ),
         Terminator::Halt { reason } => format!("halt {reason:?}"),
         Terminator::Return => "ret".to_owned(),
     }
@@ -404,6 +450,68 @@ mod tests {
             store.operand_constraints(),
             vec![(Value(5), Type::I64), (Value(6), Type::I32)]
         );
+    }
+
+    #[test]
+    fn set_flags_and_cond_branch_dump_and_successors() {
+        use super::{Cond, FlagOp};
+
+        let function = Function {
+            name: "cmp".to_owned(),
+            entry_address: 0,
+            value_count: 2,
+            blocks: vec![
+                Block {
+                    instructions: vec![
+                        Inst {
+                            result: Some(Value(0)),
+                            op: Op::GetReg { reg: Reg::X(0) },
+                            guest_address: 0x0,
+                        },
+                        Inst {
+                            result: Some(Value(1)),
+                            op: Op::Const {
+                                ty: Type::I64,
+                                value: 1,
+                            },
+                            guest_address: 0x0,
+                        },
+                        Inst {
+                            result: None,
+                            op: Op::SetFlags {
+                                op: FlagOp::Sub,
+                                lhs: Value(0),
+                                rhs: Value(1),
+                            },
+                            guest_address: 0x0,
+                        },
+                    ],
+                    terminator: Terminator::CondBranch {
+                        cond: Cond::Eq,
+                        if_true: super::BlockId(1),
+                        if_false: super::BlockId(0),
+                    },
+                    terminator_address: 0x4,
+                },
+                Block {
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return,
+                    terminator_address: 0x8,
+                },
+            ],
+        };
+
+        let dump = function.dump();
+        assert!(dump.contains("setflags.subs v0, v1"));
+        assert!(dump.contains("br.eq block1 else block0"));
+        assert_eq!(
+            function.blocks[0].terminator.successors(),
+            vec![super::BlockId(1), super::BlockId(0)]
+        );
+
+        let json = serde_json::to_string(&function).expect("function should serialize");
+        let decoded: Function = serde_json::from_str(&json).expect("function should deserialize");
+        assert_eq!(decoded, function);
     }
 
     #[test]

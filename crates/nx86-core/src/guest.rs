@@ -237,6 +237,122 @@ impl Nzcv {
             | ((self.carry as u32) << 29)
             | ((self.overflow as u32) << 28)
     }
+
+    /// Compute NZCV for a 64-bit `ADDS lhs, rhs`.
+    #[must_use]
+    pub fn from_add(lhs: u64, rhs: u64) -> Self {
+        let (result, carry) = lhs.overflowing_add(rhs);
+        let overflow = ((lhs ^ result) & (rhs ^ result)) >> 63 != 0;
+        Self {
+            negative: (result >> 63) != 0,
+            zero: result == 0,
+            carry,
+            overflow,
+        }
+    }
+
+    /// Compute NZCV for a 64-bit `SUBS lhs, rhs`. ARM defines the carry flag as
+    /// the inverse of the unsigned borrow.
+    #[must_use]
+    pub fn from_sub(lhs: u64, rhs: u64) -> Self {
+        let (result, borrow) = lhs.overflowing_sub(rhs);
+        let overflow = ((lhs ^ rhs) & (lhs ^ result)) >> 63 != 0;
+        Self {
+            negative: (result >> 63) != 0,
+            zero: result == 0,
+            carry: !borrow,
+            overflow,
+        }
+    }
+
+    /// Whether these flags satisfy an AArch64 condition code.
+    #[must_use]
+    pub const fn satisfies(self, cond: Cond) -> bool {
+        match cond {
+            Cond::Eq => self.zero,
+            Cond::Ne => !self.zero,
+            Cond::Cs => self.carry,
+            Cond::Cc => !self.carry,
+            Cond::Mi => self.negative,
+            Cond::Pl => !self.negative,
+            Cond::Vs => self.overflow,
+            Cond::Vc => !self.overflow,
+            Cond::Hi => self.carry && !self.zero,
+            Cond::Ls => !self.carry || self.zero,
+            Cond::Ge => self.negative == self.overflow,
+            Cond::Lt => self.negative != self.overflow,
+            Cond::Gt => !self.zero && (self.negative == self.overflow),
+            Cond::Le => self.zero || (self.negative != self.overflow),
+            Cond::Al => true,
+        }
+    }
+}
+
+/// An AArch64 condition code.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Cond {
+    Eq,
+    Ne,
+    Cs,
+    Cc,
+    Mi,
+    Pl,
+    Vs,
+    Vc,
+    Hi,
+    Ls,
+    Ge,
+    Lt,
+    Gt,
+    Le,
+    Al,
+}
+
+impl Cond {
+    /// Decode the 4-bit condition field (`0b1111` "never" is treated as `Al`).
+    #[must_use]
+    pub const fn from_bits(bits: u8) -> Self {
+        match bits & 0xF {
+            0 => Self::Eq,
+            1 => Self::Ne,
+            2 => Self::Cs,
+            3 => Self::Cc,
+            4 => Self::Mi,
+            5 => Self::Pl,
+            6 => Self::Vs,
+            7 => Self::Vc,
+            8 => Self::Hi,
+            9 => Self::Ls,
+            10 => Self::Ge,
+            11 => Self::Lt,
+            12 => Self::Gt,
+            13 => Self::Le,
+            _ => Self::Al,
+        }
+    }
+
+    /// The mnemonic suffix, e.g. `eq`.
+    #[must_use]
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            Self::Eq => "eq",
+            Self::Ne => "ne",
+            Self::Cs => "cs",
+            Self::Cc => "cc",
+            Self::Mi => "mi",
+            Self::Pl => "pl",
+            Self::Vs => "vs",
+            Self::Vc => "vc",
+            Self::Hi => "hi",
+            Self::Ls => "ls",
+            Self::Ge => "ge",
+            Self::Lt => "lt",
+            Self::Gt => "gt",
+            Self::Le => "le",
+            Self::Al => "al",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -484,6 +600,42 @@ mod tests {
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].register, RegisterName::Pc);
         assert_eq!(diffs[0].actual, RegisterValue::U64(4));
+    }
+
+    #[test]
+    fn flag_computation_matches_arm_semantics() {
+        use super::Cond;
+
+        // 1 - 1 == 0: zero set, carry set (no borrow), eq holds.
+        let sub = Nzcv::from_sub(1, 1);
+        assert!(sub.zero && sub.carry);
+        assert!(sub.satisfies(Cond::Eq));
+        assert!(!sub.satisfies(Cond::Ne));
+
+        // 1 - 2 underflows: negative set, carry clear (borrow), lt holds.
+        let borrow = Nzcv::from_sub(1, 2);
+        assert!(borrow.negative && !borrow.carry);
+        assert!(borrow.satisfies(Cond::Lt));
+        assert!(!borrow.satisfies(Cond::Ge));
+
+        // u64::MAX + 1 wraps to 0: zero + carry set.
+        let add = Nzcv::from_add(u64::MAX, 1);
+        assert!(add.zero && add.carry);
+
+        // Signed overflow: i64::MAX + 1.
+        let overflow = Nzcv::from_add(i64::MAX as u64, 1);
+        assert!(overflow.overflow && overflow.negative);
+    }
+
+    #[test]
+    fn condition_codes_decode_from_bits() {
+        use super::Cond;
+
+        assert_eq!(Cond::from_bits(0), Cond::Eq);
+        assert_eq!(Cond::from_bits(1), Cond::Ne);
+        assert_eq!(Cond::from_bits(11), Cond::Lt);
+        assert_eq!(Cond::from_bits(14), Cond::Al);
+        assert_eq!(Cond::from_bits(15), Cond::Al);
     }
 
     #[test]

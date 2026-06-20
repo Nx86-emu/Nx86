@@ -14,15 +14,34 @@ use std::collections::{BTreeSet, HashMap};
 
 use nx86_arm64_decode::{DecodedInstruction, InstructionKind, LogicalOp, MemSize};
 use nx86_ir::verify::{self, VerifyError};
-use nx86_ir::{BinaryOp, Block, BlockId, Function, Inst, Op, Reg, Terminator, Type, Value};
+use nx86_ir::{BinaryOp, Block, BlockId, FlagOp, Function, Inst, Op, Reg, Terminator, Type, Value};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum LiftError {
     #[error("branch at {address:#x} targets {target:#x}, which is not an instruction boundary")]
     UnknownBranchTarget { address: u64, target: u64 },
+    #[error("conditional branch at {address:#x} has no fall-through instruction")]
+    DanglingConditionalBranch { address: u64 },
     #[error("lifted IR failed verification: {0}")]
     Invalid(#[from] VerifyError),
+}
+
+/// Resolve a branch target address to the block that begins there.
+fn block_for_target(
+    index_of: &HashMap<u64, usize>,
+    block_id_of_start: &HashMap<usize, u32>,
+    address: u64,
+    target: u64,
+) -> Result<BlockId, LiftError> {
+    let target_index = index_of
+        .get(&target)
+        .ok_or(LiftError::UnknownBranchTarget { address, target })?;
+    block_id_of_start
+        .get(target_index)
+        .copied()
+        .map(BlockId)
+        .ok_or(LiftError::UnknownBranchTarget { address, target })
 }
 
 /// Lift a decoded program into a verified NxIR function.
@@ -56,23 +75,37 @@ pub fn lift_program(
         let mut block_insts: Vec<Inst> = Vec::new();
         let mut terminator: Option<(Terminator, u64)> = None;
 
-        for inst in &instructions[start..end] {
+        for (offset, inst) in instructions[start..end].iter().enumerate() {
+            let index = start + offset;
             match &inst.kind {
                 InstructionKind::Branch { target, .. } => {
-                    let target_index =
-                        index_of.get(target).ok_or(LiftError::UnknownBranchTarget {
-                            address: inst.address,
-                            target: *target,
-                        })?;
-                    let target_block = *block_id_of_start.get(target_index).ok_or(
-                        LiftError::UnknownBranchTarget {
-                            address: inst.address,
-                            target: *target,
-                        },
-                    )?;
+                    let target_block =
+                        block_for_target(&index_of, &block_id_of_start, inst.address, *target)?;
                     terminator = Some((
                         Terminator::Branch {
-                            target: BlockId(target_block),
+                            target: target_block,
+                        },
+                        inst.address,
+                    ));
+                    break;
+                }
+                InstructionKind::CondBranch { cond, target, .. } => {
+                    let if_true =
+                        block_for_target(&index_of, &block_id_of_start, inst.address, *target)?;
+                    // The not-taken edge falls through to the next instruction,
+                    // which compute_block_starts marked as a block leader.
+                    let if_false = block_id_of_start
+                        .get(&(index + 1))
+                        .copied()
+                        .map(BlockId)
+                        .ok_or(LiftError::DanglingConditionalBranch {
+                            address: inst.address,
+                        })?;
+                    terminator = Some((
+                        Terminator::CondBranch {
+                            cond: *cond,
+                            if_true,
+                            if_false,
                         },
                         inst.address,
                     ));
@@ -143,7 +176,7 @@ fn compute_block_starts(
     }
     for (index, inst) in instructions.iter().enumerate() {
         let is_terminator = match &inst.kind {
-            InstructionKind::Branch { target, .. } => {
+            InstructionKind::Branch { target, .. } | InstructionKind::CondBranch { target, .. } => {
                 if let Some(&target_index) = index_of.get(target) {
                     leaders.insert(target_index);
                 }
@@ -188,6 +221,12 @@ fn lift_data(kind: &InstructionKind, address: u64, out: &mut Vec<Inst>, counter:
         }
         InstructionKind::SubImmediate { rd, rn, imm } => {
             lift_add_sub(BinaryOp::Sub, *rd, *rn, *imm, address, out, counter);
+        }
+        InstructionKind::AddsImmediate { rd, rn, imm } => {
+            lift_flag_setting(FlagOp::Add, *rd, *rn, *imm, address, out, counter);
+        }
+        InstructionKind::SubsImmediate { rd, rn, imm } => {
+            lift_flag_setting(FlagOp::Sub, *rd, *rn, *imm, address, out, counter);
         }
         InstructionKind::LogicalReg { op, rd, rn, rm } => {
             let lhs = alloc(counter);
@@ -314,8 +353,62 @@ fn lift_data(kind: &InstructionKind, address: u64, out: &mut Vec<Inst>, counter:
             }
         }
         // Terminators are handled by the caller.
-        InstructionKind::Branch { .. } | InstructionKind::Svc { .. } => {}
+        InstructionKind::Branch { .. }
+        | InstructionKind::CondBranch { .. }
+        | InstructionKind::Svc { .. } => {}
     }
+}
+
+/// Lift a flag-setting `ADDS`/`SUBS` (and the `CMP`/`CMN` aliases). Emits a lazy
+/// `SetFlags` recording the operands, then the result write (`rd` = 31 discards,
+/// matching the zero-register semantics of the S-form).
+fn lift_flag_setting(
+    flag: FlagOp,
+    rd: u8,
+    rn: u8,
+    imm: u64,
+    address: u64,
+    out: &mut Vec<Inst>,
+    counter: &mut u32,
+) {
+    let binary = match flag {
+        FlagOp::Add => BinaryOp::Add,
+        FlagOp::Sub => BinaryOp::Sub,
+    };
+    let lhs = alloc(counter);
+    push(out, Some(lhs), Op::GetReg { reg: reg_sp(rn) }, address);
+    let rhs = alloc(counter);
+    push(
+        out,
+        Some(rhs),
+        Op::Const {
+            ty: Type::I64,
+            value: imm,
+        },
+        address,
+    );
+    push(out, None, Op::SetFlags { op: flag, lhs, rhs }, address);
+    let result = alloc(counter);
+    push(
+        out,
+        Some(result),
+        Op::Binary {
+            op: binary,
+            ty: Type::I64,
+            lhs,
+            rhs,
+        },
+        address,
+    );
+    push(
+        out,
+        None,
+        Op::SetReg {
+            reg: reg_zr(rd),
+            value: result,
+        },
+        address,
+    );
 }
 
 fn lift_add_sub(

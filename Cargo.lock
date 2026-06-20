@@ -1586,6 +1586,7 @@ dependencies = [
 name = "nx86-arm64-decode"
 version = "0.1.0"
 dependencies = [
+ "nx86-core",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -1678,6 +1679,7 @@ version = "0.1.0"
 name = "nx86-ir"
 version = "0.1.0"
 dependencies = [
+ "nx86-core",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1686,6 +1688,9 @@ dependencies = [
 [[package]]
 name = "nx86-ir-opt"
 version = "0.1.0"
+dependencies = [
+ "nx86-ir",
+]
 
 [[package]]
 name = "nx86-jit"
@@ -1711,6 +1716,7 @@ dependencies = [
  "nx86-arm64-lift",
  "nx86-core",
  "nx86-ir",
+ "nx86-ir-opt",
  "nx86-testsuite",
  "nx86-vmm",
  "thiserror 2.0.18",

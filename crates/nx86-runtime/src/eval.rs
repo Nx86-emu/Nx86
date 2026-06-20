@@ -5,10 +5,13 @@
 //! TinyInterpreter): the two engines must agree on the final guest state and
 //! memory for every synthetic program.
 
-use nx86_core::guest::CpuState;
-use nx86_ir::{BinaryOp, Function, Inst, Op, Reg, Terminator, Type, Value};
+use nx86_core::guest::{CpuState, Nzcv};
+use nx86_ir::{BinaryOp, FlagOp, Function, Inst, Op, Reg, Terminator, Type, Value};
 use nx86_vmm::{GuestAddress, GuestMemory, VmmFault};
 use thiserror::Error;
+
+/// A lazily-recorded NZCV flag source: the operation and its operands.
+type FlagSource = (FlagOp, u64, u64);
 
 /// Maximum number of block executions before evaluation is abandoned.
 const STEP_LIMIT: usize = 100_000;
@@ -33,6 +36,7 @@ pub fn evaluate(function: &Function, memory: &mut GuestMemory) -> Result<CpuStat
     let mut cpu = CpuState::new();
     cpu.set_pc(function.entry_address);
     let mut values = vec![0u64; function.value_count as usize];
+    let mut pending_flags: Option<FlagSource> = None;
     let mut block_index = 0usize;
 
     for _ in 0..STEP_LIMIT {
@@ -41,16 +45,36 @@ pub fn evaluate(function: &Function, memory: &mut GuestMemory) -> Result<CpuStat
             .get(block_index)
             .ok_or(EvalError::BlockOutOfRange { block: block_index })?;
         for inst in &block.instructions {
-            execute_op(inst, &mut cpu, &mut values, memory)?;
+            execute_op(inst, &mut cpu, &mut values, memory, &mut pending_flags)?;
         }
         match &block.terminator {
             Terminator::Branch { target } => block_index = target.0 as usize,
+            Terminator::CondBranch {
+                cond,
+                if_true,
+                if_false,
+            } => {
+                // Materialize NZCV from the lazy source only when a branch reads
+                // it, then record it so the architectural flags stay observable.
+                let nzcv = materialize(pending_flags);
+                cpu.set_nzcv(nzcv);
+                let taken = if nzcv.satisfies(*cond) {
+                    *if_true
+                } else {
+                    *if_false
+                };
+                block_index = taken.0 as usize;
+            }
             Terminator::Halt { reason } => {
+                cpu.set_nzcv(materialize(pending_flags));
                 cpu.set_pc(block.terminator_address + 4);
                 cpu.halt(reason.clone());
                 return Ok(cpu);
             }
-            Terminator::Return => return Ok(cpu),
+            Terminator::Return => {
+                cpu.set_nzcv(materialize(pending_flags));
+                return Ok(cpu);
+            }
         }
     }
 
@@ -59,11 +83,21 @@ pub fn evaluate(function: &Function, memory: &mut GuestMemory) -> Result<CpuStat
     })
 }
 
+/// Materialize NZCV from a lazily-recorded flag source.
+fn materialize(pending: Option<FlagSource>) -> Nzcv {
+    match pending {
+        Some((FlagOp::Add, lhs, rhs)) => Nzcv::from_add(lhs, rhs),
+        Some((FlagOp::Sub, lhs, rhs)) => Nzcv::from_sub(lhs, rhs),
+        None => Nzcv::default(),
+    }
+}
+
 fn execute_op(
     inst: &Inst,
     cpu: &mut CpuState,
     values: &mut [u64],
     memory: &mut GuestMemory,
+    pending_flags: &mut Option<FlagSource>,
 ) -> Result<(), EvalError> {
     let computed: Option<u64> = match &inst.op {
         Op::Const { ty, value } => Some(mask(*ty, *value)),
@@ -88,6 +122,13 @@ fn execute_op(
             let resolved_address = value_at(values, *address)?;
             let resolved_value = value_at(values, *value)?;
             store_mem(memory, *ty, resolved_address, resolved_value)?;
+            None
+        }
+        Op::SetFlags { op, lhs, rhs } => {
+            // Lazy: record the source; NZCV is materialized only when consumed.
+            let a = value_at(values, *lhs)?;
+            let b = value_at(values, *rhs)?;
+            *pending_flags = Some((*op, a, b));
             None
         }
     };
