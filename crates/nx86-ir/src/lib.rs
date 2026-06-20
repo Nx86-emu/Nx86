@@ -11,6 +11,8 @@ use std::fmt::{self, Write as _};
 
 use serde::{Deserialize, Serialize};
 
+pub mod verify;
+
 /// An SSA value: defined exactly once, referenced by later instructions.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
