@@ -1,0 +1,20 @@
+[package]
+name = "nx86-app"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "nx86-app"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+nx86-core = { path = "../nx86-core" }
+nx86-debug = { path = "../nx86-debug" }
+nx86-gui = { path = "../nx86-gui" }
+tracing.workspace = true
+
+[lints]
+workspace = true

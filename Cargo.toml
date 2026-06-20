@@ -1,0 +1,72 @@
+[workspace]
+members = [
+    "crates/nx86-app",
+    "crates/nx86-gui",
+    "crates/nx86-core",
+    "crates/nx86-title-db",
+    "crates/nx86-import",
+    "crates/nx86-inspector",
+    "crates/nx86-arm64-decode",
+    "crates/nx86-arm64-lift",
+    "crates/nx86-ir",
+    "crates/nx86-ir-opt",
+    "crates/nx86-backend",
+    "crates/nx86-x64-asm",
+    "crates/nx86-x64-v4",
+    "crates/nx86-regalloc",
+    "crates/nx86-object",
+    "crates/nx86-jit",
+    "crates/nx86-runtime",
+    "crates/nx86-vmm",
+    "crates/nx86-scheduler",
+    "crates/nx86-hle",
+    "crates/nx86-input",
+    "crates/nx86-audio",
+    "crates/nx86-gpu",
+    "crates/nx86-vulkan",
+    "crates/nx86-shader",
+    "crates/nx86-profile",
+    "crates/nx86-gso",
+    "crates/nx86-title-profiles",
+    "crates/nx86-cache",
+    "crates/nx86-debug",
+    "crates/nx86-testsuite",
+    "crates/nx86-fuzz",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+publish = false
+rust-version = "1.95"
+version = "0.1.0"
+
+[workspace.dependencies]
+# Cargo ignores semver build metadata in dependency requirements; Cargo.lock
+# resolves this exact package to ash 0.38.0+1.3.281.
+ash = "=0.38.0"
+clap = { version = "4.6.1", features = ["derive"] }
+directories = "6.0.0"
+eframe = { version = "0.34.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.34.3"
+libc = "0.2.186"
+rfd = "0.17.2"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+toml = "1.1.2"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+[workspace.lints.rust]
+rust_2018_idioms = "warn"
+unsafe_code = "warn"
+unused_lifetimes = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"

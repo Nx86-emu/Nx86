@@ -1,0 +1,262 @@
+use nx86_arm64_decode::{DecodeError, DecodedInstruction, InstructionKind, decode_program};
+use nx86_core::guest::{CpuState, CpuStateDiff};
+use nx86_testsuite::{SyntheticArm64Test, SyntheticTestError};
+use thiserror::Error;
+
+#[derive(Clone, Debug)]
+pub struct TinyInterpreter {
+    instructions: Vec<DecodedInstruction>,
+    base_address: u64,
+    max_steps: usize,
+}
+
+impl TinyInterpreter {
+    #[must_use]
+    pub fn new(instructions: Vec<DecodedInstruction>) -> Self {
+        let base_address = instructions
+            .first()
+            .map_or(0, |instruction| instruction.address);
+        Self {
+            instructions,
+            base_address,
+            max_steps: 1_000,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_max_steps(mut self, max_steps: usize) -> Self {
+        self.max_steps = max_steps;
+        self
+    }
+
+    pub fn run(&self, mut state: CpuState) -> Result<InterpreterResult, InterpreterError> {
+        let mut trace = Vec::new();
+
+        for _ in 0..self.max_steps {
+            if state.halted() {
+                return Ok(InterpreterResult {
+                    final_state: state,
+                    trace,
+                });
+            }
+
+            let pc = state.pc();
+            let instruction = self.instruction_at(pc)?;
+            trace.push(TraceStep {
+                pc,
+                disassembly: instruction.disassembly.clone(),
+            });
+            self.execute(instruction, &mut state)?;
+        }
+
+        Err(InterpreterError::StepLimit {
+            max_steps: self.max_steps,
+        })
+    }
+
+    fn instruction_at(&self, pc: u64) -> Result<&DecodedInstruction, InterpreterError> {
+        let offset = pc
+            .checked_sub(self.base_address)
+            .ok_or(InterpreterError::PcOutOfProgram { pc })?;
+        if offset % 4 != 0 {
+            return Err(InterpreterError::PcOutOfProgram { pc });
+        }
+        let index =
+            usize::try_from(offset / 4).map_err(|_| InterpreterError::PcOutOfProgram { pc })?;
+        self.instructions
+            .get(index)
+            .ok_or(InterpreterError::PcOutOfProgram { pc })
+    }
+
+    fn execute(
+        &self,
+        instruction: &DecodedInstruction,
+        state: &mut CpuState,
+    ) -> Result<(), InterpreterError> {
+        let next_pc = instruction.address + 4;
+        match instruction.kind {
+            InstructionKind::MovZ { rd, imm, .. } => {
+                state.set_x(rd, imm);
+                state.set_pc(next_pc);
+            }
+            InstructionKind::AddImmediate { rd, rn, imm } => {
+                let value = state.read_gp_or_sp(rn).wrapping_add(imm);
+                state.write_gp_or_sp(rd, value);
+                state.set_pc(next_pc);
+            }
+            InstructionKind::SubImmediate { rd, rn, imm } => {
+                let value = state.read_gp_or_sp(rn).wrapping_sub(imm);
+                state.write_gp_or_sp(rd, value);
+                state.set_pc(next_pc);
+            }
+            InstructionKind::Branch { target, .. } => {
+                if self.instruction_at(target).is_err() {
+                    return Err(InterpreterError::BranchOutOfProgram {
+                        pc: instruction.address,
+                        target,
+                    });
+                }
+                state.set_pc(target);
+            }
+            InstructionKind::Svc { imm } => {
+                state.set_pc(next_pc);
+                state.halt(format!("svc #{imm:#x}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InterpreterResult {
+    pub final_state: CpuState,
+    pub trace: Vec<TraceStep>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceStep {
+    pub pc: u64,
+    pub disassembly: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SyntheticRunResult {
+    pub interpreter: InterpreterResult,
+    pub register_diffs: Vec<CpuStateDiff>,
+}
+
+pub fn run_synthetic_test(
+    test: &SyntheticArm64Test,
+) -> Result<SyntheticRunResult, InterpreterError> {
+    let entry_point = test.entry_point()?;
+    let instructions = decode_program(&test.program.bytes, entry_point)?;
+    let mut state = CpuState::new();
+    state.set_pc(entry_point);
+
+    let interpreter = TinyInterpreter::new(instructions).run(state)?;
+    let register_diffs = test.expected.compare_cpu_state(&interpreter.final_state)?;
+
+    Ok(SyntheticRunResult {
+        interpreter,
+        register_diffs,
+    })
+}
+
+#[derive(Debug, Error)]
+pub enum InterpreterError {
+    #[error("decode error: {0}")]
+    Decode(#[from] DecodeError),
+    #[error("synthetic test error: {0}")]
+    Synthetic(#[from] SyntheticTestError),
+    #[error("pc {pc:#x} is outside the decoded program")]
+    PcOutOfProgram { pc: u64 },
+    #[error("branch at {pc:#x} targets {target:#x}, outside decoded program")]
+    BranchOutOfProgram { pc: u64, target: u64 },
+    #[error("interpreter exceeded step limit {max_steps}")]
+    StepLimit { max_steps: usize },
+}
+
+#[cfg(test)]
+mod tests {
+    use nx86_arm64_decode::decode_program;
+    use nx86_core::guest::CpuState;
+    use nx86_testsuite::SyntheticArm64Test;
+
+    use super::{InterpreterError, TinyInterpreter, run_synthetic_test};
+
+    #[test]
+    fn synthetic_add_program_executes_and_matches_expected_registers() {
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "add"
+            entry-point = "0x0"
+
+            [program]
+            arm64-hex = "20 00 80 D2 01 08 00 91 01 00 00 D4"
+
+            [expected.registers]
+            x0 = "0x1"
+            x1 = "0x3"
+            pc = "0xc"
+            halted = "true"
+            "#,
+        )
+        .expect("test should parse");
+
+        let result = run_synthetic_test(&test).expect("test should run");
+
+        assert!(result.register_diffs.is_empty());
+        assert_eq!(result.interpreter.final_state.x(1), 3);
+        assert_eq!(result.interpreter.trace.len(), 3);
+    }
+
+    #[test]
+    fn branch_updates_pc_and_skips_instruction() {
+        let bytes = [
+            0x20, 0x00, 0x80, 0xD2, // mov x0, #1
+            0x02, 0x00, 0x00, 0x14, // b +8
+            0x40, 0x00, 0x80, 0xD2, // mov x0, #2
+            0x01, 0x00, 0x00, 0xD4, // svc #0
+        ];
+        let decoded = decode_program(&bytes, 0).expect("program should decode");
+        let mut state = CpuState::new();
+        state.set_pc(0);
+
+        let result = TinyInterpreter::new(decoded)
+            .run(state)
+            .expect("program should run");
+
+        assert_eq!(result.final_state.x(0), 1);
+        assert_eq!(result.final_state.pc(), 16);
+        assert!(result.final_state.halted());
+    }
+
+    #[test]
+    fn svc_halts_and_advances_pc() {
+        let decoded =
+            decode_program(&[0x01, 0x00, 0x00, 0xD4], 0x1000).expect("program should decode");
+        let mut state = CpuState::new();
+        state.set_pc(0x1000);
+
+        let result = TinyInterpreter::new(decoded)
+            .run(state)
+            .expect("program should run");
+
+        assert!(result.final_state.halted());
+        assert_eq!(result.final_state.pc(), 0x1004);
+    }
+
+    #[test]
+    fn expected_register_mismatch_is_reported() {
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "mismatch"
+
+            [program]
+            arm64-hex = "20 00 80 D2 01 00 00 D4"
+
+            [expected.registers]
+            x0 = "0x2"
+            "#,
+        )
+        .expect("test should parse");
+
+        let result = run_synthetic_test(&test).expect("test should run");
+
+        assert_eq!(result.register_diffs.len(), 1);
+    }
+
+    #[test]
+    fn branch_out_of_program_errors() {
+        let decoded = decode_program(&[0x04, 0x00, 0x00, 0x14], 0).expect("program should decode");
+        let state = CpuState::new();
+
+        let error = TinyInterpreter::new(decoded)
+            .run(state)
+            .expect_err("branch should fail");
+
+        assert!(matches!(error, InterpreterError::BranchOutOfProgram { .. }));
+    }
+}

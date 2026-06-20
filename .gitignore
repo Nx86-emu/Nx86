@@ -1,0 +1,13 @@
+/target/
+/.idea/
+/.vscode/
+/.DS_Store
+*.swp
+*.swo
+*.log
+
+# Local Nx86 runtime data should not be committed.
+/Nx86/
+/nx86-data/
+/profiles/
+/global-cache/

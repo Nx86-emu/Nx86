@@ -1,0 +1,21 @@
+[package]
+name = "nx86-gui"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+nx86-arm64-decode = { path = "../nx86-arm64-decode" }
+nx86-core = { path = "../nx86-core" }
+nx86-runtime = { path = "../nx86-runtime" }
+nx86-testsuite = { path = "../nx86-testsuite" }
+nx86-title-db = { path = "../nx86-title-db" }
+nx86-vmm = { path = "../nx86-vmm" }
+rfd.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
