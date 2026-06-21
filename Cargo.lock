@@ -1613,6 +1613,7 @@ dependencies = [
  "nx86-ir",
  "nx86-jit",
  "nx86-object",
+ "nx86-profile",
  "nx86-x64-v4",
  "tempfile",
  "thiserror 2.0.18",
@@ -1736,6 +1737,12 @@ dependencies = [
 [[package]]
 name = "nx86-profile"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "nx86-regalloc"

@@ -8,6 +8,9 @@ use thiserror::Error;
 
 use crate::config::StorageConfig;
 
+/// Conventional per-title runtime profile file name (format version 1).
+pub const RUNTIME_PROFILE_FILE: &str = "runtime-v1.jsonl";
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageLayout {
     pub data_root: PathBuf,
@@ -46,6 +49,13 @@ impl StorageLayout {
     #[must_use]
     pub fn database_path(&self) -> PathBuf {
         self.database_dir.join("titles.sqlite3")
+    }
+
+    #[must_use]
+    pub fn runtime_profile_path(&self, title_id: &str) -> PathBuf {
+        self.title_dir(title_id)
+            .join("profiles")
+            .join(RUNTIME_PROFILE_FILE)
     }
 
     pub fn ensure_base_dirs(&self) -> Result<(), StorageError> {
@@ -127,6 +137,12 @@ mod tests {
                 .join("data")
                 .join("titles")
                 .join("0100ABCD12345678")
+        );
+        assert_eq!(
+            layout.runtime_profile_path("0100ABCD12345678"),
+            layout
+                .title_dir("0100ABCD12345678")
+                .join("profiles/runtime-v1.jsonl")
         );
     }
 

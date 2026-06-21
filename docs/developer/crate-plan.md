@@ -12,10 +12,10 @@ synthetic ARM64 test display, guest CPU state, a narrow AArch64 decoder, a tiny
 synthetic interpreter, an NxIR differential oracle, a VMM skeleton, and the
 first internal x86_64 native-codegen path for a single-block synthetic integer
 program. It does not implement real title import, Switch runtime execution,
-persistent runtime profiles, native memory or conditional-branch lowering,
+profile-guided rebuilding, native memory or conditional-branch lowering,
 graphics, or Switch rendering.
 
-## Active Phase 0-23 Crates
+## Active Phase 0-24 Crates
 
 - `nx86-app`: binary entrypoint, logging setup, config load, GUI launch.
 - `nx86-gui`: egui shell, wizard, theme, navigation, title list, worker progress, synthetic test display, decode display, tiny interpreter status, framebuffer rendering, and NxIR/native dump agreement.
@@ -33,6 +33,7 @@ graphics, or Switch rendering.
 - `nx86-regalloc`: basic linear-scan register allocator for a single NxIR block (pool registers with stack-slot spills).
 - `nx86-object`: AOT object format v0 — `.nxo` serialization of a native block with guest mapping and a validation hash.
 - `nx86-cache`: cache manager v0 — `.nxo` object directory with a manifest, shallow/full integrity checks, size accounting, and insert/load/remove/clear.
+- `nx86-profile`: versioned JSONL runtime profile writer/reader with crash-tail recovery and file-wide branch-pair deduplication.
 - `nx86-vmm`: 64 GiB guest memory arena boundary and software page-table helpers.
 - `nx86-debug`: tracing-based logging setup.
 - `nx86-testsuite`: synthetic ARM64 test file format, framebuffer spec, and result diffs.
@@ -42,8 +43,8 @@ graphics, or Switch rendering.
 
 The remaining crates compile as placeholders so the workspace layout matches
 the specification while later phases can fill them in without reshaping the
-repository. Persistent profile logging, profile-guided rebuild, and broader
-runtime/graphics crates remain deferred to Phases 24+.
+repository. Profile-guided rebuild and broader runtime/graphics crates remain
+deferred to Phases 25+.
 
 ## Vulkan Policy
 

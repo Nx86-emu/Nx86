@@ -16,6 +16,7 @@ use nx86_core::guest::CpuState;
 use nx86_ir::{Function, Terminator};
 use nx86_jit::{EmergencyJit, ExecError, ExecutableMemory, JitError, JitEvent};
 use nx86_object::NativeObject;
+use nx86_profile::{ProfileError, ProfileEvent, ProfileSink};
 use nx86_x64_v4::{LoweringError, NativeBlockState, lower_function};
 use thiserror::Error;
 
@@ -51,6 +52,7 @@ pub struct Dispatcher {
     halt_reasons: BTreeMap<u64, String>,
     max_steps: usize,
     emergency_jit: Option<EmergencyJit>,
+    profile_sink: Option<Box<dyn ProfileSink>>,
 }
 
 impl Dispatcher {
@@ -107,6 +109,7 @@ impl Dispatcher {
             halt_reasons: BTreeMap::new(),
             max_steps: DEFAULT_MAX_STEPS,
             emergency_jit: None,
+            profile_sink: None,
         })
     }
 
@@ -120,6 +123,14 @@ impl Dispatcher {
     #[must_use]
     pub fn with_emergency_jit(mut self, emergency_jit: EmergencyJit) -> Self {
         self.emergency_jit = Some(emergency_jit);
+        self
+    }
+
+    /// Attach a runtime profile destination. Profile failures are fatal to the
+    /// dispatch run and are returned as [`DispatchError::Profile`].
+    #[must_use]
+    pub fn with_profile_sink(mut self, profile_sink: impl ProfileSink + 'static) -> Self {
+        self.profile_sink = Some(Box::new(profile_sink));
         self
     }
 
@@ -159,6 +170,10 @@ impl Dispatcher {
                         jit_events,
                     });
                 }
+                self.record_profile(ProfileEvent::BranchTarget {
+                    source_pc: pc,
+                    target_pc: native.pc,
+                })?;
                 continue;
             }
 
@@ -176,6 +191,11 @@ impl Dispatcher {
                     jit_events,
                 });
             };
+            self.record_profile(ProfileEvent::JitBlock {
+                guest_pc: compilation.event.guest_pc,
+                code_size_bytes: compilation.event.code_size_bytes as u64,
+                cache_file_name: compilation.event.cache_file_name.clone(),
+            })?;
             let executable = ExecutableMemory::new(&compilation.object.code)?;
             if let Some(reason) = compilation.halt_reason {
                 self.halt_reasons.insert(pc, reason);
@@ -192,6 +212,13 @@ impl Dispatcher {
             jit_events,
         })
     }
+
+    fn record_profile(&mut self, event: ProfileEvent) -> Result<(), DispatchError> {
+        if let Some(profile_sink) = &mut self.profile_sink {
+            profile_sink.record(event)?;
+        }
+        Ok(())
+    }
 }
 
 /// A failure building or running the dispatcher.
@@ -203,6 +230,8 @@ pub enum DispatchError {
     Exec(#[from] ExecError),
     #[error("emergency JIT failed: {0}")]
     EmergencyJit(#[from] JitError),
+    #[error("runtime profile recording failed: {0}")]
+    Profile(#[from] ProfileError),
     #[error("multiple native blocks use guest entry pc {pc:#x}")]
     DuplicateBlock { pc: u64 },
     #[error("dispatcher has no native blocks")]
@@ -257,6 +286,7 @@ pub fn run_dispatched_function(
         halt_reasons: function_halt_reasons(function),
         max_steps: DEFAULT_MAX_STEPS,
         emergency_jit: None,
+        profile_sink: None,
     };
 
     let outcome = match dispatcher.run(initial, None) {
@@ -284,5 +314,45 @@ pub fn run_dispatched_function(
         DispatchExit::StepLimit { steps } => {
             NativeOutcome::error(dump, format!("dispatcher exceeded {steps} steps"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeMap, io, path::PathBuf};
+
+    use nx86_profile::{ProfileError, ProfileEvent, ProfileSink, RecordOutcome};
+
+    use super::{DEFAULT_MAX_STEPS, DispatchError, Dispatcher};
+
+    #[derive(Debug)]
+    struct FailingProfileSink;
+
+    impl ProfileSink for FailingProfileSink {
+        fn record(&mut self, _event: ProfileEvent) -> Result<RecordOutcome, ProfileError> {
+            Err(ProfileError::Io {
+                path: PathBuf::from("profile.jsonl"),
+                source: io::Error::other("injected write failure"),
+            })
+        }
+    }
+
+    #[test]
+    fn profile_failure_is_a_dispatch_error() {
+        let mut dispatcher = Dispatcher {
+            blocks: BTreeMap::new(),
+            halt_reasons: BTreeMap::new(),
+            max_steps: DEFAULT_MAX_STEPS,
+            emergency_jit: None,
+            profile_sink: Some(Box::new(FailingProfileSink)),
+        };
+
+        let error = dispatcher
+            .record_profile(ProfileEvent::BranchTarget {
+                source_pc: 0,
+                target_pc: 4,
+            })
+            .expect_err("profile failure must stop dispatch");
+        assert!(matches!(error, DispatchError::Profile(_)));
     }
 }

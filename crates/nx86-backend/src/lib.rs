@@ -5,6 +5,10 @@ use nx86_x64_v4::{LoweredBlock, LoweringError, NativeBlockState, lower_tiny_bloc
 
 pub use nx86_jit::{EmergencyJit, JitCompilation, JitError, JitEvent};
 pub use nx86_object::{NativeObject, ObjectError};
+pub use nx86_profile::{
+    MemoryAccessKind, ProfileError, ProfileEvent, ProfileLog, ProfileRecord, ProfileSink,
+    ProfileWriter, RecordOutcome, read_profile,
+};
 
 mod dispatch;
 pub use dispatch::{
@@ -572,6 +576,9 @@ mod tests {
     fn dispatcher_jits_missing_block_caches_it_and_continues() {
         let dir = tempfile::tempdir().expect("temp dir");
         let cache = nx86_cache::CacheManager::open(dir.path()).expect("open cache");
+        let profile_path = dir.path().join("runtime-v1.jsonl");
+        let profile_writer =
+            nx86_profile::ProfileWriter::open(&profile_path).expect("open runtime profile");
         let function = two_block_branch_function();
         let objects = objects_for(&function);
         // SAFETY: `objects_for` directly wraps bytes from the trusted lowerer;
@@ -580,7 +587,9 @@ mod tests {
         let dispatcher =
             unsafe { super::Dispatcher::from_objects(&objects[..1]) }.expect("build dispatcher");
         let jit = nx86_jit::EmergencyJit::new(function, cache.clone()).expect("create JIT");
-        let mut dispatcher = dispatcher.with_emergency_jit(jit);
+        let mut dispatcher = dispatcher
+            .with_emergency_jit(jit)
+            .with_profile_sink(profile_writer);
 
         let mut initial = CpuState::new();
         initial.set_pc(0);
@@ -591,11 +600,35 @@ mod tests {
         assert_eq!(outcome.jit_events.len(), 1);
         assert_eq!(outcome.jit_events[0].guest_pc, 0x8);
         assert_eq!(cache.load(0x8).expect("load JIT object").entry_address, 0x8);
+        let profile = nx86_profile::read_profile(&profile_path).expect("read runtime profile");
+        assert_eq!(profile.records.len(), 2);
+        assert!(matches!(
+            profile.records[0].event,
+            nx86_profile::ProfileEvent::BranchTarget {
+                source_pc: 0,
+                target_pc: 0x8
+            }
+        ));
+        assert!(matches!(
+            &profile.records[1].event,
+            nx86_profile::ProfileEvent::JitBlock {
+                guest_pc: 0x8,
+                cache_file_name,
+                ..
+            } if cache_file_name == "0000000000000008.nxo"
+        ));
 
         let second = dispatcher
             .run(&initial, None)
             .expect("dispatch installed block");
         assert_eq!(second.exit, super::DispatchExit::Halted);
         assert!(second.jit_events.is_empty());
+        assert_eq!(
+            nx86_profile::read_profile(profile_path)
+                .expect("read deduplicated profile")
+                .records
+                .len(),
+            2
+        );
     }
 }
