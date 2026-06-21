@@ -1,0 +1,69 @@
+Nx86 — Legal Notice
+===================
+
+This notice is informational. It explains the legal posture of the Nx86 project
+and its source code. It does not grant rights. The LICENSE file governs the
+terms under which this source may be used, and SPEC.md sections 8 ("Legal and
+Redistribution Boundary") and 17 ("Pure AOT") are authoritative for project
+intent. Where this notice and those documents differ, those documents control.
+
+
+What Nx86 is
+------------
+Nx86 is an independent, clean-room Nintendo Switch emulator and AArch64-to-
+x86_64 binary translation system. It is a tool. It operates only on content that
+the user supplies.
+
+
+What Nx86 does not contain or distribute
+----------------------------------------
+This repository and any official Nx86 build ship NONE of the following, and Nx86
+must never request, bundle, embed, or download them:
+
+  - copyrighted game dumps, ROMs, or game assets
+  - proprietary console firmware or system software
+  - console keys, certificates, or other cryptographic secrets
+  - proprietary SDK code or extracted runtime libraries
+  - shared save files or other personal user data
+  - copyrighted binary blobs of any kind, including inside shared profiles
+
+Nx86 provides no keys, no firmware, and no means of obtaining them. Acquiring
+the content needed to run a title is entirely the user's responsibility, and
+that content must be legally obtained by the user.
+
+
+User-provided content and generated output
+-------------------------------------------
+Any game content, firmware, keys, or saves present on a user's system were
+placed there by that user and remain that user's responsibility under the laws
+of the user's jurisdiction.
+
+Native code, caches, profiles, shaders, and "Pure AOT" title folders that Nx86
+generates are derived from user-provided content and may incorporate or reflect
+copyrighted material. Treat such generated output as if it contained the
+original content:
+
+  - it is intended only for local use by the person who legally provided the
+    originals;
+  - it must not be redistributed, uploaded, shared, sold, or hosted as a
+    service;
+  - profiles must be sanitized before any sharing, and shared data must never
+    carry copyrighted blobs.
+
+A generated folder that may contain such material carries its own bundled
+warning file. That per-folder warning, like this notice, is documentation only:
+it does not make redistribution of copyrighted content lawful.
+
+
+Trademarks and affiliation
+--------------------------
+"Nintendo" and "Nintendo Switch" are trademarks of Nintendo. Nx86 is an
+independent project and is not affiliated with, authorized by, sponsored by, or
+endorsed by Nintendo or any of its subsidiaries. All other trademarks are the
+property of their respective owners.
+
+
+No warranty
+-----------
+Nx86 is provided "as is", without warranty of any kind. Use it only in
+compliance with the laws that apply to you.
