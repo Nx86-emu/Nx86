@@ -459,6 +459,26 @@ mod tests {
         assert!(!outcome.dump.is_empty());
     }
 
+    #[test]
+    fn dispatcher_rejects_duplicate_object_entries_before_execution() {
+        let object = NativeObject {
+            entry_address: 0x1000,
+            guest_end: 0x1004,
+            stack_size: 0,
+            code: vec![0xc3],
+        };
+        // SAFETY: `ret` is valid trusted code for the state-pointer ABI and
+        // touches no memory. Duplicate validation also occurs before mapping.
+        #[allow(unsafe_code)]
+        let error = unsafe { super::Dispatcher::from_objects([&object, &object]) }
+            .expect_err("duplicate entries must be rejected");
+
+        assert!(matches!(
+            error,
+            super::DispatchError::DuplicateBlock { pc: 0x1000 }
+        ));
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn dispatcher_routes_blocks_loaded_from_cache() {
@@ -492,6 +512,40 @@ mod tests {
 
         assert_eq!(outcome.exit, super::DispatchExit::Halted);
         assert_eq!(outcome.final_state, two_block_expected_state());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn dispatcher_uses_the_reached_blocks_halt_reason() {
+        let function = Function {
+            name: "two_halts".to_owned(),
+            entry_address: 0,
+            value_count: 0,
+            blocks: vec![
+                Block {
+                    instructions: Vec::new(),
+                    terminator: Terminator::Halt {
+                        reason: "first halt".to_owned(),
+                    },
+                    terminator_address: 0,
+                },
+                Block {
+                    instructions: Vec::new(),
+                    terminator: Terminator::Halt {
+                        reason: "second halt".to_owned(),
+                    },
+                    terminator_address: 8,
+                },
+            ],
+        };
+        let mut dispatcher = super::Dispatcher::from_function(&function).expect("build dispatcher");
+        let mut initial = CpuState::new();
+        initial.set_pc(8);
+
+        let outcome = dispatcher.run(&initial, None).expect("dispatch run");
+
+        assert_eq!(outcome.exit, super::DispatchExit::Halted);
+        assert_eq!(outcome.final_state.halt_reason(), Some("second halt"));
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -530,9 +584,7 @@ mod tests {
 
         let mut initial = CpuState::new();
         initial.set_pc(0);
-        let outcome = dispatcher
-            .run(&initial, Some("svc #0x0"))
-            .expect("dispatch with JIT");
+        let outcome = dispatcher.run(&initial, None).expect("dispatch with JIT");
 
         assert_eq!(outcome.exit, super::DispatchExit::Halted);
         assert_eq!(outcome.final_state, two_block_expected_state());
@@ -541,7 +593,7 @@ mod tests {
         assert_eq!(cache.load(0x8).expect("load JIT object").entry_address, 0x8);
 
         let second = dispatcher
-            .run(&initial, Some("svc #0x0"))
+            .run(&initial, None)
             .expect("dispatch installed block");
         assert_eq!(second.exit, super::DispatchExit::Halted);
         assert!(second.jit_events.is_empty());

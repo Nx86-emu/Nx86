@@ -24,6 +24,9 @@ makes provenance explicit because an `.nxo` hash detects corruption but cannot
 prove that bytes came from Nx86's lowerer. A guest PC with no registered block
 is returned as `DispatchExit::MissingBlock` — the seam the Phase 23 emergency
 JIT fills — and a step budget guards against runaway loops.
+Duplicate guest-PC objects are rejected instead of silently replacing one
+another, and halt reasons remain associated with the block that actually
+stopped execution.
 `run_dispatched_function` is the multi-block analogue of
 `run_tiny_native_block`, classifying the result against the interpreter. The
 differential harness in `nx86-runtime` now runs this dispatcher cross-check

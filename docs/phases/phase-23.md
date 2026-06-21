@@ -22,6 +22,8 @@ consume the native execution step budget. The event is returned in
 `DispatchOutcome`; subsequent visits use the installed block without compiling
 it again. Without an attached JIT, or when the source function has no block for
 the PC, the existing `MissingBlock` exit remains unchanged.
+The compiled block carries its own halt reason into the dispatcher, so a
+function with multiple halt blocks reports the reason for the block reached.
 
 ## Exit Criteria
 

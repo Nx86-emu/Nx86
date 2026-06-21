@@ -1,8 +1,8 @@
 //! NxIR evaluator (Phase 14).
 //!
 //! A reference interpreter over verified NxIR that produces a [`CpuState`]. It
-//! is the differential partner of the AArch64 [`TinyInterpreter`](crate::
-//! TinyInterpreter): the two engines must agree on the final guest state and
+//! is the differential partner of the AArch64 [`TinyInterpreter`](crate::TinyInterpreter):
+//! the two engines must agree on the final guest state and
 //! memory for every synthetic program.
 
 use nx86_core::guest::{CpuState, Nzcv};

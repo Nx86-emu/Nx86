@@ -21,6 +21,12 @@ recording the event, and continuing execution.
   retain the Phase 22 `MissingBlock` behavior.
 - JIT events are scoped to one dispatch run. Persistent event files and
   profile-guided promotion remain Phases 24-25.
+- Follow-up review of Phases 21-23 rejected duplicate NxIR and native-object
+  guest entry PCs, rejected a function entry that does not match its first
+  block, and preserved the halt reason of the block actually reached.
+- Cache review added atomic object/manifest replacement, file-key versus header
+  validation, non-regular-file rejection, and safe handling of `.nxo`
+  directories and symlinks.
 
 ## Boundary Checks
 
@@ -44,8 +50,11 @@ actionlint .github/workflows/ci.yml .github/workflows/linux-x86_64-v4.yml
 git diff --check
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets   # 134 tests, 0 failures
+cargo test --workspace --all-targets   # 140 tests, 0 failures
 cargo build --workspace
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items --locked
+cargo check -p nx86-backend --tests --target x86_64-unknown-linux-gnu --locked
+cargo audit
 ```
 
 The Linux x86_64-only integration test starts with one cached AOT block, JITs

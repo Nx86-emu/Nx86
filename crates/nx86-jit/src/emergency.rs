@@ -19,6 +19,8 @@ pub struct JitEvent {
 pub struct JitCompilation {
     pub object: NativeObject,
     pub event: JitEvent,
+    /// Halt reason for this block, when its terminator halts execution.
+    pub halt_reason: Option<String>,
 }
 
 /// On-demand compiler for missing native blocks from one verified NxIR function.
@@ -73,7 +75,17 @@ impl EmergencyJit {
             cache_file = %event.cache_file_name,
             "emergency JIT compiled missing block"
         );
-        Ok(Some(JitCompilation { object, event }))
+        let halt_reason = match &source_block.terminator {
+            nx86_ir::Terminator::Halt { reason } => Some(reason.clone()),
+            nx86_ir::Terminator::Branch { .. }
+            | nx86_ir::Terminator::CondBranch { .. }
+            | nx86_ir::Terminator::Return => None,
+        };
+        Ok(Some(JitCompilation {
+            object,
+            event,
+            halt_reason,
+        }))
     }
 }
 
@@ -117,6 +129,7 @@ mod tests {
             compilation.object.code.len()
         );
         assert_eq!(compilation.event.cache_file_name, "0000000000000008.nxo");
+        assert_eq!(compilation.halt_reason.as_deref(), Some("svc #0x0"));
         assert_eq!(
             cache.load(0x8).expect("load cached block"),
             compilation.object

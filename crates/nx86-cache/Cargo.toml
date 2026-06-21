@@ -9,10 +9,8 @@ rust-version.workspace = true
 nx86-object = { path = "../nx86-object" }
 serde = { workspace = true }
 serde_json.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

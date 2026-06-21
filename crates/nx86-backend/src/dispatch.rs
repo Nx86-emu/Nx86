@@ -10,7 +10,7 @@
 //! [`EmergencyJit`]; without one, or when the source function does not contain
 //! that PC, dispatch reports [`DispatchExit::MissingBlock`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use nx86_core::guest::CpuState;
 use nx86_ir::{Function, Terminator};
@@ -48,6 +48,7 @@ pub struct DispatchOutcome {
 #[derive(Debug)]
 pub struct Dispatcher {
     blocks: BTreeMap<u64, ExecutableMemory>,
+    halt_reasons: BTreeMap<u64, String>,
     max_steps: usize,
     emergency_jit: Option<EmergencyJit>,
 }
@@ -63,7 +64,9 @@ impl Dispatcher {
                 ExecutableMemory::new(block.lowered.bytes())?,
             );
         }
-        Self::from_blocks(blocks)
+        let mut dispatcher = Self::from_blocks(blocks)?;
+        dispatcher.halt_reasons = function_halt_reasons(function);
+        Ok(dispatcher)
     }
 
     /// Register native blocks loaded from cached objects (e.g. via
@@ -79,6 +82,15 @@ impl Dispatcher {
     pub unsafe fn from_objects<'a>(
         objects: impl IntoIterator<Item = &'a NativeObject>,
     ) -> Result<Self, DispatchError> {
+        let objects: Vec<&NativeObject> = objects.into_iter().collect();
+        let mut entries = BTreeSet::new();
+        for object in &objects {
+            if !entries.insert(object.entry_address) {
+                return Err(DispatchError::DuplicateBlock {
+                    pc: object.entry_address,
+                });
+            }
+        }
         let mut blocks = BTreeMap::new();
         for object in objects {
             blocks.insert(object.entry_address, ExecutableMemory::new(&object.code)?);
@@ -92,6 +104,7 @@ impl Dispatcher {
         }
         Ok(Self {
             blocks,
+            halt_reasons: BTreeMap::new(),
             max_steps: DEFAULT_MAX_STEPS,
             emergency_jit: None,
         })
@@ -135,6 +148,11 @@ impl Dispatcher {
                 call_generated_block(executable, &mut native)?;
                 steps += 1;
                 if native.halted != 0 {
+                    let halt_reason = self
+                        .halt_reasons
+                        .get(&pc)
+                        .map(String::as_str)
+                        .or(halt_reason);
                     return Ok(DispatchOutcome {
                         exit: DispatchExit::Halted,
                         final_state: native.apply_to_cpu_state(initial.clone(), halt_reason),
@@ -159,6 +177,9 @@ impl Dispatcher {
                 });
             };
             let executable = ExecutableMemory::new(&compilation.object.code)?;
+            if let Some(reason) = compilation.halt_reason {
+                self.halt_reasons.insert(pc, reason);
+            }
             self.blocks.insert(pc, executable);
             jit_events.push(compilation.event);
         }
@@ -182,21 +203,21 @@ pub enum DispatchError {
     Exec(#[from] ExecError),
     #[error("emergency JIT failed: {0}")]
     EmergencyJit(#[from] JitError),
+    #[error("multiple native blocks use guest entry pc {pc:#x}")]
+    DuplicateBlock { pc: u64 },
     #[error("dispatcher has no native blocks")]
     Empty,
 }
 
-/// Reason string of the first `Halt` terminator anywhere in the function. The
-/// lifter's entry block may be a branch, so this scans all blocks rather than
-/// only the first.
-fn function_halt_reason(function: &Function) -> Option<&str> {
+fn function_halt_reasons(function: &Function) -> BTreeMap<u64, String> {
     function
         .blocks
         .iter()
-        .find_map(|block| match &block.terminator {
-            Terminator::Halt { reason } => Some(reason.as_str()),
+        .filter_map(|block| match &block.terminator {
+            Terminator::Halt { reason } => Some((block.entry_address(), reason.clone())),
             Terminator::Branch { .. } | Terminator::CondBranch { .. } | Terminator::Return => None,
         })
+        .collect()
 }
 
 /// Lower `function` into a dispatcher, run it from `initial`, and classify the
@@ -233,11 +254,12 @@ pub fn run_dispatched_function(
     }
     let mut dispatcher = Dispatcher {
         blocks,
+        halt_reasons: function_halt_reasons(function),
         max_steps: DEFAULT_MAX_STEPS,
         emergency_jit: None,
     };
 
-    let outcome = match dispatcher.run(initial, function_halt_reason(function)) {
+    let outcome = match dispatcher.run(initial, None) {
         Ok(outcome) => outcome,
         Err(error) => return NativeOutcome::error(dump, error),
     };

@@ -15,7 +15,7 @@
 
 use std::{
     fs::{self, File},
-    io::{self, ErrorKind, Read},
+    io::{self, ErrorKind, Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -23,6 +23,7 @@ use nx86_object::{
     NativeObject, OBJECT_HEADER_LEN, OBJECT_VERSION, ObjectError, ObjectHeader, object_file_name,
 };
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 use thiserror::Error;
 
 pub const CRATE_NAME: &str = "nx86-cache";
@@ -152,18 +153,28 @@ impl CacheManager {
             if path.extension().and_then(|ext| ext.to_str()) != Some("nxo") {
                 continue;
             }
+            if !entry
+                .file_type()
+                .map_err(|source| CacheError::io(&path, source))?
+                .is_file()
+            {
+                continue;
+            }
             let Some(header) = header_of(&path)? else {
                 continue;
             };
-            let size_bytes = entry
-                .metadata()
-                .map_err(|source| CacheError::io(&path, source))?
-                .len();
             let file_name = path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default()
                 .to_owned();
+            if file_name != object_file_name(header.entry_address) {
+                continue;
+            }
+            let size_bytes = entry
+                .metadata()
+                .map_err(|source| CacheError::io(&path, source))?
+                .len();
             entries.push(CacheEntry {
                 entry_address: header.entry_address,
                 file_name,
@@ -184,9 +195,12 @@ impl CacheManager {
     /// entry address match. Does not validate the content hash.
     pub fn shallow_check(&self, entry_address: u64) -> Result<CheckOutcome, CacheError> {
         let path = self.object_path(entry_address);
-        match path.try_exists() {
-            Ok(false) => return Ok(CheckOutcome::Missing),
-            Ok(true) => {}
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.file_type().is_file() => return Ok(CheckOutcome::Invalid),
+            Ok(_) => {}
+            Err(source) if source.kind() == ErrorKind::NotFound => {
+                return Ok(CheckOutcome::Missing);
+            }
             Err(source) => return Err(CacheError::io(&path, source)),
         }
         match header_of(&path)? {
@@ -204,6 +218,14 @@ impl CacheManager {
     /// dependencies) later.
     pub fn full_check(&self, entry_address: u64) -> Result<CheckOutcome, CacheError> {
         let path = self.object_path(entry_address);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.file_type().is_file() => return Ok(CheckOutcome::Invalid),
+            Ok(_) => {}
+            Err(source) if source.kind() == ErrorKind::NotFound => {
+                return Ok(CheckOutcome::Missing);
+            }
+            Err(source) => return Err(CacheError::io(&path, source)),
+        }
         match fs::read(&path) {
             Ok(bytes) => match NativeObject::from_bytes(&bytes) {
                 Ok(object) if object.entry_address == entry_address => Ok(CheckOutcome::Ok),
@@ -216,14 +238,26 @@ impl CacheManager {
 
     /// Load and validate the cached object for `entry_address`.
     pub fn load(&self, entry_address: u64) -> Result<NativeObject, CacheError> {
-        let object = NativeObject::read_from_path(&self.object_path(entry_address))?;
+        let path = self.object_path(entry_address);
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|source| CacheError::io(&path, source))?;
+        if !metadata.file_type().is_file() {
+            return Err(CacheError::NotRegularObject { path });
+        }
+        let object = NativeObject::read_from_path(&path)?;
+        if object.entry_address != entry_address {
+            return Err(CacheError::EntryAddressMismatch {
+                requested: entry_address,
+                actual: object.entry_address,
+            });
+        }
         Ok(object)
     }
 
     /// Write `object` into the cache, returning its manifest entry.
     pub fn insert(&self, object: &NativeObject) -> Result<CacheEntry, CacheError> {
         let path = self.object_path(object.entry_address);
-        object.write_to_path(&path)?;
+        write_atomic(&self.dir, &path, &object.to_bytes())?;
         let size_bytes = fs::metadata(&path)
             .map_err(|source| CacheError::io(&path, source))?
             .len();
@@ -263,6 +297,13 @@ impl CacheManager {
             if path.extension().and_then(|ext| ext.to_str()) != Some("nxo") {
                 continue;
             }
+            if entry
+                .file_type()
+                .map_err(|source| CacheError::io(&path, source))?
+                .is_dir()
+            {
+                continue;
+            }
             match fs::remove_file(&path) {
                 Ok(()) => removed += 1,
                 Err(source) if source.kind() == ErrorKind::NotFound => {}
@@ -276,18 +317,27 @@ impl CacheManager {
     pub fn write_manifest(&self, manifest: &CacheManifest) -> Result<(), CacheError> {
         let json = serde_json::to_string_pretty(manifest).map_err(CacheError::Manifest)?;
         let path = self.manifest_path();
-        fs::write(&path, json).map_err(|source| CacheError::io(&path, source))
+        write_atomic(&self.dir, &path, json.as_bytes())
     }
 
     /// Read the persisted manifest snapshot, if one exists. Prefer [`Self::scan`]
     /// when accuracy matters.
     pub fn read_manifest(&self) -> Result<Option<CacheManifest>, CacheError> {
         let path = self.manifest_path();
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(CacheError::NotRegularManifest { path });
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(CacheError::io(&path, source)),
+        }
         match fs::read_to_string(&path) {
             Ok(text) => {
                 let manifest = serde_json::from_str(&text).map_err(CacheError::Manifest)?;
                 Ok(Some(manifest))
             }
+            // The file may be removed between metadata and read.
             Err(source) if source.kind() == ErrorKind::NotFound => Ok(None),
             Err(source) => Err(CacheError::io(&path, source)),
         }
@@ -311,6 +361,24 @@ fn header_of(path: &Path) -> Result<Option<ObjectHeader>, CacheError> {
     Ok(NativeObject::read_header(&header).ok())
 }
 
+/// Atomically replace `path` with bytes written to a same-directory temporary
+/// file. This avoids partial cache entries and never follows an existing
+/// destination symlink.
+fn write_atomic(dir: &Path, path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
+    let mut temporary = NamedTempFile::new_in(dir).map_err(|source| CacheError::io(dir, source))?;
+    temporary
+        .write_all(bytes)
+        .map_err(|source| CacheError::io(temporary.path(), source))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|source| CacheError::io(temporary.path(), source))?;
+    temporary
+        .persist(path)
+        .map_err(|error| CacheError::io(path, error.error))?;
+    Ok(())
+}
+
 /// A failure operating on the cache.
 #[derive(Debug, Error)]
 pub enum CacheError {
@@ -320,6 +388,12 @@ pub enum CacheError {
     Object(#[from] ObjectError),
     #[error("cache manifest (de)serialization failed: {0}")]
     Manifest(serde_json::Error),
+    #[error("cached object entry mismatch: requested {requested:#x}, object contains {actual:#x}")]
+    EntryAddressMismatch { requested: u64, actual: u64 },
+    #[error("cached object path is not a regular file: {path}")]
+    NotRegularObject { path: PathBuf },
+    #[error("cache manifest path is not a regular file: {path}")]
+    NotRegularManifest { path: PathBuf },
 }
 
 impl CacheError {
@@ -336,7 +410,7 @@ mod tests {
     use nx86_object::NativeObject;
     use tempfile::tempdir;
 
-    use super::{CacheManager, CheckOutcome};
+    use super::{CacheError, CacheManager, CheckOutcome};
 
     fn object(entry_address: u64, code: Vec<u8>) -> NativeObject {
         NativeObject {
@@ -379,6 +453,60 @@ mod tests {
 
         let loaded = cache.load(0x4000).expect("load a");
         assert_eq!(loaded, a);
+    }
+
+    #[test]
+    fn load_rejects_object_stored_under_the_wrong_key() {
+        let dir = tempdir().expect("temp dir");
+        let cache = CacheManager::open(dir.path()).expect("open cache");
+        let wrong_object = object(0x2000, vec![0xc3]);
+        wrong_object
+            .write_to_path(&cache.object_path(0x1000))
+            .expect("write mismatched object");
+
+        assert!(matches!(
+            cache.load(0x1000),
+            Err(CacheError::EntryAddressMismatch {
+                requested: 0x1000,
+                actual: 0x2000
+            })
+        ));
+        assert_eq!(cache.scan().expect("scan").object_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insert_replaces_symlink_without_overwriting_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("temp dir");
+        let cache = CacheManager::open(dir.path()).expect("open cache");
+        let outside = dir.path().join("outside.bin");
+        std::fs::write(&outside, b"outside data").expect("write outside target");
+        let object_path = cache.object_path(0x1000);
+        symlink(&outside, &object_path).expect("create cache symlink");
+
+        assert_eq!(
+            cache.shallow_check(0x1000).expect("shallow check"),
+            CheckOutcome::Invalid
+        );
+        assert_eq!(
+            cache.full_check(0x1000).expect("full check"),
+            CheckOutcome::Invalid
+        );
+        assert!(matches!(
+            cache.load(0x1000),
+            Err(CacheError::NotRegularObject { .. })
+        ));
+
+        let object = object(0x1000, vec![0xc3]);
+        cache.insert(&object).expect("insert object");
+
+        assert_eq!(
+            std::fs::read(&outside).expect("read outside target"),
+            b"outside data"
+        );
+        assert_eq!(cache.load(0x1000).expect("load object"), object);
     }
 
     #[test]
@@ -439,22 +567,14 @@ mod tests {
         // A corrupt object the scan does not recognize must still be cleared.
         std::fs::write(dir.path().join("000000000000beef.nxo"), b"not an object")
             .expect("write corrupt object");
+        std::fs::create_dir(dir.path().join("not-an-object.nxo")).expect("create directory");
 
         // scan only sees the one valid object, but clear removes both files.
         assert_eq!(cache.scan().expect("scan").object_count(), 1);
         assert_eq!(cache.clear().expect("clear"), 2);
-
-        let remaining = std::fs::read_dir(dir.path())
-            .expect("read dir")
-            .filter(|entry| {
-                entry
-                    .as_ref()
-                    .ok()
-                    .and_then(|entry| entry.path().extension().map(|ext| ext == "nxo"))
-                    .unwrap_or(false)
-            })
-            .count();
-        assert_eq!(remaining, 0);
+        assert!(dir.path().join("not-an-object.nxo").is_dir());
+        assert!(!cache.object_path(0x1).exists());
+        assert!(!dir.path().join("000000000000beef.nxo").exists());
     }
 
     #[test]
@@ -475,5 +595,33 @@ mod tests {
             .expect("read manifest")
             .expect("present");
         assert_eq!(restored, manifest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_write_replaces_symlink_without_overwriting_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("temp dir");
+        let cache = CacheManager::open(dir.path()).expect("open cache");
+        let outside = dir.path().join("outside-manifest.json");
+        std::fs::write(&outside, b"outside data").expect("write outside target");
+        symlink(&outside, cache.manifest_path()).expect("create manifest symlink");
+        let manifest = super::CacheManifest::default();
+
+        assert!(matches!(
+            cache.read_manifest(),
+            Err(CacheError::NotRegularManifest { .. })
+        ));
+        cache.write_manifest(&manifest).expect("write manifest");
+
+        assert_eq!(
+            std::fs::read(&outside).expect("read outside target"),
+            b"outside data"
+        );
+        assert_eq!(
+            cache.read_manifest().expect("read manifest"),
+            Some(manifest)
+        );
     }
 }

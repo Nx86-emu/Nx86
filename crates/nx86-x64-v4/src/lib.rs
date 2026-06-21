@@ -210,10 +210,7 @@ fn lower_block_with_entries(
 /// terminator address when the block has no instructions.
 #[must_use]
 pub fn block_entry_pc(block: &Block) -> u64 {
-    block
-        .instructions
-        .first()
-        .map_or(block.terminator_address, |inst| inst.guest_address)
+    block.entry_address()
 }
 
 /// Lower one block to a self-contained native block. `resolve_target` maps a

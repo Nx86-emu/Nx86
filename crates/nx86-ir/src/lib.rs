@@ -202,6 +202,16 @@ pub struct Block {
     pub terminator_address: u64,
 }
 
+impl Block {
+    /// Guest PC used to enter this block.
+    #[must_use]
+    pub fn entry_address(&self) -> u64 {
+        self.instructions
+            .first()
+            .map_or(self.terminator_address, |inst| inst.guest_address)
+    }
+}
+
 /// A lifted function: a list of blocks (block 0 is the entry) plus the number
 /// of SSA values allocated.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

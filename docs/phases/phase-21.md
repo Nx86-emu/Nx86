@@ -14,7 +14,11 @@ and its header magic, version, and entry address match, via the new header-only
 reader) and a hash-validating `full_check` (loads the object and verifies its
 FNV-1a content hash). The full check is the placeholder the SPEC §24 "full
 check" upgrades later. `status`/`total_size_bytes` account for cache size, and
-`insert`/`load`/`remove`/`clear` round-trip objects.
+`insert`/`load`/`remove`/`clear` round-trip objects. Object and manifest writes
+use same-directory temporary files followed by atomic replacement, preventing
+partial cache entries and destination-symlink writes. Reads reject non-regular
+paths, and scans ignore objects whose file key does not match the embedded guest
+entry address.
 
 To support header-only inspection without loading and hashing each object,
 `nx86-object` gained `NativeObject::read_header` + `ObjectHeader`, a shared

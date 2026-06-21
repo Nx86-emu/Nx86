@@ -6,7 +6,7 @@
 //! to run after lifting and after every optimization pass in debug/research
 //! builds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;
 
@@ -35,6 +35,15 @@ pub enum VerifyError {
     UnexpectedResult { value: Value },
     #[error("branch targets block{} but the function has {block_count} block(s)", target.0)]
     BranchTargetOutOfRange { target: BlockId, block_count: usize },
+    #[error("multiple blocks use guest entry address {entry_address:#x}")]
+    DuplicateBlockEntry { entry_address: u64 },
+    #[error(
+        "function entry address {function_entry:#x} does not match first block entry {block_entry:#x}"
+    )]
+    EntryAddressMismatch {
+        function_entry: u64,
+        block_entry: u64,
+    },
 }
 
 /// Verify every function in a module.
@@ -54,6 +63,20 @@ pub fn verify(function: &Function) -> Result<(), VerifyError> {
     }
 
     let block_count = function.blocks.len();
+    let first_block_entry = function.blocks[0].entry_address();
+    if function.entry_address != first_block_entry {
+        return Err(VerifyError::EntryAddressMismatch {
+            function_entry: function.entry_address,
+            block_entry: first_block_entry,
+        });
+    }
+    let mut block_entries = HashSet::new();
+    for block in &function.blocks {
+        let entry_address = block.entry_address();
+        if !block_entries.insert(entry_address) {
+            return Err(VerifyError::DuplicateBlockEntry { entry_address });
+        }
+    }
     let mut defined: HashMap<Value, Type> = HashMap::new();
 
     for block in &function.blocks {
@@ -180,6 +203,31 @@ mod tests {
         assert!(matches!(
             verify(&function),
             Err(VerifyError::NoEntryBlock { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_block_entry_is_rejected() {
+        let mut function = valid_function();
+        function.blocks.push(function.blocks[0].clone());
+
+        assert!(matches!(
+            verify(&function),
+            Err(VerifyError::DuplicateBlockEntry { entry_address: 0 })
+        ));
+    }
+
+    #[test]
+    fn mismatched_function_entry_is_rejected() {
+        let mut function = valid_function();
+        function.entry_address = 0x1000;
+
+        assert!(matches!(
+            verify(&function),
+            Err(VerifyError::EntryAddressMismatch {
+                function_entry: 0x1000,
+                block_entry: 0
+            })
         ));
     }
 
