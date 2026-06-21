@@ -8,7 +8,7 @@ use std::{
     collections::HashSet,
     fmt::Debug,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -18,6 +18,8 @@ use thiserror::Error;
 pub const CRATE_NAME: &str = "nx86-profile";
 /// On-disk runtime profile format emitted by this crate.
 pub const PROFILE_FORMAT_VERSION: u32 = 1;
+/// Maximum serialized size of one profile record accepted by the reader.
+pub const MAX_PROFILE_RECORD_BYTES: usize = 16 * 1024;
 
 #[must_use]
 pub const fn crate_name() -> &'static str {
@@ -95,6 +97,7 @@ pub trait ProfileSink: Debug {
 pub struct ProfileWriter {
     path: PathBuf,
     file: File,
+    valid_len: u64,
     branch_targets: HashSet<(u64, u64)>,
 }
 
@@ -110,32 +113,49 @@ impl ProfileWriter {
             fs::create_dir_all(parent).map_err(|source| ProfileError::io(parent, source))?;
         }
 
-        let existing = match fs::symlink_metadata(&path) {
+        match fs::symlink_metadata(&path) {
             Ok(metadata) if !metadata.file_type().is_file() => {
                 return Err(ProfileError::NotRegularFile { path });
             }
-            Ok(_) => fs::read(&path).map_err(|source| ProfileError::io(&path, source))?,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(source) => return Err(ProfileError::io(&path, source)),
-        };
+            Ok(_) | Err(_) => {}
+        }
 
-        let parsed = parse_profile(&existing)?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).append(true);
+        set_no_follow(&mut options);
+        let mut file = options
             .open(&path)
             .map_err(|source| ProfileError::io(&path, source))?;
-
-        match parsed.tail_repair {
-            TailRepair::None => {}
-            TailRepair::AddNewline => file
-                .write_all(b"\n")
-                .map_err(|source| ProfileError::io(&path, source))?,
-            TailRepair::Truncate(valid_len) => file
-                .set_len(valid_len as u64)
-                .map_err(|source| ProfileError::io(&path, source))?,
+        if !file
+            .metadata()
+            .map_err(|source| ProfileError::io(&path, source))?
+            .file_type()
+            .is_file()
+        {
+            return Err(ProfileError::NotRegularFile { path });
         }
+        lock_exclusive(&file, &path)?;
+
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| ProfileError::io(&path, source))?;
+        let mut existing = Vec::new();
+        file.read_to_end(&mut existing)
+            .map_err(|source| ProfileError::io(&path, source))?;
+
+        let parsed = parse_profile(&existing)?;
+        let valid_len = match parsed.tail_repair {
+            TailRepair::None => existing.len() as u64,
+            TailRepair::AddNewline => {
+                file.write_all(b"\n")
+                    .map_err(|source| ProfileError::io(&path, source))?;
+                existing.len() as u64 + 1
+            }
+            TailRepair::Truncate(valid_len) => {
+                file.set_len(valid_len as u64)
+                    .map_err(|source| ProfileError::io(&path, source))?;
+                valid_len as u64
+            }
+        };
 
         let branch_targets = parsed
             .log
@@ -155,6 +175,7 @@ impl ProfileWriter {
         Ok(Self {
             path,
             file,
+            valid_len,
             branch_targets,
         })
     }
@@ -184,9 +205,21 @@ impl ProfileSink for ProfileWriter {
         let mut bytes =
             serde_json::to_vec(&ProfileRecord::new(event)).map_err(ProfileError::Serialize)?;
         bytes.push(b'\n');
-        self.file
-            .write_all(&bytes)
-            .map_err(|source| ProfileError::io(&self.path, source))?;
+        let next_valid_len = self
+            .valid_len
+            .checked_add(bytes.len() as u64)
+            .ok_or(ProfileError::FileTooLarge)?;
+        if let Err(write_error) = self.file.write_all(&bytes) {
+            return match self.file.set_len(self.valid_len) {
+                Ok(()) => Err(ProfileError::io(&self.path, write_error)),
+                Err(rollback_error) => Err(ProfileError::WriteRollback {
+                    path: self.path.clone(),
+                    write_error,
+                    rollback_error,
+                }),
+            };
+        }
+        self.valid_len = next_valid_len;
         if let Some(target) = branch_target {
             self.branch_targets.insert(target);
         }
@@ -211,7 +244,26 @@ pub fn read_profile(path: impl AsRef<Path>) -> Result<ProfileLog, ProfileError> 
             path: path.to_path_buf(),
         });
     }
-    let bytes = fs::read(path).map_err(|source| ProfileError::io(path, source))?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    set_no_follow(&mut options);
+    let mut file = options
+        .open(path)
+        .map_err(|source| ProfileError::io(path, source))?;
+    if !file
+        .metadata()
+        .map_err(|source| ProfileError::io(path, source))?
+        .file_type()
+        .is_file()
+    {
+        return Err(ProfileError::NotRegularFile {
+            path: path.to_path_buf(),
+        });
+    }
+    lock_shared(&file, path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| ProfileError::io(path, source))?;
     Ok(parse_profile(&bytes)?.log)
 }
 
@@ -249,30 +301,44 @@ fn parse_profile(bytes: &[u8]) -> Result<ParsedProfile, ProfileError> {
         let line = &bytes[line_start..line_end];
         let is_unterminated_tail = line_end == bytes.len() && !terminated;
 
-        if !line.is_empty() {
-            match serde_json::from_slice::<ProfileRecord>(line) {
-                Ok(record) => {
-                    validate_version(&record, line_number)?;
-                    validate_event(&record.event)?;
-                    records.push(record);
-                }
-                Err(_) if is_unterminated_tail => {
-                    return Ok(ParsedProfile {
-                        log: ProfileLog {
-                            records,
-                            recovered_truncated_tail: true,
-                        },
-                        tail_repair: TailRepair::Truncate(line_start),
-                    });
-                }
-                Err(source) => {
-                    return Err(ProfileError::MalformedRecord {
-                        line: line_number,
-                        source,
-                    });
-                }
-            }
+        if line.is_empty() {
+            return Err(ProfileError::EmptyRecord { line: line_number });
         }
+        if line.len() > MAX_PROFILE_RECORD_BYTES {
+            return Err(ProfileError::RecordTooLarge {
+                line: line_number,
+                size_bytes: line.len(),
+            });
+        }
+
+        let value = match serde_json::from_slice::<serde_json::Value>(line) {
+            Ok(value) => value,
+            Err(_) if is_unterminated_tail => {
+                return Ok(ParsedProfile {
+                    log: ProfileLog {
+                        records,
+                        recovered_truncated_tail: true,
+                    },
+                    tail_repair: TailRepair::Truncate(line_start),
+                });
+            }
+            Err(source) => {
+                return Err(ProfileError::MalformedRecord {
+                    line: line_number,
+                    source,
+                });
+            }
+        };
+        let record = serde_json::from_slice::<ProfileRecord>(line).map_err(|source| {
+            ProfileError::MalformedRecord {
+                line: line_number,
+                source,
+            }
+        })?;
+        validate_version(&record, line_number)?;
+        validate_record_shape(&value, &record.event, line_number)?;
+        validate_event(&record.event)?;
+        records.push(record);
 
         if line_end == bytes.len() {
             break;
@@ -305,6 +371,44 @@ fn validate_version(record: &ProfileRecord, line: usize) -> Result<(), ProfileEr
     }
 }
 
+fn validate_record_shape(
+    value: &serde_json::Value,
+    event: &ProfileEvent,
+    line: usize,
+) -> Result<(), ProfileError> {
+    let object = value
+        .as_object()
+        .ok_or(ProfileError::UnexpectedFields { line })?;
+    let expected: &[&str] = match event {
+        ProfileEvent::JitBlock { .. } => &[
+            "format_version",
+            "kind",
+            "guest_pc",
+            "code_size_bytes",
+            "cache_file_name",
+        ],
+        ProfileEvent::BranchTarget { .. } => &["format_version", "kind", "source_pc", "target_pc"],
+        ProfileEvent::HelperCall { .. } => &["format_version", "kind", "guest_pc", "helper_id"],
+        ProfileEvent::Slowmem { .. } => &[
+            "format_version",
+            "kind",
+            "guest_pc",
+            "address",
+            "size_bytes",
+            "access",
+            "reason_code",
+        ],
+    };
+    if object.len() != expected.len()
+        || object
+            .keys()
+            .any(|field| !expected.contains(&field.as_str()))
+    {
+        return Err(ProfileError::UnexpectedFields { line });
+    }
+    Ok(())
+}
+
 fn validate_event(event: &ProfileEvent) -> Result<(), ProfileError> {
     match event {
         ProfileEvent::JitBlock {
@@ -312,12 +416,22 @@ fn validate_event(event: &ProfileEvent) -> Result<(), ProfileError> {
         } if !is_object_cache_name(cache_file_name) => Err(ProfileError::InvalidField {
             field: "cache_file_name",
         }),
+        ProfileEvent::JitBlock {
+            code_size_bytes: 0, ..
+        } => Err(ProfileError::InvalidField {
+            field: "code_size_bytes",
+        }),
         ProfileEvent::HelperCall { helper_id, .. } if !is_identifier(helper_id) => {
             Err(ProfileError::InvalidField { field: "helper_id" })
         }
         ProfileEvent::Slowmem { reason_code, .. } if !is_identifier(reason_code) => {
             Err(ProfileError::InvalidField {
                 field: "reason_code",
+            })
+        }
+        ProfileEvent::Slowmem { size_bytes, .. } if !matches!(*size_bytes, 1 | 2 | 4 | 8 | 16) => {
+            Err(ProfileError::InvalidField {
+                field: "size_bytes",
             })
         }
         ProfileEvent::JitBlock { .. }
@@ -344,6 +458,56 @@ fn is_object_cache_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
+#[cfg(unix)]
+fn set_no_follow(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.custom_flags(libc::O_NOFOLLOW);
+}
+
+#[cfg(not(unix))]
+fn set_no_follow(_options: &mut OpenOptions) {}
+
+#[cfg(unix)]
+fn lock_exclusive(file: &File, path: &Path) -> Result<(), ProfileError> {
+    lock_file(file, path, libc::LOCK_EX)
+}
+
+#[cfg(not(unix))]
+fn lock_exclusive(_file: &File, _path: &Path) -> Result<(), ProfileError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn lock_shared(file: &File, path: &Path) -> Result<(), ProfileError> {
+    lock_file(file, path, libc::LOCK_SH)
+}
+
+#[cfg(not(unix))]
+fn lock_shared(_file: &File, _path: &Path) -> Result<(), ProfileError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn lock_file(file: &File, path: &Path, operation: libc::c_int) -> Result<(), ProfileError> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: `file` owns a live descriptor for the duration of this call.
+    let result = unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(());
+    }
+    let source = io::Error::last_os_error();
+    if source.kind() == io::ErrorKind::WouldBlock {
+        Err(ProfileError::AlreadyLocked {
+            path: path.to_path_buf(),
+        })
+    } else {
+        Err(ProfileError::io(path, source))
+    }
+}
+
 /// A failure reading or writing a runtime profile.
 #[derive(Debug, Error)]
 pub enum ProfileError {
@@ -351,6 +515,10 @@ pub enum ProfileError {
     Io { path: PathBuf, source: io::Error },
     #[error("profile path is not a regular file: {path}")]
     NotRegularFile { path: PathBuf },
+    #[error("profile file is already open for writing: {path}")]
+    AlreadyLocked { path: PathBuf },
+    #[error("profile file length exceeds the supported range")]
+    FileTooLarge,
     #[error("profile record serialization failed: {0}")]
     Serialize(serde_json::Error),
     #[error("profile record on line {line} is malformed: {source}")]
@@ -360,8 +528,22 @@ pub enum ProfileError {
     },
     #[error("profile record on line {line} uses unsupported format version {found}")]
     UnsupportedVersion { line: usize, found: u32 },
+    #[error("profile record on line {line} is empty")]
+    EmptyRecord { line: usize },
+    #[error("profile record on line {line} is too large ({size_bytes} bytes)")]
+    RecordTooLarge { line: usize, size_bytes: usize },
+    #[error("profile record on line {line} contains unexpected fields")]
+    UnexpectedFields { line: usize },
     #[error("profile field `{field}` is not a safe deterministic identifier")]
     InvalidField { field: &'static str },
+    #[error(
+        "profile write failed for {path}: {write_error}; rollback also failed: {rollback_error}"
+    )]
+    WriteRollback {
+        path: PathBuf,
+        write_error: io::Error,
+        rollback_error: io::Error,
+    },
 }
 
 impl ProfileError {
@@ -420,6 +602,7 @@ mod tests {
                 RecordOutcome::Written
             );
         }
+        drop(writer);
 
         let log = read_profile(&path).expect("read profile");
         assert!(!log.recovered_truncated_tail);
@@ -459,6 +642,7 @@ mod tests {
             writer.record(branch).expect("deduplicate after reopen"),
             RecordOutcome::Duplicate
         );
+        drop(writer);
         assert_eq!(read_profile(path).expect("read profile").records.len(), 1);
     }
 
@@ -478,6 +662,7 @@ mod tests {
                 RecordOutcome::Written
             );
         }
+        drop(writer);
         assert_eq!(read_profile(path).expect("read profile").records.len(), 2);
     }
 
@@ -504,6 +689,7 @@ mod tests {
                 helper_id: "second".to_owned(),
             })
             .expect("append after repair");
+        drop(writer);
         let repaired = read_profile(path).expect("read repaired profile");
         assert!(!repaired.recovered_truncated_tail);
         assert_eq!(repaired.records.len(), 2);
@@ -526,6 +712,7 @@ mod tests {
                 helper_id: "second".to_owned(),
             })
             .expect("append");
+        drop(writer);
         assert_eq!(read_profile(path).expect("read profile").records.len(), 2);
     }
 
@@ -556,6 +743,82 @@ mod tests {
     }
 
     #[test]
+    fn unexpected_fields_are_rejected() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("runtime-v1.jsonl");
+        fs::write(
+            &path,
+            b"{\"format_version\":1,\"kind\":\"branch_target\",\"source_pc\":1,\"target_pc\":2,\"personal_path\":\"/Users/example\"}\n",
+        )
+        .expect("write profile");
+        assert!(matches!(
+            read_profile(path),
+            Err(ProfileError::UnexpectedFields { line: 1 })
+        ));
+    }
+
+    #[test]
+    fn empty_oversized_and_duplicate_field_records_are_rejected() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("runtime-v1.jsonl");
+
+        fs::write(&path, b"\n").expect("write empty record");
+        assert!(matches!(
+            read_profile(&path),
+            Err(ProfileError::EmptyRecord { line: 1 })
+        ));
+
+        fs::write(&path, vec![b'x'; super::MAX_PROFILE_RECORD_BYTES + 1])
+            .expect("write oversized record");
+        assert!(matches!(
+            read_profile(&path),
+            Err(ProfileError::RecordTooLarge { line: 1, .. })
+        ));
+
+        fs::write(
+            &path,
+            b"{\"format_version\":1,\"kind\":\"branch_target\",\"source_pc\":1,\"source_pc\":2,\"target_pc\":3}\n",
+        )
+        .expect("write duplicate field");
+        assert!(matches!(
+            read_profile(path),
+            Err(ProfileError::MalformedRecord { line: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn complete_but_invalid_unterminated_record_is_not_discarded() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("runtime-v1.jsonl");
+        fs::write(
+            &path,
+            b"{\"format_version\":1,\"kind\":\"branch_target\",\"source_pc\":\"bad\",\"target_pc\":2}",
+        )
+        .expect("write profile");
+        assert!(matches!(
+            read_profile(path),
+            Err(ProfileError::MalformedRecord { line: 1, .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_writer_and_reader_are_rejected() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("runtime-v1.jsonl");
+        let _writer = ProfileWriter::open(&path).expect("open first writer");
+
+        assert!(matches!(
+            ProfileWriter::open(&path),
+            Err(ProfileError::AlreadyLocked { .. })
+        ));
+        assert!(matches!(
+            read_profile(&path),
+            Err(ProfileError::AlreadyLocked { .. })
+        ));
+    }
+
+    #[test]
     fn personal_path_like_identifiers_are_rejected() {
         let dir = tempdir().expect("temp dir");
         let path = dir.path().join("runtime-v1.jsonl");
@@ -566,6 +829,35 @@ mod tests {
                 helper_id: "/Users/example/helper".to_owned(),
             }),
             Err(ProfileError::InvalidField { field: "helper_id" })
+        ));
+    }
+
+    #[test]
+    fn impossible_event_sizes_are_rejected() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("runtime-v1.jsonl");
+        let mut writer = ProfileWriter::open(path).expect("open profile");
+        assert!(matches!(
+            writer.record(ProfileEvent::JitBlock {
+                guest_pc: 1,
+                code_size_bytes: 0,
+                cache_file_name: "0000000000000001.nxo".to_owned(),
+            }),
+            Err(ProfileError::InvalidField {
+                field: "code_size_bytes"
+            })
+        ));
+        assert!(matches!(
+            writer.record(ProfileEvent::Slowmem {
+                guest_pc: 1,
+                address: 2,
+                size_bytes: 3,
+                access: MemoryAccessKind::Read,
+                reason_code: "page-not-fastmem".to_owned(),
+            }),
+            Err(ProfileError::InvalidField {
+                field: "size_bytes"
+            })
         ));
     }
 

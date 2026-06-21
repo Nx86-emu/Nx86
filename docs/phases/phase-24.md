@@ -7,16 +7,19 @@ the final line incomplete.
 
 `nx86-profile` defines typed JIT-block, branch-target, helper-call, and slowmem
 events. The writer repairs a truncated final line before appending, rejects
-unsupported versions and malformed complete records, and refuses non-regular
-destinations. A reader exposes complete records plus whether it recovered an
-incomplete tail.
+unsupported versions, oversized or structurally unexpected records, and
+malformed complete records. It also refuses non-regular destinations. A reader
+exposes complete records plus whether it recovered an incomplete tail.
 
 Branch observations are discovery data rather than hotness counters in this
 phase. A `(source_pc, target_pc)` pair is written only once across the entire
-profile file, including after the writer is reopened. Different sources that
-reach the same target remain distinct. JIT events are recorded whenever a new
-block is compiled. Helper and slowmem event APIs are available for their future
-runtime paths without fabricating observations today.
+profile file, including after the writer is reopened. On Unix targets, an
+exclusive lifetime lock prevents concurrent writers from violating this rule;
+readers use a shared lock and consume the file after the writer closes.
+Different sources that reach the same target remain distinct. JIT events are
+recorded whenever a new block is compiled. Helper and slowmem event APIs are
+available for their future runtime paths without fabricating observations
+today.
 
 The dispatcher accepts an optional `ProfileSink`. It records a branch after a
 non-halting native block publishes its next guest PC and records a JIT event
@@ -30,6 +33,10 @@ helper and slowmem identifiers accept only a short ASCII identifier alphabet;
 path-like free-form values are rejected. Phase 24 does not add upload, sharing,
 title-profile sanitization UI, timestamps, host identifiers, guest bytes, memory
 contents, or personal data.
+
+Each append tracks the last complete byte boundary. If a write fails after a
+partial append, the writer truncates back to that boundary before returning the
+fatal error; a rollback failure is reported separately.
 
 ## Exit Criteria
 

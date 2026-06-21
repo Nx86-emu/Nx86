@@ -27,6 +27,11 @@ integration. Profile-guided rebuild remains Phase 25.
   are rejected, and parent directories are created for new local profile files.
 - Cache names are validated against the deterministic `.nxo` key shape, and
   helper/slowmem identifiers reject path-like or free-form values.
+- Records reject unknown, duplicate, empty, and oversized input. This prevents
+  ignored JSON fields from carrying data outside the documented schema.
+- Unix profile writers hold an exclusive file lock for their lifetime, while
+  readers take a shared lock. Failed partial appends roll back to the last known
+  complete record boundary.
 
 ## Boundary Checks
 
@@ -46,7 +51,7 @@ Passed locally on `aarch64-apple-darwin`:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets   # 151 tests, 0 failures
+cargo test --workspace --all-targets   # 156 tests, 0 failures
 cargo build --workspace
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items --locked
 cargo check -p nx86-backend --tests --target x86_64-unknown-linux-gnu --locked

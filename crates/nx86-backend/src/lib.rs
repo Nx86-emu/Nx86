@@ -600,7 +600,14 @@ mod tests {
         assert_eq!(outcome.jit_events.len(), 1);
         assert_eq!(outcome.jit_events[0].guest_pc, 0x8);
         assert_eq!(cache.load(0x8).expect("load JIT object").entry_address, 0x8);
-        let profile = nx86_profile::read_profile(&profile_path).expect("read runtime profile");
+        let second = dispatcher
+            .run(&initial, None)
+            .expect("dispatch installed block");
+        assert_eq!(second.exit, super::DispatchExit::Halted);
+        assert!(second.jit_events.is_empty());
+        drop(dispatcher);
+
+        let profile = nx86_profile::read_profile(profile_path).expect("read runtime profile");
         assert_eq!(profile.records.len(), 2);
         assert!(matches!(
             profile.records[0].event,
@@ -617,18 +624,5 @@ mod tests {
                 ..
             } if cache_file_name == "0000000000000008.nxo"
         ));
-
-        let second = dispatcher
-            .run(&initial, None)
-            .expect("dispatch installed block");
-        assert_eq!(second.exit, super::DispatchExit::Halted);
-        assert!(second.jit_events.is_empty());
-        assert_eq!(
-            nx86_profile::read_profile(profile_path)
-                .expect("read deduplicated profile")
-                .records
-                .len(),
-            2
-        );
     }
 }
