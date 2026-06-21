@@ -5,6 +5,7 @@
 *.swp
 *.swo
 *.log
+.mcp.json
 
 # Local Nx86 runtime data should not be committed.
 /Nx86/

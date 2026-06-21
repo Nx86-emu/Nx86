@@ -649,6 +649,8 @@ fn native_status_line(status: NativeStatus, error: Option<&str>) -> String {
     match (status, error) {
         (NativeStatus::MatchesInterpreter, _) => "matches interpreter".to_owned(),
         (NativeStatus::DisagreesWithInterpreter, _) => "disagrees with interpreter".to_owned(),
+        (NativeStatus::Unsupported, Some(error)) => format!("unsupported: {error}"),
+        (NativeStatus::Unsupported, None) => "unsupported".to_owned(),
         (NativeStatus::Unavailable, Some(error)) => format!("unavailable: {error}"),
         (NativeStatus::Unavailable, None) => "unavailable".to_owned(),
         (NativeStatus::Error, Some(error)) => format!("error: {error}"),

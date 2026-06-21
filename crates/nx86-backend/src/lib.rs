@@ -1,7 +1,9 @@
 use nx86_core::guest::CpuState;
 use nx86_ir::{Function, Terminator};
 use nx86_jit::{ExecError, ExecutableMemory};
-use nx86_x64_v4::{NativeBlockState, lower_tiny_block};
+use nx86_x64_v4::{LoweredBlock, LoweringError, NativeBlockState, lower_tiny_block};
+
+pub use nx86_object::{NativeObject, ObjectError};
 
 pub const CRATE_NAME: &str = "nx86-backend";
 
@@ -10,10 +12,34 @@ pub const fn crate_name() -> &'static str {
     CRATE_NAME
 }
 
+/// Build a persistable [`NativeObject`] from a lowered single block and the
+/// function it came from. The caller is responsible for having produced
+/// `lowered` from `function` (e.g. via [`lower_tiny_block`]); the guest mapping
+/// is taken from the function's entry address and its first block's span.
+#[must_use]
+pub fn native_object(function: &Function, lowered: &LoweredBlock) -> NativeObject {
+    let guest_end = function
+        .blocks
+        .first()
+        .map_or(function.entry_address, |block| {
+            block.terminator_address.saturating_add(4)
+        });
+    NativeObject {
+        entry_address: function.entry_address,
+        guest_end,
+        stack_size: u32::try_from(lowered.stack_size()).unwrap_or(0),
+        code: lowered.bytes().to_vec(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeStatus {
     MatchesInterpreter,
     DisagreesWithInterpreter,
+    /// The program is valid NxIR but its shape is outside the current tiny
+    /// native path (e.g. multiple blocks, branches, or unlowered ops). This is
+    /// expected and benign, not a failure.
+    Unsupported,
     Unavailable,
     Error,
 }
@@ -24,6 +50,7 @@ impl NativeStatus {
         match self {
             Self::MatchesInterpreter => "matches interpreter",
             Self::DisagreesWithInterpreter => "disagrees with interpreter",
+            Self::Unsupported => "unsupported",
             Self::Unavailable => "unavailable",
             Self::Error => "error",
         }
@@ -53,6 +80,29 @@ impl NativeOutcome {
         }
     }
 
+    /// Build an outcome from a lowering failure, classifying "program shape not
+    /// yet supported by the tiny path" (benign) apart from genuine failures.
+    fn from_lowering_error(dump: String, error: LoweringError) -> Self {
+        let status = match &error {
+            LoweringError::UnsupportedBlockCount { .. }
+            | LoweringError::UnsupportedOp { .. }
+            | LoweringError::UnsupportedTerminator { .. } => NativeStatus::Unsupported,
+            LoweringError::InvalidIr(_)
+            | LoweringError::MissingResult { .. }
+            | LoweringError::ValueOutOfRange { .. }
+            | LoweringError::RegisterOutOfRange { .. }
+            | LoweringError::StackTooLarge { .. }
+            | LoweringError::AddressOverflow { .. }
+            | LoweringError::Assembler(_) => NativeStatus::Error,
+        };
+        Self {
+            status,
+            dump,
+            final_state: None,
+            error: Some(error.to_string()),
+        }
+    }
+
     fn unavailable(dump: String, error: impl ToString) -> Self {
         Self {
             status: NativeStatus::Unavailable,
@@ -70,7 +120,7 @@ pub fn run_tiny_native_block(
 ) -> NativeOutcome {
     let lowered = match lower_tiny_block(function) {
         Ok(lowered) => lowered,
-        Err(error) => return NativeOutcome::error(String::new(), error),
+        Err(error) => return NativeOutcome::from_lowering_error(String::new(), error),
     };
     let dump = lowered.dump().to_owned();
 
@@ -126,7 +176,9 @@ mod tests {
     use nx86_core::guest::CpuState;
     use nx86_ir::{Block, Function, Inst, Op, Reg, Terminator, Type, Value};
 
-    use super::{NativeStatus, run_tiny_native_block};
+    use super::{
+        NativeObject, NativeStatus, lower_tiny_block, native_object, run_tiny_native_block,
+    };
 
     #[test]
     fn native_attempt_reports_host_or_match() {
@@ -151,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn native_attempt_reports_lowering_error() {
+    fn native_attempt_reports_unsupported_shape() {
         let mut function = tiny_add_function();
         function.blocks.push(Block {
             instructions: Vec::new(),
@@ -163,13 +215,77 @@ mod tests {
 
         let outcome = run_tiny_native_block(&function, &initial, &expected);
 
-        assert_eq!(outcome.status, NativeStatus::Error);
+        assert_eq!(outcome.status, NativeStatus::Unsupported);
         assert!(
             outcome
                 .error
                 .as_deref()
                 .is_some_and(|error| { error.contains("exactly one block") })
         );
+    }
+
+    #[test]
+    fn native_attempt_reports_genuine_error() {
+        // Corrupt the add to reference an undefined value: verification fails,
+        // which is a real error rather than an unsupported program shape.
+        let mut function = tiny_add_function();
+        function.blocks[0].instructions[4].op = Op::Binary {
+            op: nx86_ir::BinaryOp::Add,
+            ty: Type::I64,
+            lhs: Value(9),
+            rhs: Value(2),
+        };
+        let initial = CpuState::new();
+        let expected = CpuState::new();
+
+        let outcome = run_tiny_native_block(&function, &initial, &expected);
+
+        assert_eq!(outcome.status, NativeStatus::Error);
+    }
+
+    #[test]
+    fn native_object_round_trips_through_bytes() {
+        let function = tiny_add_function();
+        let lowered = lower_tiny_block(&function).expect("tiny add should lower");
+
+        let object = native_object(&function, &lowered);
+        let restored = NativeObject::from_bytes(&object.to_bytes()).expect("valid object");
+
+        assert_eq!(restored, object);
+        assert_eq!(restored.entry_address, 0);
+        assert_eq!(restored.guest_end, 12);
+        assert_eq!(restored.code, lowered.bytes());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn persisted_object_executes_after_reload() {
+        use nx86_x64_v4::NativeBlockState;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let function = tiny_add_function();
+        let lowered = lower_tiny_block(&function).expect("tiny add should lower");
+        let object = native_object(&function, &lowered);
+
+        // Persist to disk, then reload as if across a restart.
+        let path = dir.path().join(object.file_name());
+        object.write_to_path(&path).expect("write object");
+        let loaded = NativeObject::read_from_path(&path).expect("read object");
+
+        let executable =
+            nx86_jit::ExecutableMemory::new(&loaded.code).expect("code should allocate");
+        let cpu = CpuState::new();
+        let mut state = NativeBlockState::from_cpu_state(&cpu);
+
+        // SAFETY: the loaded bytes are the exact `extern "C"
+        // fn(*mut NativeBlockState)` block produced by `lower_tiny_block`.
+        unsafe { executable.call_with_state(&mut state) }.expect("native block should run");
+        let final_state = state.to_cpu_state(Some("svc #0x0"));
+
+        assert_eq!(final_state.x(1), 3);
+        assert_eq!(final_state.pc(), 12);
+        assert!(final_state.halted());
     }
 
     fn tiny_add_function() -> Function {

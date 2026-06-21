@@ -1001,6 +1001,49 @@ Pure AOT MUST require:
 
 Pure AOT SHOULD be hidden under advanced per-title settings.
 
+### 17.7 Size Optimization Policy
+
+Nx86 distinguishes between active compiler cache size and final Pure AOT output size.
+
+The active Nx86 cache MAY be large. It may contain native objects, promoted JIT objects, shader caches, pipeline caches, profile logs, guard metadata, deopt metadata, rollback generations, debug maps, and compile reports.
+
+Pure AOT output MUST be size-disciplined.
+
+Pure AOT export SHOULD remove:
+
+1. unused native objects
+2. stale promoted JIT objects
+3. old profile logs
+4. rollback generations
+5. debug dumps
+6. temporary compiler data
+7. unused shader variants
+8. unused pipeline variants
+9. unused title profile data
+10. redundant metadata
+
+Pure AOT export SHOULD apply:
+
+1. dead code elimination
+2. duplicate thunk merging
+3. unused runtime service pruning
+4. shader/pipeline pruning
+5. symbol stripping
+6. optional debug-symbol sidecar output
+7. object layout compaction
+8. runtime library deduplication
+
+Nx86 SHOULD allow separate modes for:
+
+- development cache
+- release cache
+- Pure AOT export
+- Pure AOT debug export
+
+The normal Nx86 cache is allowed to be large because it is a compiler workspace.
+
+The Pure AOT folder should be as small as practical while preserving correctness, performance, and legal local-use boundaries.
+
 ---
 
 ## 18. Continuous Dynamic Compilation

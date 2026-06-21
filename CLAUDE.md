@@ -50,9 +50,11 @@ product target is **Linux `x86_64-v4`**. This shapes everything:
   Linux x86_64; Apple Silicon reports a clean unsupported-host outcome.
 - The GUI shell (`cargo run -p nx86-app`) is **Linux-only**; do not expect it to
   run on the dev host. Exercise GUI changes on the Linux target.
-- The Phase 16–18 backend crates (`nx86-x64-asm`, `nx86-jit`, `nx86-x64-v4`,
-  `nx86-backend`) are active for the tiny single-block integer path. Later
-  backend crates such as `nx86-regalloc` and `nx86-object` remain skeletons.
+- The Phase 16–20 backend crates (`nx86-x64-asm`, `nx86-jit`, `nx86-x64-v4`,
+  `nx86-backend`, `nx86-regalloc`, `nx86-object`) are active for the tiny
+  single-block integer path: a basic register allocator (pool registers + stack
+  spills) and a `.nxo` AOT object format that persists a lowered block to disk.
+  Later backend crates such as `nx86-cache` remain skeletons.
 
 ## Architecture
 
