@@ -15,7 +15,7 @@ use nx86_core::{
     ipc::{CancelledEvent, IpcEvent, WorkerKind, decode_event},
     storage::StorageLayout,
 };
-use nx86_runtime::run_synthetic_test;
+use nx86_runtime::{NativeStatus, run_synthetic_test};
 use nx86_testsuite::SyntheticArm64Test;
 use nx86_title_db::{TitleDatabase, TitleEntry, TitleId};
 use nx86_vmm::{GuestAddress, GuestMemory, PagePermissions};
@@ -487,6 +487,12 @@ impl Nx86App {
                 self.test_ui.run_status = None;
                 self.test_ui.register_diffs.clear();
                 self.test_ui.memory_dumps.clear();
+                self.test_ui.framebuffer = None;
+                self.test_ui.framebuffer_texture = None;
+                self.test_ui.nxir_status = None;
+                self.test_ui.nxir_dump = None;
+                self.test_ui.native_status = None;
+                self.test_ui.native_dump = None;
                 self.test_ui.message = Some(error.to_string());
             }
         }
@@ -501,6 +507,8 @@ impl Nx86App {
         self.test_ui.framebuffer_texture = None;
         self.test_ui.nxir_status = None;
         self.test_ui.nxir_dump = None;
+        self.test_ui.native_status = None;
+        self.test_ui.native_dump = None;
 
         match test.entry_point() {
             Ok(entry) => match decode_program(&test.program.bytes, entry) {
@@ -554,6 +562,12 @@ impl Nx86App {
                 });
                 self.test_ui.nxir_dump =
                     (!result.nxir.dump.is_empty()).then(|| result.nxir.dump.clone());
+                self.test_ui.native_status = Some(native_status_line(
+                    result.native.status,
+                    result.native.error.as_deref(),
+                ));
+                self.test_ui.native_dump =
+                    (!result.native.dump.is_empty()).then(|| result.native.dump.clone());
             }
             Err(error) => {
                 self.test_ui.run_status = Some(format!("interpreter failed: {error}"));
@@ -631,6 +645,17 @@ fn memory_dump_summary(range: &nx86_testsuite::ExpectedMemoryRange) -> Result<St
     ))
 }
 
+fn native_status_line(status: NativeStatus, error: Option<&str>) -> String {
+    match (status, error) {
+        (NativeStatus::MatchesInterpreter, _) => "matches interpreter".to_owned(),
+        (NativeStatus::DisagreesWithInterpreter, _) => "disagrees with interpreter".to_owned(),
+        (NativeStatus::Unavailable, Some(error)) => format!("unavailable: {error}"),
+        (NativeStatus::Unavailable, None) => "unavailable".to_owned(),
+        (NativeStatus::Error, Some(error)) => format!("error: {error}"),
+        (NativeStatus::Error, None) => "error".to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nx86_core::config::{AppConfig, AppScreen};
@@ -678,5 +703,9 @@ mod tests {
         }));
         assert!(app.test_ui.register_diffs.is_empty());
         assert_eq!(app.test_ui.memory_dumps, vec!["0x1000: aa bb"]);
+        assert!(app.test_ui.native_status.as_deref().is_some_and(|status| {
+            status.contains("unavailable") || status.contains("matches interpreter")
+        }));
+        assert!(app.test_ui.native_dump.is_some());
     }
 }

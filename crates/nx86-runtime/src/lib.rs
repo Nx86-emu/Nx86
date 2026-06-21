@@ -2,6 +2,7 @@ use nx86_arm64_decode::{
     DecodeError, DecodedInstruction, InstructionKind, LogicalOp, MemSize, decode_program,
 };
 use nx86_arm64_lift::lift_program;
+use nx86_backend::run_tiny_native_block;
 use nx86_core::guest::{CpuState, CpuStateDiff, Nzcv};
 use nx86_testsuite::{Framebuffer, MemoryDiff, SyntheticArm64Test, SyntheticTestError};
 use nx86_vmm::{GuestAddress, GuestMemory, PAGE_SIZE, PagePermissions, VmmFault};
@@ -10,6 +11,7 @@ use thiserror::Error;
 mod eval;
 
 pub use eval::{EvalError, evaluate};
+pub use nx86_backend::{NativeOutcome, NativeStatus};
 
 #[derive(Clone, Debug)]
 pub struct TinyInterpreter {
@@ -230,6 +232,9 @@ pub struct SyntheticRunResult {
     /// Result of lifting the program to NxIR and evaluating it as a differential
     /// cross-check against the AArch64 interpreter.
     pub nxir: NxirOutcome,
+    /// Best-effort Phase 18 native x86_64 execution of the same verified NxIR
+    /// function, when the host can run generated x86_64 code.
+    pub native: NativeOutcome,
 }
 
 /// Outcome of the NxIR differential cross-check.
@@ -262,21 +267,23 @@ pub fn run_synthetic_test(
 ) -> Result<SyntheticRunResult, InterpreterError> {
     let entry_point = test.entry_point()?;
     let instructions = decode_program(&test.program.bytes, entry_point)?;
-    let mut state = CpuState::new();
-    state.set_pc(entry_point);
+    let mut initial_state = CpuState::new();
+    initial_state.set_pc(entry_point);
 
     let mut memory = GuestMemory::new_logical();
     map_regions(&mut memory, test)?;
 
-    let interpreter = TinyInterpreter::new(instructions.clone()).run_in(state, &mut memory)?;
+    let interpreter =
+        TinyInterpreter::new(instructions.clone()).run_in(initial_state.clone(), &mut memory)?;
     let register_diffs = test.expected.compare_cpu_state(&interpreter.final_state)?;
     let memory_diffs = compare_expected_memory(&memory, test)?;
     let framebuffer = read_framebuffer(&memory, test)?;
 
-    let nxir = run_nxir_differential(
+    let (nxir, native) = run_translation_differentials(
         test,
         &instructions,
         entry_point,
+        &initial_state,
         &interpreter.final_state,
         &memory,
     );
@@ -287,33 +294,58 @@ pub fn run_synthetic_test(
         memory_diffs,
         framebuffer,
         nxir,
+        native,
     })
 }
 
-/// Lift the program to NxIR, verify it, evaluate it on a fresh memory, and
-/// compare the result with the interpreter. This is best-effort: any failure is
-/// captured in [`NxirOutcome::error`] rather than propagated, so the GUI still
-/// shows interpreter results for programs the lifter cannot yet handle.
-fn run_nxir_differential(
+/// Lift the program to NxIR once, run the NxIR evaluator, then attempt Phase 18
+/// native execution from the same verified function. Both cross-checks are
+/// best-effort: failures are captured in their outcome structs rather than
+/// hiding the interpreter result.
+fn run_translation_differentials(
     test: &SyntheticArm64Test,
     instructions: &[DecodedInstruction],
     entry_point: u64,
+    initial_state: &CpuState,
     interpreter_state: &CpuState,
     interpreter_memory: &GuestMemory,
-) -> NxirOutcome {
+) -> (NxirOutcome, NativeOutcome) {
     let mut function = match lift_program("synthetic", instructions, entry_point) {
         Ok(function) => function,
-        Err(error) => return NxirOutcome::failed(error),
+        Err(error) => {
+            let message = error.to_string();
+            return (
+                NxirOutcome::failed(&message),
+                NativeOutcome::error(String::new(), message),
+            );
+        }
     };
 
     // Run the dead-flag pass and re-verify (SPEC §21.5: the verifier runs after
     // every optimization pass).
     nx86_ir_opt::eliminate_dead_flags(&mut function);
     if let Err(error) = nx86_ir::verify::verify(&function) {
-        return NxirOutcome::failed(error);
+        let message = error.to_string();
+        return (
+            NxirOutcome::failed(&message),
+            NativeOutcome::error(String::new(), message),
+        );
     }
     let dump = function.dump();
 
+    let nxir = evaluate_verified_nxir(test, &function, dump, interpreter_state, interpreter_memory);
+    let native = run_tiny_native_block(&function, initial_state, interpreter_state);
+
+    (nxir, native)
+}
+
+fn evaluate_verified_nxir(
+    test: &SyntheticArm64Test,
+    function: &nx86_ir::Function,
+    dump: String,
+    interpreter_state: &CpuState,
+    interpreter_memory: &GuestMemory,
+) -> NxirOutcome {
     let mut memory = GuestMemory::new_logical();
     if let Err(error) = map_regions(&mut memory, test) {
         return NxirOutcome {
@@ -324,7 +356,7 @@ fn run_nxir_differential(
         };
     }
 
-    let nxir_state = match evaluate(&function, &mut memory) {
+    let nxir_state = match evaluate(function, &mut memory) {
         Ok(state) => state,
         Err(error) => {
             return NxirOutcome {
@@ -454,7 +486,7 @@ mod tests {
     use nx86_core::guest::CpuState;
     use nx86_testsuite::SyntheticArm64Test;
 
-    use super::{InterpreterError, TinyInterpreter, run_synthetic_test};
+    use super::{InterpreterError, NativeStatus, TinyInterpreter, run_synthetic_test};
 
     #[test]
     fn synthetic_add_program_executes_and_matches_expected_registers() {
@@ -481,6 +513,11 @@ mod tests {
         assert!(result.register_diffs.is_empty());
         assert_eq!(result.interpreter.final_state.x(1), 3);
         assert_eq!(result.interpreter.trace.len(), 3);
+        assert!(!result.native.dump.is_empty());
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(result.native.status, NativeStatus::MatchesInterpreter);
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        assert_eq!(result.native.status, NativeStatus::Unavailable);
     }
 
     #[test]

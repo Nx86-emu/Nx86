@@ -300,6 +300,93 @@ This folder is intended only for local use by the person who legally provided th
 
 ---
 
+## System Reimplementation Policy
+
+Nx86 SHOULD reimplement every system, service, runtime, and firmware behavior that can reasonably be reimplemented.
+
+Nx86 MUST NOT be designed as a firmware-first emulator.
+
+The preferred compatibility strategy is:
+
+```text
+clean-room reimplementation
+  ↓
+high-level emulation
+  ↓
+native Nx86 runtime service
+  ↓
+stub only when safe
+  ↓
+user-provided local system file fallback only when unavoidable
+```
+
+Nx86 MUST NOT ship firmware, system archives, console keys, proprietary SDK code, or copyrighted system components.
+
+Nx86 MUST NOT include instructions, links, workflows, or tooling for obtaining console keys, dumping firmware, bypassing encryption, or sharing system files.
+
+Nx86 MAY support user-provided local system files when required for compatibility, but this MUST be treated as a compatibility fallback rather than the preferred architecture.
+
+For synthetic ARM64 tests, homebrew, and Pure AOT research, Nx86 SHOULD avoid requiring firmware or keys entirely.
+
+For commercial title compatibility, Nx86 SHOULD reimplement as much Horizon-like service behavior as possible through clean-room HLE and native Nx86 runtime libraries.
+
+### Reimplementation Targets
+
+Nx86 SHOULD prioritize reimplementing:
+
+1. process management
+2. thread management
+3. synchronization primitives
+4. virtual memory behavior
+5. filesystem services
+6. save data services
+7. input services
+8. gamepad services
+9. audio services
+10. graphics services
+11. shader translation
+12. GPU pipeline management
+13. applet/service stubs
+14. account/user service stubs
+15. settings service stubs
+16. time services
+17. network service stubs
+18. error/reporting services
+19. logging services
+20. runtime loader behavior
+
+### Firmware Fallback Policy
+
+Firmware or user-provided system files MAY be supported only when:
+
+1. the behavior cannot yet be accurately reimplemented
+2. the user provides the files locally
+3. Nx86 does not redistribute them
+4. Nx86 does not provide acquisition instructions
+5. the fallback is clearly marked as compatibility-only
+6. the long-term goal remains reimplementation
+
+### Pure AOT Impact
+
+Pure AOT output SHOULD depend on Nx86’s own native runtime libraries rather than proprietary firmware files.
+
+A Pure AOT title folder SHOULD include Nx86-provided runtime libraries for:
+
+1. input
+2. audio
+3. graphics
+4. filesystem behavior
+5. service behavior
+6. windowing
+7. gamepad support
+8. title-specific compatibility behavior
+
+Pure AOT SHOULD NOT require the full Nx86 emulator app.
+
+The long-term goal is for Nx86 to replace firmware/runtime dependency with clean-room native runtime components wherever possible.
+
+---
+
 ## 9. Target Platform Strategy
 
 ### 9.1 Initial Target

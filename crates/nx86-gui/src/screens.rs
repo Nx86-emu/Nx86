@@ -90,6 +90,10 @@ pub struct TestUiState {
     pub nxir_status: Option<String>,
     /// NxIR text dump from the last run, if lifting succeeded.
     pub nxir_dump: Option<String>,
+    /// Phase 18 native x86_64 execution status, as a compact status line.
+    pub native_status: Option<String>,
+    /// Native assembler dump from the last run, if lowering succeeded.
+    pub native_dump: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,7 +317,7 @@ pub fn compile(ui: &mut egui::Ui, state: &mut CompileUiState) -> CompileAction {
 }
 
 pub fn tests(ui: &mut egui::Ui, state: &mut TestUiState) -> TestAction {
-    screen_header(ui, "Synthetic ARM64 Tests", "Phases 6-11");
+    screen_header(ui, "Synthetic ARM64 Tests", "Phases 6-18");
     let mut action = TestAction::None;
 
     ui.horizontal(|ui| {
@@ -411,6 +415,20 @@ pub fn tests(ui: &mut egui::Ui, state: &mut TestUiState) -> TestAction {
             if let Some(dump) = &state.nxir_dump {
                 egui::ScrollArea::vertical()
                     .id_salt("nxir-dump")
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        ui.monospace(dump);
+                    });
+            }
+        }
+
+        if let Some(status) = &state.native_status {
+            ui.add_space(10.0);
+            ui.strong("Native x86_64");
+            ui.monospace(status);
+            if let Some(dump) = &state.native_dump {
+                egui::ScrollArea::vertical()
+                    .id_salt("native-dump")
                     .max_height(180.0)
                     .show(ui, |ui| {
                         ui.monospace(dump);

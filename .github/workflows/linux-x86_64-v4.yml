@@ -1,0 +1,143 @@
+name: Linux x86_64-v4 Static Artifact
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+concurrency:
+  group: linux-x86_64-v4-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_BINARY: target/release/nx86-app
+  RELEASE_NAME: nx86-app-linux-x86_64-v4
+  RUSTFLAGS: -C target-cpu=x86-64-v4 -C target-feature=+crt-static -C strip=symbols
+
+jobs:
+  artifact:
+    name: Build and validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils \
+            build-essential \
+            file \
+            gzip \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-dev \
+            pkg-config \
+            tar
+
+      - name: Validate runner
+        run: |
+          set -euo pipefail
+          test "$(uname -s)" = "Linux"
+          test "$(uname -m)" = "x86_64"
+
+      - name: Detect x86_64-v4 runtime support
+        id: cpu
+        run: |
+          if bash .github/scripts/verify-linux-x86_64-v4.sh --cpu-only; then
+            echo "v4_runtime=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "v4_runtime=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test workspace
+        if: steps.cpu.outputs.v4_runtime == 'true'
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Test workspace with host-compatible CPU
+        if: steps.cpu.outputs.v4_runtime != 'true'
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Compile x86_64-v4 test binaries
+        if: steps.cpu.outputs.v4_runtime != 'true'
+        run: cargo test --workspace --all-targets --no-run --locked
+
+      - name: Build release artifact
+        run: cargo build -p nx86-app --release --locked
+
+      - name: Verify release artifact
+        run: bash .github/scripts/verify-linux-x86_64-v4.sh "$RELEASE_BINARY"
+
+      - name: Package artifact
+        run: |
+          set -euo pipefail
+          package_root="dist/${RELEASE_NAME}"
+          rm -rf dist
+          mkdir -p "$package_root"
+
+          cp "$RELEASE_BINARY" "$package_root/nx86-app"
+          chmod 755 "$package_root/nx86-app"
+
+          cat > "$package_root/RUNTIME-DEPS.txt" <<'NOTE'
+          Nx86 Linux x86_64-v4 artifact
+
+          This binary is built with:
+            RUSTFLAGS="-C target-cpu=x86-64-v4 -C target-feature=+crt-static -C strip=symbols"
+
+          The current GUI stack may runtime-load host display, OpenGL/EGL,
+          Vulkan, portal, and file-dialog libraries. This artifact is not a
+          fully self-contained musl GUI binary.
+          NOTE
+
+          tar -czf "dist/${RELEASE_NAME}.tar.gz" -C dist "$RELEASE_NAME"
+          sha256sum "dist/${RELEASE_NAME}.tar.gz" > "dist/${RELEASE_NAME}.tar.gz.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RELEASE_NAME }}
+          path: |
+            dist/${{ env.RELEASE_NAME }}.tar.gz
+            dist/${{ env.RELEASE_NAME }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: artifact
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download workflow artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.RELEASE_NAME }}
+          path: dist
+
+      - name: Upload GitHub Release artifact
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ env.RELEASE_NAME }}.tar.gz
+            dist/${{ env.RELEASE_NAME }}.tar.gz.sha256

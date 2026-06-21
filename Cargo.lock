@@ -1607,6 +1607,12 @@ version = "0.1.0"
 [[package]]
 name = "nx86-backend"
 version = "0.1.0"
+dependencies = [
+ "nx86-core",
+ "nx86-ir",
+ "nx86-jit",
+ "nx86-x64-v4",
+]
 
 [[package]]
 name = "nx86-cache"
@@ -1695,6 +1701,11 @@ dependencies = [
 [[package]]
 name = "nx86-jit"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "nx86-x64-asm",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "nx86-object"
@@ -1714,6 +1725,7 @@ version = "0.1.0"
 dependencies = [
  "nx86-arm64-decode",
  "nx86-arm64-lift",
+ "nx86-backend",
  "nx86-core",
  "nx86-ir",
  "nx86-ir-opt",
@@ -1776,10 +1788,20 @@ dependencies = [
 [[package]]
 name = "nx86-x64-asm"
 version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "nx86-x64-v4"
 version = "0.1.0"
+dependencies = [
+ "nx86-core",
+ "nx86-ir",
+ "nx86-jit",
+ "nx86-x64-asm",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "objc-sys"

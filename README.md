@@ -10,7 +10,7 @@ Vulkan graphics backend.
 
 ## Current Prototype Target
 
-Phase 0 through Phase 15 define the current prototype:
+Phase 0 through Phase 18 define the current prototype:
 
 - Linux x86_64-v4 target
 - Rust monorepo
@@ -28,12 +28,16 @@ Phase 0 through Phase 15 define the current prototype:
 - NxIR intermediate representation, verifier, and AArch64 lifter
 - NxIR evaluator used as a differential oracle against the interpreter
 - lazy NZCV flags with conditional branches and a dead-flag pass
+- internal x86_64 assembler with labels, stack-frame helpers, and dumps
+- Linux x86_64 executable-memory manager for trusted generated code
+- first tiny NxIR-to-native x86_64 block path for single-block integer tests
 - 64 GiB VMM skeleton with software page mapping and debug dumps
 - internal Vulkan boundary crate prepared for future `ash` work
 
-The prototype does not import or run Switch software yet, and there is no
-native x86_64 code generation yet (Phases 16+). The first real software target
-after the early foundations is homebrew, as described in `SPEC.md`.
+The prototype does not import or run Switch software yet. Native x86_64 code
+generation is limited to an internal Phase 18 synthetic add-block path; broader
+register allocation, object caching, dispatch, JIT fallback, and homebrew
+execution remain later phases, as described in `SPEC.md`.
 
 ## Build
 
