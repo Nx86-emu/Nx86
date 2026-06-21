@@ -12,8 +12,8 @@ synthetic ARM64 test display, guest CPU state, a narrow AArch64 decoder, a tiny
 synthetic interpreter, an NxIR differential oracle, a VMM skeleton, and the
 first internal x86_64 native-codegen path for a single-block synthetic integer
 program. It does not implement real title import, Switch runtime execution,
-register allocation, object caching, dispatcher/JIT fallback, graphics, or
-rendering.
+emergency JIT fallback, native memory or conditional-branch lowering, graphics,
+or Switch rendering.
 
 ## Active Phase 0-22 Crates
 

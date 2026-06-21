@@ -64,7 +64,15 @@ impl Dispatcher {
 
     /// Register native blocks loaded from cached objects (e.g. via
     /// `nx86_cache::CacheManager::load`), keyed by each object's entry address.
-    pub fn from_objects<'a>(
+    ///
+    /// # Safety
+    ///
+    /// Every object's code bytes must have been emitted by Nx86's trusted
+    /// `nx86-x64-v4` lowerer for the `NativeBlockState` ABI and must not have
+    /// been replaced or forged after persistence. The `.nxo` content hash
+    /// detects accidental corruption; it does not establish provenance.
+    #[allow(unsafe_code)]
+    pub unsafe fn from_objects<'a>(
         objects: impl IntoIterator<Item = &'a NativeObject>,
     ) -> Result<Self, DispatchError> {
         let mut blocks = BTreeMap::new();

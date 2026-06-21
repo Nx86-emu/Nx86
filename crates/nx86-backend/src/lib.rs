@@ -172,11 +172,11 @@ fn call_generated_block(
     executable: &ExecutableMemory,
     state: &mut NativeBlockState,
 ) -> Result<(), ExecError> {
-    // SAFETY: the bytes behind `executable` are produced by the trusted lowerer
-    // — `lower_tiny_block` or `lower_function` (`nx86-x64-v4`), including bytes
-    // round-tripped through `.nxo` cache objects, which only ever store lowerer
-    // output. The lowerer emits an `extern "C" fn(*mut NativeBlockState)` block
-    // that reads and writes only fields within the provided state pointer.
+    // SAFETY: the bytes behind `executable` are either produced directly by the
+    // trusted `nx86-x64-v4` lowerer or admitted through `Dispatcher::from_objects`,
+    // whose unsafe contract requires that provenance. The lowerer emits an
+    // `extern "C" fn(*mut NativeBlockState)` block that reads and writes only
+    // fields within the provided state pointer.
     unsafe { executable.call_with_state(state) }
 }
 
@@ -476,7 +476,11 @@ mod tests {
             .map(|entry| cache.load(entry.entry_address).expect("load object"))
             .collect();
 
-        let dispatcher = super::Dispatcher::from_objects(loaded.iter()).expect("build dispatcher");
+        // SAFETY: every object was emitted by `objects_for`, persisted in this
+        // test's private temporary cache, and loaded without outside mutation.
+        #[allow(unsafe_code)]
+        let dispatcher =
+            unsafe { super::Dispatcher::from_objects(loaded.iter()) }.expect("build dispatcher");
         assert_eq!(dispatcher.block_count(), 2);
 
         let mut initial = CpuState::new();
@@ -495,7 +499,11 @@ mod tests {
         // Register only the entry block, so routing to block 1 finds no block.
         let function = two_block_branch_function();
         let objects = objects_for(&function);
-        let dispatcher = super::Dispatcher::from_objects(&objects[..1]).expect("build dispatcher");
+        // SAFETY: `objects_for` directly wraps bytes from the trusted lowerer;
+        // no persistence or external mutation occurs in this test.
+        #[allow(unsafe_code)]
+        let dispatcher =
+            unsafe { super::Dispatcher::from_objects(&objects[..1]) }.expect("build dispatcher");
 
         let mut initial = CpuState::new();
         initial.set_pc(0);

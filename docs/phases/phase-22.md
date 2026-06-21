@@ -17,15 +17,17 @@ rejecting branches — a lone block has no sibling to reach. Conditional branche
 and `Return` remain unlowered (native flags are a later phase).
 
 `nx86-backend` adds the `Dispatcher`: a registry of native blocks keyed by guest
-entry PC, built either `from_function` (lower in place) or `from_objects` (load
-cached `.nxo` objects), and a `run` loop that looks up the current PC, calls the
-block, and continues until a block halts. A guest PC with no registered block is
-returned as `DispatchExit::MissingBlock` — the seam the Phase 23 emergency JIT
-fills — and a step budget guards against runaway loops. `run_dispatched_function`
-is the multi-block analogue of `run_tiny_native_block`, classifying the result
-against the interpreter. The differential harness in `nx86-runtime` now runs this
-dispatcher cross-check alongside the single-block attempt for every synthetic
-test.
+entry PC, built either `from_function` (lower in place) or unsafe `from_objects`
+(load trusted cached `.nxo` objects), and a `run` loop that looks up the current
+PC, calls the block, and continues until a block halts. The unsafe constructor
+makes provenance explicit because an `.nxo` hash detects corruption but cannot
+prove that bytes came from Nx86's lowerer. A guest PC with no registered block
+is returned as `DispatchExit::MissingBlock` — the seam the Phase 23 emergency
+JIT fills — and a step budget guards against runaway loops.
+`run_dispatched_function` is the multi-block analogue of
+`run_tiny_native_block`, classifying the result against the interpreter. The
+differential harness in `nx86-runtime` now runs this dispatcher cross-check
+alongside the single-block attempt for every synthetic test.
 
 The emergency JIT (compiling a missing block on demand) and runtime profile
 logging remain later phases.

@@ -17,9 +17,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RELEASE_BINARY: target/release/nx86-app
+  RELEASE_BINARY: target/x86_64-unknown-linux-gnu/release/nx86-app
   RELEASE_NAME: nx86-app-linux-x86_64-v4
-  RUSTFLAGS: -C target-cpu=x86-64-v4 -C target-feature=+crt-static -C strip=symbols
 
 jobs:
   artifact:
@@ -69,20 +68,24 @@ jobs:
 
       - name: Test workspace
         if: steps.cpu.outputs.v4_runtime == 'true'
-        run: cargo test --workspace --all-targets --locked
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v4
+        run: cargo test --workspace --all-targets --target x86_64-unknown-linux-gnu --locked
 
       - name: Test workspace with host-compatible CPU
         if: steps.cpu.outputs.v4_runtime != 'true'
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo test --workspace --all-targets --locked
 
       - name: Compile x86_64-v4 test binaries
         if: steps.cpu.outputs.v4_runtime != 'true'
-        run: cargo test --workspace --all-targets --no-run --locked
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v4
+        run: cargo test --workspace --all-targets --target x86_64-unknown-linux-gnu --no-run --locked
 
       - name: Build release artifact
-        run: cargo build -p nx86-app --release --locked
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v4 -C target-feature=+crt-static -C strip=symbols
+        run: cargo build -p nx86-app --release --target x86_64-unknown-linux-gnu --locked
 
       - name: Verify release artifact
         run: bash .github/scripts/verify-linux-x86_64-v4.sh "$RELEASE_BINARY"

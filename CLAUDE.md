@@ -50,11 +50,11 @@ product target is **Linux `x86_64-v4`**. This shapes everything:
   Linux x86_64; Apple Silicon reports a clean unsupported-host outcome.
 - The GUI shell (`cargo run -p nx86-app`) is **Linux-only**; do not expect it to
   run on the dev host. Exercise GUI changes on the Linux target.
-- The Phase 16–20 backend crates (`nx86-x64-asm`, `nx86-jit`, `nx86-x64-v4`,
-  `nx86-backend`, `nx86-regalloc`, `nx86-object`) are active for the tiny
-  single-block integer path: a basic register allocator (pool registers + stack
-  spills) and a `.nxo` AOT object format that persists a lowered block to disk.
-  Later backend crates such as `nx86-cache` remain skeletons.
+- The Phase 16–22 backend crates (`nx86-x64-asm`, `nx86-jit`, `nx86-x64-v4`,
+  `nx86-backend`, `nx86-regalloc`, `nx86-object`, `nx86-cache`) are active for
+  the narrow integer path: register allocation with spills, persistent `.nxo`
+  objects, a managed cache, and multi-block dispatch through unconditional
+  branches. Emergency JIT and runtime profiling remain later phases.
 
 ## Architecture
 
@@ -75,13 +75,14 @@ interpreter and an independent NxIR evaluator (`eval.rs`). `run_synthetic_test`
 runs a program through both and asserts they agree on final register state and
 observed memory. It also attempts the Phase 18 native x86_64 tiny-block path
 from the same verified NxIR function. On Apple Silicon, native execution should
-report `unavailable`; on Linux x86_64, the synthetic add block should match the
-interpreter.
+report `unavailable`; on Linux x86_64, supported single- and multi-block
+programs should match the interpreter.
 
 **Native backend slice:** `nx86-x64-asm` owns exact byte emission for the small
 assembler API; `nx86-jit` owns executable memory and trusted generated-code call
-wrappers; `nx86-x64-v4` lowers the tiny single-block NxIR integer subset into
-x86_64 bytes; `nx86-backend` orchestrates native execution and comparison.
+wrappers; `nx86-x64-v4` lowers the supported NxIR integer subset per block;
+`nx86-object` and `nx86-cache` persist and manage native blocks; `nx86-backend`
+orchestrates single-block execution and multi-block dispatch.
 
 **Shared foundations:**
 - `nx86-core`: shared config, storage layout, the IPC model (`ipc.rs`), and
