@@ -38,6 +38,9 @@ pub const OBJECT_MAGIC: [u8; 4] = *b"NXO\0";
 pub const OBJECT_VERSION: u32 = 1;
 
 const HEADER_LEN: usize = 32;
+/// Length of the fixed `.nxo` header (magic, version, guest mapping, stack size,
+/// and code length) that precedes the code bytes and trailing hash.
+pub const OBJECT_HEADER_LEN: usize = HEADER_LEN;
 const HASH_LEN: usize = 8;
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -76,11 +79,11 @@ impl NativeObject {
         out
     }
 
-    /// Parse and validate a `.nxo` byte buffer.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ObjectError> {
-        if bytes.len() < HEADER_LEN + HASH_LEN {
-            return Err(ObjectError::Truncated);
-        }
+    /// Parse just the fixed header from the start of a `.nxo` buffer, validating
+    /// the magic but not the version or content hash. This is the cheap
+    /// "shallow" inspection the cache uses to enumerate objects without loading
+    /// and hashing their code.
+    pub fn read_header(bytes: &[u8]) -> Result<ObjectHeader, ObjectError> {
         let magic: [u8; 4] = bytes
             .get(0..4)
             .and_then(|slice| slice.try_into().ok())
@@ -88,14 +91,28 @@ impl NativeObject {
         if magic != OBJECT_MAGIC {
             return Err(ObjectError::BadMagic);
         }
-        let version = read_u32(bytes, 4)?;
-        if version != OBJECT_VERSION {
-            return Err(ObjectError::UnsupportedVersion { found: version });
+        Ok(ObjectHeader {
+            version: read_u32(bytes, 4)?,
+            entry_address: read_u64(bytes, 8)?,
+            guest_end: read_u64(bytes, 16)?,
+            stack_size: read_u32(bytes, 24)?,
+            code_len: read_u32(bytes, 28)?,
+        })
+    }
+
+    /// Parse and validate a `.nxo` byte buffer (magic, version, exact length,
+    /// and content hash).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ObjectError> {
+        if bytes.len() < HEADER_LEN + HASH_LEN {
+            return Err(ObjectError::Truncated);
         }
-        let entry_address = read_u64(bytes, 8)?;
-        let guest_end = read_u64(bytes, 16)?;
-        let stack_size = read_u32(bytes, 24)?;
-        let code_len = read_u32(bytes, 28)? as usize;
+        let header = Self::read_header(bytes)?;
+        if header.version != OBJECT_VERSION {
+            return Err(ObjectError::UnsupportedVersion {
+                found: header.version,
+            });
+        }
+        let code_len = header.code_len as usize;
 
         let expected_len = HEADER_LEN
             .checked_add(code_len)
@@ -119,9 +136,9 @@ impl NativeObject {
         }
 
         Ok(Self {
-            entry_address,
-            guest_end,
-            stack_size,
+            entry_address: header.entry_address,
+            guest_end: header.guest_end,
+            stack_size: header.stack_size,
             code,
         })
     }
@@ -140,8 +157,26 @@ impl NativeObject {
     /// Conventional file name for this object, keyed by its guest entry address.
     #[must_use]
     pub fn file_name(&self) -> String {
-        format!("{:016x}.nxo", self.entry_address)
+        object_file_name(self.entry_address)
     }
+}
+
+/// The fixed-size header at the start of every `.nxo` object, parsed without
+/// loading or hash-validating the code body. See [`NativeObject::read_header`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectHeader {
+    pub version: u32,
+    pub entry_address: u64,
+    pub guest_end: u64,
+    pub stack_size: u32,
+    pub code_len: u32,
+}
+
+/// Conventional `.nxo` file name for an object with the given guest entry
+/// address. The shared source of truth for both writing and cache lookup.
+#[must_use]
+pub fn object_file_name(entry_address: u64) -> String {
+    format!("{entry_address:016x}.nxo")
 }
 
 /// A failure parsing or loading a `.nxo` object.
@@ -269,6 +304,31 @@ mod tests {
         assert!(matches!(
             NativeObject::from_bytes(&bytes),
             Err(ObjectError::HashMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn read_header_parses_mapping_without_hash() {
+        let object = sample();
+        // A corrupt body still yields a readable header (no hash validation).
+        let mut bytes = object.to_bytes();
+        bytes[32] ^= 0xFF;
+
+        let header = NativeObject::read_header(&bytes).expect("header should parse");
+        assert_eq!(header.version, super::OBJECT_VERSION);
+        assert_eq!(header.entry_address, object.entry_address);
+        assert_eq!(header.guest_end, object.guest_end);
+        assert_eq!(header.stack_size, object.stack_size);
+        assert_eq!(header.code_len as usize, object.code.len());
+    }
+
+    #[test]
+    fn read_header_rejects_bad_magic() {
+        let mut bytes = sample().to_bytes();
+        bytes[0] = b'X';
+        assert!(matches!(
+            NativeObject::read_header(&bytes),
+            Err(ObjectError::BadMagic)
         ));
     }
 }

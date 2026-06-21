@@ -1619,6 +1619,13 @@ dependencies = [
 [[package]]
 name = "nx86-cache"
 version = "0.1.0"
+dependencies = [
+ "nx86-object",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "nx86-core"
@@ -1658,6 +1665,7 @@ dependencies = [
  "eframe",
  "egui",
  "nx86-arm64-decode",
+ "nx86-cache",
  "nx86-core",
  "nx86-runtime",
  "nx86-testsuite",

@@ -15,7 +15,7 @@ program. It does not implement real title import, Switch runtime execution,
 register allocation, object caching, dispatcher/JIT fallback, graphics, or
 rendering.
 
-## Active Phase 0-18 Crates
+## Active Phase 0-21 Crates
 
 - `nx86-app`: binary entrypoint, logging setup, config load, GUI launch.
 - `nx86-gui`: egui shell, wizard, theme, navigation, title list, worker progress, synthetic test display, decode display, tiny interpreter status, framebuffer rendering, and NxIR/native dump agreement.
@@ -32,6 +32,7 @@ rendering.
 - `nx86-x64-v4`: tiny single-block NxIR integer lowering to x86_64 bytes.
 - `nx86-regalloc`: basic linear-scan register allocator for a single NxIR block (pool registers with stack-slot spills).
 - `nx86-object`: AOT object format v0 — `.nxo` serialization of a native block with guest mapping and a validation hash.
+- `nx86-cache`: cache manager v0 — `.nxo` object directory with a manifest, shallow/full integrity checks, size accounting, and insert/load/remove/clear.
 - `nx86-vmm`: 64 GiB guest memory arena boundary and software page-table helpers.
 - `nx86-debug`: tracing-based logging setup.
 - `nx86-testsuite`: synthetic ARM64 test file format, framebuffer spec, and result diffs.
@@ -41,8 +42,8 @@ rendering.
 
 The remaining crates compile as placeholders so the workspace layout matches
 the specification while later phases can fill them in without reshaping the
-repository. `nx86-cache` and broader backend/runtime crates remain deferred to
-Phases 21+.
+repository. The dispatcher, emergency JIT, profile logging, and broader
+runtime/graphics crates remain deferred to Phases 22+.
 
 ## Vulkan Policy
 

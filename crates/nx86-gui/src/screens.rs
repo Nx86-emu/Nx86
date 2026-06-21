@@ -14,6 +14,8 @@ pub struct LibraryUiState {
     pub new_title_id: String,
     pub new_display_name: String,
     pub message: Option<String>,
+    /// Global CPU-object cache summary, refreshed alongside the title list.
+    pub cache_status: Option<nx86_cache::CacheStatus>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +23,7 @@ pub enum LibraryAction {
     None,
     CreatePlaceholder,
     Refresh,
+    ClearCache,
 }
 
 #[derive(Default)]
@@ -202,6 +205,26 @@ pub fn library(
     if let Some(message) = &state.message {
         ui.label(message);
     }
+
+    ui.add_space(12.0);
+    ui.horizontal(|ui| {
+        ui.strong("CPU object cache:");
+        match &state.cache_status {
+            Some(status) => {
+                ui.label(format!(
+                    "{} object(s), {}",
+                    status.object_count,
+                    human_bytes(status.total_bytes)
+                ));
+            }
+            None => {
+                ui.label("unavailable");
+            }
+        }
+        if ui.button("Clear Cache").clicked() {
+            action = LibraryAction::ClearCache;
+        }
+    });
 
     ui.add_space(12.0);
     egui::Grid::new("library-grid")
@@ -592,6 +615,18 @@ fn edit_path(ui: &mut egui::Ui, path: &mut PathBuf) {
     let mut text = path.display().to_string();
     if ui.text_edit_singleline(&mut text).changed() {
         *path = PathBuf::from(text);
+    }
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    if bytes < KIB {
+        format!("{bytes} B")
+    } else if bytes < MIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
     }
 }
 

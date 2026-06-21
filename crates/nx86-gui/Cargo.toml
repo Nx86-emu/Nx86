@@ -9,6 +9,7 @@ rust-version.workspace = true
 eframe.workspace = true
 egui.workspace = true
 nx86-arm64-decode = { path = "../nx86-arm64-decode" }
+nx86-cache = { path = "../nx86-cache" }
 nx86-core = { path = "../nx86-core" }
 nx86-runtime = { path = "../nx86-runtime" }
 nx86-testsuite = { path = "../nx86-testsuite" }

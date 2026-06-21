@@ -173,6 +173,7 @@ impl Nx86App {
                 self.service_error = Some(error.to_string());
             }
         }
+        self.refresh_cache_status();
     }
 
     fn refresh_titles(&mut self) {
@@ -190,6 +191,44 @@ impl Nx86App {
                 self.service_error = Some(error.to_string());
             }
         }
+    }
+
+    fn refresh_cache_status(&mut self) {
+        let cache_dir = match &self.storage_layout {
+            Some(layout) => layout.global_cache_dir.clone(),
+            None => {
+                self.library_ui.cache_status = None;
+                return;
+            }
+        };
+        self.library_ui.cache_status =
+            match nx86_cache::CacheManager::open(cache_dir).and_then(|cache| cache.status()) {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to read CPU object cache status");
+                    None
+                }
+            };
+    }
+
+    fn clear_cache(&mut self) {
+        let Some(cache_dir) = self
+            .storage_layout
+            .as_ref()
+            .map(|layout| layout.global_cache_dir.clone())
+        else {
+            self.library_ui.message = Some("cache is not available".to_owned());
+            return;
+        };
+        match nx86_cache::CacheManager::open(cache_dir).and_then(|cache| cache.clear()) {
+            Ok(removed) => {
+                self.library_ui.message = Some(format!("cleared {removed} cached object(s)"));
+            }
+            Err(error) => {
+                self.library_ui.message = Some(error.to_string());
+            }
+        }
+        self.refresh_cache_status();
     }
 
     fn create_placeholder_title(&mut self) {
@@ -307,7 +346,11 @@ impl Nx86App {
             ) {
                 screens::LibraryAction::None => {}
                 screens::LibraryAction::CreatePlaceholder => self.create_placeholder_title(),
-                screens::LibraryAction::Refresh => self.refresh_titles(),
+                screens::LibraryAction::Refresh => {
+                    self.refresh_titles();
+                    self.refresh_cache_status();
+                }
+                screens::LibraryAction::ClearCache => self.clear_cache(),
             },
             AppScreen::Compile => match screens::compile(ui, &mut self.compile_ui) {
                 screens::CompileAction::None => {}
