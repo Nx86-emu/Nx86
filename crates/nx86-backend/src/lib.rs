@@ -3,6 +3,7 @@ use nx86_ir::{Function, Terminator};
 use nx86_jit::{ExecError, ExecutableMemory};
 use nx86_x64_v4::{LoweredBlock, LoweringError, NativeBlockState, lower_tiny_block};
 
+pub use nx86_jit::{EmergencyJit, JitCompilation, JitError, JitEvent};
 pub use nx86_object::{NativeObject, ObjectError};
 
 mod dispatch;
@@ -479,7 +480,7 @@ mod tests {
         // SAFETY: every object was emitted by `objects_for`, persisted in this
         // test's private temporary cache, and loaded without outside mutation.
         #[allow(unsafe_code)]
-        let dispatcher =
+        let mut dispatcher =
             unsafe { super::Dispatcher::from_objects(loaded.iter()) }.expect("build dispatcher");
         assert_eq!(dispatcher.block_count(), 2);
 
@@ -502,7 +503,7 @@ mod tests {
         // SAFETY: `objects_for` directly wraps bytes from the trusted lowerer;
         // no persistence or external mutation occurs in this test.
         #[allow(unsafe_code)]
-        let dispatcher =
+        let mut dispatcher =
             unsafe { super::Dispatcher::from_objects(&objects[..1]) }.expect("build dispatcher");
 
         let mut initial = CpuState::new();
@@ -510,5 +511,39 @@ mod tests {
         let outcome = dispatcher.run(&initial, None).expect("dispatch run");
 
         assert_eq!(outcome.exit, super::DispatchExit::MissingBlock { pc: 0x8 });
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn dispatcher_jits_missing_block_caches_it_and_continues() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = nx86_cache::CacheManager::open(dir.path()).expect("open cache");
+        let function = two_block_branch_function();
+        let objects = objects_for(&function);
+        // SAFETY: `objects_for` directly wraps bytes from the trusted lowerer;
+        // no persistence or external mutation occurs before construction.
+        #[allow(unsafe_code)]
+        let dispatcher =
+            unsafe { super::Dispatcher::from_objects(&objects[..1]) }.expect("build dispatcher");
+        let jit = nx86_jit::EmergencyJit::new(function, cache.clone()).expect("create JIT");
+        let mut dispatcher = dispatcher.with_emergency_jit(jit);
+
+        let mut initial = CpuState::new();
+        initial.set_pc(0);
+        let outcome = dispatcher
+            .run(&initial, Some("svc #0x0"))
+            .expect("dispatch with JIT");
+
+        assert_eq!(outcome.exit, super::DispatchExit::Halted);
+        assert_eq!(outcome.final_state, two_block_expected_state());
+        assert_eq!(outcome.jit_events.len(), 1);
+        assert_eq!(outcome.jit_events[0].guest_pc, 0x8);
+        assert_eq!(cache.load(0x8).expect("load JIT object").entry_address, 0x8);
+
+        let second = dispatcher
+            .run(&initial, Some("svc #0x0"))
+            .expect("dispatch installed block");
+        assert_eq!(second.exit, super::DispatchExit::Halted);
+        assert!(second.jit_events.is_empty());
     }
 }

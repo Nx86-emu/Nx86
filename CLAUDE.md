@@ -50,11 +50,12 @@ product target is **Linux `x86_64-v4`**. This shapes everything:
   Linux x86_64; Apple Silicon reports a clean unsupported-host outcome.
 - The GUI shell (`cargo run -p nx86-app`) is **Linux-only**; do not expect it to
   run on the dev host. Exercise GUI changes on the Linux target.
-- The Phase 16–22 backend crates (`nx86-x64-asm`, `nx86-jit`, `nx86-x64-v4`,
+- The Phase 16–23 backend crates (`nx86-x64-asm`, `nx86-jit`, `nx86-x64-v4`,
   `nx86-backend`, `nx86-regalloc`, `nx86-object`, `nx86-cache`) are active for
   the narrow integer path: register allocation with spills, persistent `.nxo`
-  objects, a managed cache, and multi-block dispatch through unconditional
-  branches. Emergency JIT and runtime profiling remain later phases.
+  objects, a managed cache, multi-block dispatch through unconditional branches,
+  and emergency single-block JIT fallback. Runtime profile files remain a later
+  phase.
 
 ## Architecture
 
@@ -79,8 +80,9 @@ report `unavailable`; on Linux x86_64, supported single- and multi-block
 programs should match the interpreter.
 
 **Native backend slice:** `nx86-x64-asm` owns exact byte emission for the small
-assembler API; `nx86-jit` owns executable memory and trusted generated-code call
-wrappers; `nx86-x64-v4` lowers the supported NxIR integer subset per block;
+assembler API; `nx86-jit` owns executable memory, trusted generated-code call
+wrappers, and the emergency compiler/cache path; `nx86-x64-v4` lowers the
+supported NxIR integer subset per block;
 `nx86-object` and `nx86-cache` persist and manage native blocks; `nx86-backend`
 orchestrates single-block execution and multi-block dispatch.
 

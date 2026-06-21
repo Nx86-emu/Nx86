@@ -162,18 +162,48 @@ pub fn lower_function(function: &Function) -> Result<Vec<LoweredFunctionBlock>, 
     let entry_pcs: Vec<u64> = function.blocks.iter().map(block_entry_pc).collect();
     let mut blocks = Vec::with_capacity(function.blocks.len());
     for (index, block) in function.blocks.iter().enumerate() {
-        let lowered = lower_block(block, function.value_count, |target: BlockId| {
-            entry_pcs
-                .get(target.0 as usize)
-                .copied()
-                .ok_or(LoweringError::UnknownBranchTarget { target })
-        })?;
+        let lowered = lower_block_with_entries(block, function.value_count, &entry_pcs)?;
         blocks.push(LoweredFunctionBlock {
             entry_pc: entry_pcs[index],
             lowered,
         });
     }
     Ok(blocks)
+}
+
+/// Lower one block selected by guest entry PC from a verified function.
+///
+/// Returns `Ok(None)` when the function has no block at `entry_pc`. Branches
+/// from the selected block still resolve against the complete function, so the
+/// emitted block uses the same routing protocol as [`lower_function`].
+pub fn lower_function_block(
+    function: &Function,
+    entry_pc: u64,
+) -> Result<Option<LoweredFunctionBlock>, LoweringError> {
+    verify::verify(function)?;
+    let entry_pcs: Vec<u64> = function.blocks.iter().map(block_entry_pc).collect();
+    let Some(index) = entry_pcs
+        .iter()
+        .position(|candidate| *candidate == entry_pc)
+    else {
+        return Ok(None);
+    };
+    let lowered =
+        lower_block_with_entries(&function.blocks[index], function.value_count, &entry_pcs)?;
+    Ok(Some(LoweredFunctionBlock { entry_pc, lowered }))
+}
+
+fn lower_block_with_entries(
+    block: &Block,
+    value_count: u32,
+    entry_pcs: &[u64],
+) -> Result<LoweredBlock, LoweringError> {
+    lower_block(block, value_count, |target: BlockId| {
+        entry_pcs
+            .get(target.0 as usize)
+            .copied()
+            .ok_or(LoweringError::UnknownBranchTarget { target })
+    })
 }
 
 /// Guest entry PC of a block: the address of its first instruction, or its
@@ -459,7 +489,7 @@ const fn state_mem(offset: i32) -> Mem64 {
 mod tests {
     use nx86_ir::{Block, BlockId, Function, Inst, Op, Reg, Terminator, Type, Value};
 
-    use super::{NativeBlockState, lower_function, lower_tiny_block};
+    use super::{NativeBlockState, lower_function, lower_function_block, lower_tiny_block};
 
     #[test]
     fn lowers_tiny_add_block() {
@@ -509,6 +539,23 @@ mod tests {
         let halt_dump = blocks[1].lowered.dump();
         assert!(halt_dump.contains("mov rax, 0x1"));
         assert!(halt_dump.contains("mov [rdi+0x110], rax"));
+    }
+
+    #[test]
+    fn lowers_one_function_block_by_guest_pc() {
+        let function = two_block_branch_function();
+
+        let block = lower_function_block(&function, 0x8)
+            .expect("function should verify")
+            .expect("block should exist");
+        assert_eq!(block.entry_pc, 0x8);
+        assert!(block.lowered.dump().contains("mov [rdi+0x110], rax"));
+
+        assert!(
+            lower_function_block(&function, 0xdead)
+                .expect("function should verify")
+                .is_none()
+        );
     }
 
     #[test]

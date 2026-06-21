@@ -7,10 +7,16 @@ rust-version.workspace = true
 
 [dependencies]
 libc.workspace = true
+nx86-cache = { path = "../nx86-cache" }
+nx86-ir = { path = "../nx86-ir" }
+nx86-object = { path = "../nx86-object" }
+nx86-x64-v4 = { path = "../nx86-x64-v4" }
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 nx86-x64-asm = { path = "../nx86-x64-asm" }
+tempfile.workspace = true
 
 [lints]
 workspace = true

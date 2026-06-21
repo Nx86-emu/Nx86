@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+mod emergency;
+pub use emergency::{EmergencyJit, JitCompilation, JitError, JitEvent};
+
 pub const CRATE_NAME: &str = "nx86-jit";
 
 #[must_use]

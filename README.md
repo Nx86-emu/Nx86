@@ -10,7 +10,7 @@ Vulkan graphics backend.
 
 ## Current Prototype Target
 
-Phase 0 through Phase 22 define the current prototype:
+Phase 0 through Phase 23 define the current prototype:
 
 - Linux x86_64-v4 target
 - Rust monorepo
@@ -33,13 +33,14 @@ Phase 0 through Phase 22 define the current prototype:
 - narrow NxIR-to-native x86_64 integer lowering with register allocation and spills
 - persistent `.nxo` native block objects with managed cache integrity checks
 - multi-block native dispatch through unconditional guest branches
+- emergency single-block JIT fallback with cache insertion and typed events
 - 64 GiB VMM skeleton with software page mapping and debug dumps
 - internal Vulkan boundary crate prepared for future `ash` work
 
 The prototype does not import or run Switch software yet. Native x86_64 code
 generation remains limited to synthetic integer programs: conditional branches,
-memory operations, flags lowering, emergency JIT fallback, profiling, and
-homebrew execution remain later phases, as described in `SPEC.md`.
+memory operations, flags lowering, persistent runtime profiling, and homebrew
+execution remain later phases, as described in `SPEC.md`.
 
 ## Build
 

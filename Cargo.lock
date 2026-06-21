@@ -1715,8 +1715,14 @@ name = "nx86-jit"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "nx86-cache",
+ "nx86-ir",
+ "nx86-object",
  "nx86-x64-asm",
+ "nx86-x64-v4",
+ "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

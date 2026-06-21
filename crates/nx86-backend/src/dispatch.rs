@@ -1,4 +1,4 @@
-//! Multi-block dispatcher (Phase 22).
+//! Multi-block dispatcher with emergency-JIT fallback (Phases 22-23).
 //!
 //! Each NxIR block is lowered to its own native block (see
 //! [`nx86_x64_v4::lower_function`]) keyed by its guest entry PC. The
@@ -6,14 +6,15 @@
 //! lookup-call-route loop: read the current guest PC, call the matching block,
 //! and continue. A block that exits via a branch leaves the halted flag clear
 //! and writes the next guest PC; a `Halt` sets the flag and stops the loop. A
-//! guest PC with no registered block is reported as [`DispatchExit::MissingBlock`]
-//! — the seam the Phase 23 emergency JIT fills.
+//! guest PC with no registered block is offered to an attached
+//! [`EmergencyJit`]; without one, or when the source function does not contain
+//! that PC, dispatch reports [`DispatchExit::MissingBlock`].
 
 use std::collections::BTreeMap;
 
 use nx86_core::guest::CpuState;
 use nx86_ir::{Function, Terminator};
-use nx86_jit::{ExecError, ExecutableMemory};
+use nx86_jit::{EmergencyJit, ExecError, ExecutableMemory, JitError, JitEvent};
 use nx86_object::NativeObject;
 use nx86_x64_v4::{LoweringError, NativeBlockState, lower_function};
 use thiserror::Error;
@@ -39,6 +40,8 @@ pub enum DispatchExit {
 pub struct DispatchOutcome {
     pub exit: DispatchExit,
     pub final_state: CpuState,
+    /// Emergency-JIT blocks compiled during this dispatch run.
+    pub jit_events: Vec<JitEvent>,
 }
 
 /// A registry of native blocks keyed by guest entry PC.
@@ -46,6 +49,7 @@ pub struct DispatchOutcome {
 pub struct Dispatcher {
     blocks: BTreeMap<u64, ExecutableMemory>,
     max_steps: usize,
+    emergency_jit: Option<EmergencyJit>,
 }
 
 impl Dispatcher {
@@ -89,12 +93,20 @@ impl Dispatcher {
         Ok(Self {
             blocks,
             max_steps: DEFAULT_MAX_STEPS,
+            emergency_jit: None,
         })
     }
 
     #[must_use]
     pub fn with_max_steps(mut self, max_steps: usize) -> Self {
         self.max_steps = max_steps;
+        self
+    }
+
+    /// Attach the compiler used when dispatch reaches a missing native block.
+    #[must_use]
+    pub fn with_emergency_jit(mut self, emergency_jit: EmergencyJit) -> Self {
+        self.emergency_jit = Some(emergency_jit);
         self
     }
 
@@ -105,30 +117,50 @@ impl Dispatcher {
 
     /// Run from `initial`, routing between registered blocks by guest PC until a
     /// block halts, a guest PC is missing, or the step budget is exhausted.
-    /// `halt_reason` is applied to the final state when a block halts so it can
-    /// be compared against the interpreter.
+    /// An attached emergency JIT compiles, caches, and installs known missing
+    /// blocks before dispatch continues. `halt_reason` is applied to the final
+    /// state when a block halts so it can be compared against the interpreter.
     pub fn run(
-        &self,
+        &mut self,
         initial: &CpuState,
         halt_reason: Option<&str>,
-    ) -> Result<DispatchOutcome, ExecError> {
+    ) -> Result<DispatchOutcome, DispatchError> {
         let mut native = NativeBlockState::from_cpu_state(initial);
+        let mut jit_events = Vec::new();
+        let mut steps = 0;
 
-        for _ in 0..self.max_steps {
+        while steps < self.max_steps {
             let pc = native.pc;
-            let Some(executable) = self.blocks.get(&pc) else {
+            if let Some(executable) = self.blocks.get(&pc) {
+                call_generated_block(executable, &mut native)?;
+                steps += 1;
+                if native.halted != 0 {
+                    return Ok(DispatchOutcome {
+                        exit: DispatchExit::Halted,
+                        final_state: native.apply_to_cpu_state(initial.clone(), halt_reason),
+                        jit_events,
+                    });
+                }
+                continue;
+            }
+
+            let Some(emergency_jit) = &self.emergency_jit else {
                 return Ok(DispatchOutcome {
                     exit: DispatchExit::MissingBlock { pc },
                     final_state: native.apply_to_cpu_state(initial.clone(), None),
+                    jit_events,
                 });
             };
-            call_generated_block(executable, &mut native)?;
-            if native.halted != 0 {
+            let Some(compilation) = emergency_jit.compile(pc)? else {
                 return Ok(DispatchOutcome {
-                    exit: DispatchExit::Halted,
-                    final_state: native.apply_to_cpu_state(initial.clone(), halt_reason),
+                    exit: DispatchExit::MissingBlock { pc },
+                    final_state: native.apply_to_cpu_state(initial.clone(), None),
+                    jit_events,
                 });
-            }
+            };
+            let executable = ExecutableMemory::new(&compilation.object.code)?;
+            self.blocks.insert(pc, executable);
+            jit_events.push(compilation.event);
         }
 
         Ok(DispatchOutcome {
@@ -136,17 +168,20 @@ impl Dispatcher {
                 steps: self.max_steps,
             },
             final_state: native.apply_to_cpu_state(initial.clone(), None),
+            jit_events,
         })
     }
 }
 
-/// A failure building the dispatcher.
+/// A failure building or running the dispatcher.
 #[derive(Debug, Error)]
 pub enum DispatchError {
     #[error("lowering failed: {0}")]
     Lowering(#[from] LoweringError),
     #[error("executable memory failed: {0}")]
     Exec(#[from] ExecError),
+    #[error("emergency JIT failed: {0}")]
+    EmergencyJit(#[from] JitError),
     #[error("dispatcher has no native blocks")]
     Empty,
 }
@@ -196,9 +231,10 @@ pub fn run_dispatched_function(
             Err(error) => return NativeOutcome::error(dump, error),
         }
     }
-    let dispatcher = Dispatcher {
+    let mut dispatcher = Dispatcher {
         blocks,
         max_steps: DEFAULT_MAX_STEPS,
+        emergency_jit: None,
     };
 
     let outcome = match dispatcher.run(initial, function_halt_reason(function)) {
