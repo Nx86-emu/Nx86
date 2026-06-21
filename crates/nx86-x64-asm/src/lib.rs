@@ -253,6 +253,23 @@ impl Assembler {
         self.emit_reg_reg(0x39, lhs, rhs);
     }
 
+    pub fn and_reg_reg(&mut self, dst: Reg64, src: Reg64) {
+        self.dump
+            .push(format!("and {}, {}", dst.name(), src.name()));
+        self.emit_reg_reg(0x21, dst, src);
+    }
+
+    pub fn or_reg_reg(&mut self, dst: Reg64, src: Reg64) {
+        self.dump.push(format!("or {}, {}", dst.name(), src.name()));
+        self.emit_reg_reg(0x09, dst, src);
+    }
+
+    pub fn xor_reg_reg(&mut self, dst: Reg64, src: Reg64) {
+        self.dump
+            .push(format!("xor {}, {}", dst.name(), src.name()));
+        self.emit_reg_reg(0x31, dst, src);
+    }
+
     pub fn jmp(&mut self, label: Label) -> Result<(), AsmError> {
         let index = label.0;
         if self.labels.get(index).is_none() {
@@ -433,6 +450,23 @@ mod tests {
         );
         assert!(code.dump().contains("mov rax, 0x1122334455667788"));
         assert!(code.dump().contains("cmp rax, rcx"));
+    }
+
+    #[test]
+    fn emits_logical_bytes() {
+        let mut asm = Assembler::new();
+
+        asm.and_reg_reg(Reg64::Rax, Reg64::Rcx);
+        asm.or_reg_reg(Reg64::Rax, Reg64::Rcx);
+        asm.xor_reg_reg(Reg64::Rax, Reg64::Rcx);
+
+        let code = asm.finish().expect("assembler should finish");
+        assert_eq!(
+            code.bytes(),
+            &[0x48, 0x21, 0xC8, 0x48, 0x09, 0xC8, 0x48, 0x31, 0xC8]
+        );
+        assert!(code.dump().contains("and rax, rcx"));
+        assert!(code.dump().contains("xor rax, rcx"));
     }
 
     #[test]

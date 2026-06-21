@@ -317,7 +317,7 @@ pub fn compile(ui: &mut egui::Ui, state: &mut CompileUiState) -> CompileAction {
 }
 
 pub fn tests(ui: &mut egui::Ui, state: &mut TestUiState) -> TestAction {
-    screen_header(ui, "Synthetic ARM64 Tests", "Phases 6-18");
+    screen_header(ui, "Synthetic ARM64 Tests", "Phases 6-19");
     let mut action = TestAction::None;
 
     ui.horizontal(|ui| {

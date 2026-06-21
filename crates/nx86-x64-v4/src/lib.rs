@@ -1,6 +1,7 @@
 use nx86_core::guest::{CpuState, Nzcv};
 use nx86_ir::verify::{self, VerifyError};
 use nx86_ir::{BinaryOp, Function, Inst, Op, Reg, Terminator, Type, Value};
+use nx86_regalloc::{Allocation, Location, allocate};
 use nx86_x64_asm::{AsmError, Assembler, CodeBuffer, Mem64, Reg64};
 use thiserror::Error;
 
@@ -124,8 +125,9 @@ pub fn lower_tiny_block(function: &Function) -> Result<LoweredBlock, LoweringErr
         });
     }
 
-    let stack_size = stack_size(function.value_count)?;
     let block = &function.blocks[0];
+    let allocation = allocate(block, function.value_count);
+    let stack_size = stack_size(allocation.spill_count())?;
     let mut asm = Assembler::new();
     asm.prologue();
     if stack_size > 0 {
@@ -135,7 +137,7 @@ pub fn lower_tiny_block(function: &Function) -> Result<LoweredBlock, LoweringErr
     asm.mov_mem_reg(state_mem(HALTED_OFFSET), Reg64::Rax);
 
     for inst in &block.instructions {
-        lower_inst(&mut asm, inst, function.value_count)?;
+        lower_inst(&mut asm, inst, &allocation)?;
     }
 
     match &block.terminator {
@@ -174,27 +176,35 @@ pub fn lower_tiny_block(function: &Function) -> Result<LoweredBlock, LoweringErr
     Ok(LoweredBlock { code, stack_size })
 }
 
-fn lower_inst(asm: &mut Assembler, inst: &Inst, value_count: u32) -> Result<(), LoweringError> {
+fn lower_inst(asm: &mut Assembler, inst: &Inst, alloc: &Allocation) -> Result<(), LoweringError> {
     match &inst.op {
         Op::Const {
             ty: Type::I64,
             value,
         } => {
             let result = result_value(inst, "const")?;
-            asm.mov_reg_imm64(Reg64::Rax, *value);
-            store_value(asm, result, value_count)?;
+            define_value(asm, result, alloc, |asm, dst| {
+                asm.mov_reg_imm64(dst, *value);
+                Ok(())
+            })?;
         }
         Op::GetReg { reg } => {
             let result = result_value(inst, "getreg")?;
-            load_reg(asm, *reg)?;
-            store_value(asm, result, value_count)?;
+            define_value(asm, result, alloc, |asm, dst| {
+                emit_load_guest(asm, dst, *reg)
+            })?;
         }
         Op::SetReg { reg, value } => {
             if matches!(reg, Reg::X(31)) {
                 return Ok(());
             }
-            load_value(asm, *value, value_count, Reg64::Rax)?;
-            store_reg(asm, *reg)?;
+            match location(alloc, *value)? {
+                Location::Register(src) => emit_store_guest(asm, src, *reg)?,
+                Location::Spill(slot) => {
+                    asm.mov_reg_mem(Reg64::Rax, spill_slot(slot)?);
+                    emit_store_guest(asm, Reg64::Rax, *reg)?;
+                }
+            }
         }
         Op::Binary {
             op,
@@ -203,18 +213,16 @@ fn lower_inst(asm: &mut Assembler, inst: &Inst, value_count: u32) -> Result<(), 
             rhs,
         } => {
             let result = result_value(inst, "binary")?;
-            load_value(asm, *lhs, value_count, Reg64::Rax)?;
-            load_value(asm, *rhs, value_count, Reg64::Rcx)?;
+            materialize_value(asm, *lhs, alloc, Reg64::Rax)?;
+            materialize_value(asm, *rhs, alloc, Reg64::Rcx)?;
             match op {
                 BinaryOp::Add => asm.add_reg_reg(Reg64::Rax, Reg64::Rcx),
                 BinaryOp::Sub => asm.sub_reg_reg(Reg64::Rax, Reg64::Rcx),
-                BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
-                    return Err(LoweringError::UnsupportedOp {
-                        op: "logical binary operation",
-                    });
-                }
+                BinaryOp::And => asm.and_reg_reg(Reg64::Rax, Reg64::Rcx),
+                BinaryOp::Or => asm.or_reg_reg(Reg64::Rax, Reg64::Rcx),
+                BinaryOp::Xor => asm.xor_reg_reg(Reg64::Rax, Reg64::Rcx),
             }
-            store_value(asm, result, value_count)?;
+            store_into_value(asm, result, alloc, Reg64::Rax)?;
         }
         Op::Const { .. } => {
             return Err(LoweringError::UnsupportedOp {
@@ -251,57 +259,103 @@ fn result_value(inst: &Inst, op: &'static str) -> Result<Value, LoweringError> {
     })
 }
 
-fn stack_size(value_count: u32) -> Result<i32, LoweringError> {
-    let bytes = u64::from(value_count)
+fn stack_size(spill_count: u32) -> Result<i32, LoweringError> {
+    let bytes = u64::from(spill_count)
         .checked_mul(8)
-        .ok_or(LoweringError::StackTooLarge { value_count })?;
-    let aligned = bytes
-        .checked_add(15)
-        .map(|value| value & !15)
-        .ok_or(LoweringError::StackTooLarge { value_count })?;
-    i32::try_from(aligned).map_err(|_| LoweringError::StackTooLarge { value_count })
+        .ok_or(LoweringError::StackTooLarge {
+            value_count: spill_count,
+        })?;
+    let aligned =
+        bytes
+            .checked_add(15)
+            .map(|value| value & !15)
+            .ok_or(LoweringError::StackTooLarge {
+                value_count: spill_count,
+            })?;
+    i32::try_from(aligned).map_err(|_| LoweringError::StackTooLarge {
+        value_count: spill_count,
+    })
 }
 
-fn value_slot(value: Value, value_count: u32) -> Result<Mem64, LoweringError> {
-    if value.0 >= value_count {
-        return Err(LoweringError::ValueOutOfRange { value });
-    }
-    let offset = i32::try_from((u64::from(value.0) + 1) * 8)
-        .map_err(|_| LoweringError::StackTooLarge { value_count })?;
+fn location(alloc: &Allocation, value: Value) -> Result<Location, LoweringError> {
+    alloc
+        .location(value)
+        .ok_or(LoweringError::ValueOutOfRange { value })
+}
+
+fn spill_slot(slot: u32) -> Result<Mem64, LoweringError> {
+    let offset = i32::try_from((u64::from(slot) + 1) * 8)
+        .map_err(|_| LoweringError::StackTooLarge { value_count: slot })?;
     Ok(Mem64::new(Reg64::Rbp, -offset))
 }
 
-fn load_value(
+/// Emit code that produces a result value into its assigned location. `emit`
+/// writes the value into the register it is handed: for a register-allocated
+/// result that register is its final home; for a spilled result it is the RAX
+/// scratch, which is then stored to the value's stack slot.
+fn define_value<F>(
     asm: &mut Assembler,
     value: Value,
-    value_count: u32,
-    target: Reg64,
-) -> Result<(), LoweringError> {
-    asm.mov_reg_mem(target, value_slot(value, value_count)?);
-    Ok(())
-}
-
-fn store_value(asm: &mut Assembler, value: Value, value_count: u32) -> Result<(), LoweringError> {
-    asm.mov_mem_reg(value_slot(value, value_count)?, Reg64::Rax);
-    Ok(())
-}
-
-fn load_reg(asm: &mut Assembler, reg: Reg) -> Result<(), LoweringError> {
-    match reg {
-        Reg::X(31) => asm.mov_reg_imm64(Reg64::Rax, 0),
-        Reg::X(index) if index < 31 => asm.mov_reg_mem(Reg64::Rax, state_mem(x_offset(index))),
-        Reg::X(register) => return Err(LoweringError::RegisterOutOfRange { register }),
-        Reg::Sp => asm.mov_reg_mem(Reg64::Rax, state_mem(SP_OFFSET)),
+    alloc: &Allocation,
+    emit: F,
+) -> Result<(), LoweringError>
+where
+    F: FnOnce(&mut Assembler, Reg64) -> Result<(), LoweringError>,
+{
+    match location(alloc, value)? {
+        Location::Register(reg) => emit(asm, reg)?,
+        Location::Spill(slot) => {
+            emit(asm, Reg64::Rax)?;
+            asm.mov_mem_reg(spill_slot(slot)?, Reg64::Rax);
+        }
     }
     Ok(())
 }
 
-fn store_reg(asm: &mut Assembler, reg: Reg) -> Result<(), LoweringError> {
+/// Load `value` into `dst`, whether it lives in a register or a spill slot.
+fn materialize_value(
+    asm: &mut Assembler,
+    value: Value,
+    alloc: &Allocation,
+    dst: Reg64,
+) -> Result<(), LoweringError> {
+    match location(alloc, value)? {
+        Location::Register(reg) => asm.mov_reg_reg(dst, reg),
+        Location::Spill(slot) => asm.mov_reg_mem(dst, spill_slot(slot)?),
+    }
+    Ok(())
+}
+
+/// Store `src` into `value`'s assigned location.
+fn store_into_value(
+    asm: &mut Assembler,
+    value: Value,
+    alloc: &Allocation,
+    src: Reg64,
+) -> Result<(), LoweringError> {
+    match location(alloc, value)? {
+        Location::Register(reg) => asm.mov_reg_reg(reg, src),
+        Location::Spill(slot) => asm.mov_mem_reg(spill_slot(slot)?, src),
+    }
+    Ok(())
+}
+
+fn emit_load_guest(asm: &mut Assembler, dst: Reg64, reg: Reg) -> Result<(), LoweringError> {
+    match reg {
+        Reg::X(31) => asm.mov_reg_imm64(dst, 0),
+        Reg::X(index) if index < 31 => asm.mov_reg_mem(dst, state_mem(x_offset(index))),
+        Reg::X(register) => return Err(LoweringError::RegisterOutOfRange { register }),
+        Reg::Sp => asm.mov_reg_mem(dst, state_mem(SP_OFFSET)),
+    }
+    Ok(())
+}
+
+fn emit_store_guest(asm: &mut Assembler, src: Reg64, reg: Reg) -> Result<(), LoweringError> {
     match reg {
         Reg::X(31) => {}
-        Reg::X(index) if index < 31 => asm.mov_mem_reg(state_mem(x_offset(index)), Reg64::Rax),
+        Reg::X(index) if index < 31 => asm.mov_mem_reg(state_mem(x_offset(index)), src),
         Reg::X(register) => return Err(LoweringError::RegisterOutOfRange { register }),
-        Reg::Sp => asm.mov_mem_reg(state_mem(SP_OFFSET), Reg64::Rax),
+        Reg::Sp => asm.mov_mem_reg(state_mem(SP_OFFSET), src),
     }
     Ok(())
 }
@@ -318,7 +372,7 @@ const fn state_mem(offset: i32) -> Mem64 {
 mod tests {
     use nx86_ir::{Block, Function, Inst, Op, Reg, Terminator, Type, Value};
 
-    use super::{LoweringError, NativeBlockState, lower_tiny_block};
+    use super::{NativeBlockState, lower_tiny_block};
 
     #[test]
     fn lowers_tiny_add_block() {
@@ -327,13 +381,15 @@ mod tests {
         let lowered = lower_tiny_block(&function).expect("tiny add should lower");
 
         assert!(!lowered.bytes().is_empty());
-        assert_eq!(lowered.stack_size(), 32);
+        // The four SSA values all fit in pool registers, so nothing spills.
+        assert_eq!(lowered.stack_size(), 0);
+        assert!(lowered.dump().contains("mov rdx, 0x1"));
         assert!(lowered.dump().contains("mov [rdi+0x100], rax"));
         assert!(lowered.dump().contains("ret"));
     }
 
     #[test]
-    fn rejects_logical_binary_ops() {
+    fn lowers_logical_binary_ops() {
         let mut function = tiny_add_function();
         function.blocks[0].instructions[4].op = Op::Binary {
             op: nx86_ir::BinaryOp::And,
@@ -342,9 +398,18 @@ mod tests {
             rhs: Value(2),
         };
 
-        let error = lower_tiny_block(&function).expect_err("logical op should be rejected");
+        let lowered = lower_tiny_block(&function).expect("logical op should lower");
 
-        assert!(matches!(error, LoweringError::UnsupportedOp { .. }));
+        assert!(lowered.dump().contains("and rax, rcx"));
+    }
+
+    #[test]
+    fn lowers_block_with_spills() {
+        // Seven values live at once exceed the six-register pool, forcing one
+        // spill slot (rounded up to 16 bytes).
+        let lowered = lower_tiny_block(&spill_function()).expect("spill block should lower");
+
+        assert_eq!(lowered.stack_size(), 16);
     }
 
     #[test]
@@ -410,6 +475,64 @@ mod tests {
         assert_eq!(final_state.pc(), 12);
         assert!(final_state.halted());
         assert_eq!(final_state.halt_reason(), Some("svc #0x0"));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn calls_lowered_block_with_spills() {
+        let lowered = lower_tiny_block(&spill_function()).expect("spill block should lower");
+        let executable =
+            nx86_jit::ExecutableMemory::new(lowered.bytes()).expect("code should allocate");
+        let cpu = nx86_core::guest::CpuState::new();
+        let mut state = NativeBlockState::from_cpu_state(&cpu);
+
+        // SAFETY: `lower_tiny_block` produced an `extern "C"
+        // fn(*mut NativeBlockState)` body for this exact state layout, exercising
+        // the spill path for the seventh value.
+        unsafe { executable.call_with_state(&mut state) }.expect("native block should run");
+        let final_state = state.to_cpu_state(Some("svc #0x0"));
+
+        for index in 0u32..7 {
+            assert_eq!(final_state.x(index as u8), u64::from(index) + 1);
+        }
+        assert!(final_state.halted());
+    }
+
+    fn spill_function() -> Function {
+        let mut instructions = Vec::new();
+        for index in 0u32..7 {
+            instructions.push(Inst {
+                result: Some(Value(index)),
+                op: Op::Const {
+                    ty: Type::I64,
+                    value: u64::from(index) + 1,
+                },
+                guest_address: 0,
+            });
+        }
+        for index in 0u32..7 {
+            instructions.push(Inst {
+                result: None,
+                op: Op::SetReg {
+                    reg: Reg::X(index as u8),
+                    value: Value(index),
+                },
+                guest_address: 0,
+            });
+        }
+        Function {
+            name: "spill".to_owned(),
+            entry_address: 0,
+            value_count: 7,
+            blocks: vec![Block {
+                instructions,
+                terminator: Terminator::Halt {
+                    reason: "svc #0x0".to_owned(),
+                },
+                terminator_address: 0,
+            }],
+        }
     }
 
     fn tiny_add_function() -> Function {

@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 nx86-core = { path = "../nx86-core" }
 nx86-ir = { path = "../nx86-ir" }
+nx86-regalloc = { path = "../nx86-regalloc" }
 nx86-x64-asm = { path = "../nx86-x64-asm" }
 thiserror.workspace = true
 
