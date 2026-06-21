@@ -1,6 +1,6 @@
 use nx86_core::guest::{CpuState, Nzcv};
 use nx86_ir::verify::{self, VerifyError};
-use nx86_ir::{BinaryOp, Function, Inst, Op, Reg, Terminator, Type, Value};
+use nx86_ir::{BinaryOp, Block, BlockId, Function, Inst, Op, Reg, Terminator, Type, Value};
 use nx86_regalloc::{Allocation, Location, allocate};
 use nx86_x64_asm::{AsmError, Assembler, CodeBuffer, Mem64, Reg64};
 use thiserror::Error;
@@ -100,6 +100,8 @@ pub enum LoweringError {
     UnsupportedOp { op: &'static str },
     #[error("tiny native lowering does not support {terminator}")]
     UnsupportedTerminator { terminator: &'static str },
+    #[error("branch target {target:?} is outside the function block table")]
+    UnknownBranchTarget { target: BlockId },
     #[error("instruction at {guest_address:#x} is missing result value for {op}")]
     MissingResult {
         guest_address: u64,
@@ -117,6 +119,19 @@ pub enum LoweringError {
     Assembler(#[from] AsmError),
 }
 
+/// A single block of a function lowered to native code, keyed by the guest PC
+/// the dispatcher uses to reach it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoweredFunctionBlock {
+    /// Guest entry PC of the block (its dispatcher key).
+    pub entry_pc: u64,
+    /// The block's lowered native code.
+    pub lowered: LoweredBlock,
+}
+
+/// Lower a verified single-block function. Branches are rejected because a lone
+/// block has no sibling to route to; use [`lower_function`] for multi-block
+/// functions.
 pub fn lower_tiny_block(function: &Function) -> Result<LoweredBlock, LoweringError> {
     verify::verify(function)?;
     if function.blocks.len() != 1 {
@@ -124,15 +139,72 @@ pub fn lower_tiny_block(function: &Function) -> Result<LoweredBlock, LoweringErr
             count: function.blocks.len(),
         });
     }
+    lower_block(
+        &function.blocks[0],
+        function.value_count,
+        |_target: BlockId| {
+            Err(LoweringError::UnsupportedTerminator {
+                terminator: "branch",
+            })
+        },
+    )
+}
 
-    let block = &function.blocks[0];
-    let allocation = allocate(block, function.value_count);
+/// Lower every block of a verified function into a separately-callable native
+/// block keyed by its guest entry PC. Unconditional branches set the next guest
+/// PC and exit to the dispatcher; `Halt` additionally sets the halted flag.
+pub fn lower_function(function: &Function) -> Result<Vec<LoweredFunctionBlock>, LoweringError> {
+    verify::verify(function)?;
+    if function.blocks.is_empty() {
+        return Err(LoweringError::UnsupportedBlockCount { count: 0 });
+    }
+
+    let entry_pcs: Vec<u64> = function.blocks.iter().map(block_entry_pc).collect();
+    let mut blocks = Vec::with_capacity(function.blocks.len());
+    for (index, block) in function.blocks.iter().enumerate() {
+        let lowered = lower_block(block, function.value_count, |target: BlockId| {
+            entry_pcs
+                .get(target.0 as usize)
+                .copied()
+                .ok_or(LoweringError::UnknownBranchTarget { target })
+        })?;
+        blocks.push(LoweredFunctionBlock {
+            entry_pc: entry_pcs[index],
+            lowered,
+        });
+    }
+    Ok(blocks)
+}
+
+/// Guest entry PC of a block: the address of its first instruction, or its
+/// terminator address when the block has no instructions.
+#[must_use]
+pub fn block_entry_pc(block: &Block) -> u64 {
+    block
+        .instructions
+        .first()
+        .map_or(block.terminator_address, |inst| inst.guest_address)
+}
+
+/// Lower one block to a self-contained native block. `resolve_target` maps a
+/// branch's `BlockId` to the guest PC the dispatcher should resume at.
+fn lower_block<F>(
+    block: &Block,
+    value_count: u32,
+    resolve_target: F,
+) -> Result<LoweredBlock, LoweringError>
+where
+    F: Fn(BlockId) -> Result<u64, LoweringError>,
+{
+    let allocation = allocate(block, value_count);
     let stack_size = stack_size(allocation.spill_count())?;
     let mut asm = Assembler::new();
     asm.prologue();
     if stack_size > 0 {
         asm.sub_reg_imm32(Reg64::Rsp, stack_size);
     }
+    // A block that exits via a branch leaves the halted flag clear so the
+    // dispatcher routes to the next guest PC; `Halt` sets it in the terminator.
     asm.mov_reg_imm64(Reg64::Rax, 0);
     asm.mov_mem_reg(state_mem(HALTED_OFFSET), Reg64::Rax);
 
@@ -140,6 +212,25 @@ pub fn lower_tiny_block(function: &Function) -> Result<LoweredBlock, LoweringErr
         lower_inst(&mut asm, inst, &allocation)?;
     }
 
+    emit_terminator(&mut asm, block, resolve_target)?;
+
+    if stack_size > 0 {
+        asm.add_reg_imm32(Reg64::Rsp, stack_size);
+    }
+    asm.epilogue();
+
+    let code = asm.finish()?;
+    Ok(LoweredBlock { code, stack_size })
+}
+
+fn emit_terminator<F>(
+    asm: &mut Assembler,
+    block: &Block,
+    resolve_target: F,
+) -> Result<(), LoweringError>
+where
+    F: Fn(BlockId) -> Result<u64, LoweringError>,
+{
     match &block.terminator {
         Terminator::Halt { .. } => {
             let next_pc =
@@ -149,31 +240,27 @@ pub fn lower_tiny_block(function: &Function) -> Result<LoweredBlock, LoweringErr
                     .ok_or(LoweringError::AddressOverflow {
                         address: block.terminator_address,
                     })?;
-            asm.mov_reg_imm64(Reg64::Rax, next_pc);
-            asm.mov_mem_reg(state_mem(PC_OFFSET), Reg64::Rax);
+            emit_set_pc(asm, next_pc);
             asm.mov_reg_imm64(Reg64::Rax, 1);
             asm.mov_mem_reg(state_mem(HALTED_OFFSET), Reg64::Rax);
         }
-        Terminator::Return => {}
-        Terminator::Branch { .. } => {
-            return Err(LoweringError::UnsupportedTerminator {
-                terminator: "branch",
-            });
+        Terminator::Branch { target } => {
+            let target_pc = resolve_target(*target)?;
+            emit_set_pc(asm, target_pc);
         }
+        Terminator::Return => {}
         Terminator::CondBranch { .. } => {
             return Err(LoweringError::UnsupportedTerminator {
                 terminator: "conditional branch",
             });
         }
     }
+    Ok(())
+}
 
-    if stack_size > 0 {
-        asm.add_reg_imm32(Reg64::Rsp, stack_size);
-    }
-    asm.epilogue();
-
-    let code = asm.finish()?;
-    Ok(LoweredBlock { code, stack_size })
+fn emit_set_pc(asm: &mut Assembler, pc: u64) {
+    asm.mov_reg_imm64(Reg64::Rax, pc);
+    asm.mov_mem_reg(state_mem(PC_OFFSET), Reg64::Rax);
 }
 
 fn lower_inst(asm: &mut Assembler, inst: &Inst, alloc: &Allocation) -> Result<(), LoweringError> {
@@ -370,9 +457,9 @@ const fn state_mem(offset: i32) -> Mem64 {
 
 #[cfg(test)]
 mod tests {
-    use nx86_ir::{Block, Function, Inst, Op, Reg, Terminator, Type, Value};
+    use nx86_ir::{Block, BlockId, Function, Inst, Op, Reg, Terminator, Type, Value};
 
-    use super::{NativeBlockState, lower_tiny_block};
+    use super::{NativeBlockState, lower_function, lower_tiny_block};
 
     #[test]
     fn lowers_tiny_add_block() {
@@ -401,6 +488,44 @@ mod tests {
         let lowered = lower_tiny_block(&function).expect("logical op should lower");
 
         assert!(lowered.dump().contains("and rax, rcx"));
+    }
+
+    #[test]
+    fn lower_function_routes_branch_to_target_pc() {
+        let function = two_block_branch_function();
+        let blocks = lower_function(&function).expect("two-block function should lower");
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].entry_pc, 0x0);
+        assert_eq!(blocks[1].entry_pc, 0x8);
+
+        // Block 0 branches: it sets PC to block 1's entry (0x8) and does not halt.
+        let branch_dump = blocks[0].lowered.dump();
+        assert!(branch_dump.contains("mov rax, 0x8"));
+        assert!(branch_dump.contains("mov [rdi+0x100], rax"));
+        assert!(!branch_dump.contains("mov rax, 0x1"));
+
+        // Block 1 halts: it sets the halted flag (offset 0x110) to 1.
+        let halt_dump = blocks[1].lowered.dump();
+        assert!(halt_dump.contains("mov rax, 0x1"));
+        assert!(halt_dump.contains("mov [rdi+0x110], rax"));
+    }
+
+    #[test]
+    fn lower_tiny_block_still_rejects_branches() {
+        let mut function = two_block_branch_function();
+        // Collapse to a single block whose branch targets itself: a valid CFG
+        // (passes verification) with no sibling for the single-block path.
+        function.blocks.truncate(1);
+        function.blocks[0].terminator = Terminator::Branch { target: BlockId(0) };
+        function.value_count = 1;
+        let error = lower_tiny_block(&function).expect_err("branch must be rejected");
+        assert!(matches!(
+            error,
+            super::LoweringError::UnsupportedTerminator {
+                terminator: "branch"
+            }
+        ));
     }
 
     #[test]
@@ -595,6 +720,62 @@ mod tests {
                 },
                 terminator_address: 8,
             }],
+        }
+    }
+
+    /// Two straight-line blocks: block 0 sets x0 = 5 then branches to block 1,
+    /// which copies x0 into x1 and halts. Inter-block dataflow goes through the
+    /// guest register file, so each block lowers independently.
+    fn two_block_branch_function() -> Function {
+        Function {
+            name: "two_block".to_owned(),
+            entry_address: 0,
+            value_count: 2,
+            blocks: vec![
+                Block {
+                    instructions: vec![
+                        Inst {
+                            result: Some(Value(0)),
+                            op: Op::Const {
+                                ty: Type::I64,
+                                value: 5,
+                            },
+                            guest_address: 0,
+                        },
+                        Inst {
+                            result: None,
+                            op: Op::SetReg {
+                                reg: Reg::X(0),
+                                value: Value(0),
+                            },
+                            guest_address: 0,
+                        },
+                    ],
+                    terminator: Terminator::Branch { target: BlockId(1) },
+                    terminator_address: 4,
+                },
+                Block {
+                    instructions: vec![
+                        Inst {
+                            result: Some(Value(1)),
+                            op: Op::GetReg { reg: Reg::X(0) },
+                            guest_address: 8,
+                        },
+                        Inst {
+                            result: None,
+                            op: Op::SetReg {
+                                reg: Reg::X(1),
+                                value: Value(1),
+                            },
+                            guest_address: 8,
+                        },
+                    ],
+                    terminator: Terminator::Halt {
+                        reason: "svc #0x0".to_owned(),
+                    },
+                    terminator_address: 8,
+                },
+            ],
         }
     }
 }

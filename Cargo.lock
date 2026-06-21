@@ -1608,12 +1608,14 @@ version = "0.1.0"
 name = "nx86-backend"
 version = "0.1.0"
 dependencies = [
+ "nx86-cache",
  "nx86-core",
  "nx86-ir",
  "nx86-jit",
  "nx86-object",
  "nx86-x64-v4",
  "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

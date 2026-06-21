@@ -15,7 +15,7 @@ program. It does not implement real title import, Switch runtime execution,
 register allocation, object caching, dispatcher/JIT fallback, graphics, or
 rendering.
 
-## Active Phase 0-21 Crates
+## Active Phase 0-22 Crates
 
 - `nx86-app`: binary entrypoint, logging setup, config load, GUI launch.
 - `nx86-gui`: egui shell, wizard, theme, navigation, title list, worker progress, synthetic test display, decode display, tiny interpreter status, framebuffer rendering, and NxIR/native dump agreement.
@@ -26,10 +26,10 @@ rendering.
 - `nx86-arm64-lift`: AArch64 → NxIR lifter with basic-block CFG construction.
 - `nx86-ir-opt`: NxIR optimization passes (dead-flag elimination).
 - `nx86-runtime`: tiny synthetic interpreter (with guest memory), NxIR evaluator, native backend attempt, and the differential synthetic-test harness.
-- `nx86-backend`: Phase 18 native execution orchestration and interpreter comparison.
+- `nx86-backend`: native execution orchestration, interpreter comparison, and the multi-block dispatcher (per-block objects routed by guest PC).
 - `nx86-x64-asm`: internal x86_64 assembler API, labels, code buffer, and dump.
 - `nx86-jit`: Linux x86_64 executable memory and trusted generated-code call wrappers.
-- `nx86-x64-v4`: tiny single-block NxIR integer lowering to x86_64 bytes.
+- `nx86-x64-v4`: single-block and per-block NxIR integer lowering to x86_64 bytes, including unconditional-branch routing for the dispatcher.
 - `nx86-regalloc`: basic linear-scan register allocator for a single NxIR block (pool registers with stack-slot spills).
 - `nx86-object`: AOT object format v0 — `.nxo` serialization of a native block with guest mapping and a validation hash.
 - `nx86-cache`: cache manager v0 — `.nxo` object directory with a manifest, shallow/full integrity checks, size accounting, and insert/load/remove/clear.
@@ -42,8 +42,8 @@ rendering.
 
 The remaining crates compile as placeholders so the workspace layout matches
 the specification while later phases can fill them in without reshaping the
-repository. The dispatcher, emergency JIT, profile logging, and broader
-runtime/graphics crates remain deferred to Phases 22+.
+repository. The emergency JIT, profile logging, profile-guided rebuild, and
+broader runtime/graphics crates remain deferred to Phases 23+.
 
 ## Vulkan Policy
 

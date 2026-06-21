@@ -5,6 +5,12 @@ use nx86_x64_v4::{LoweredBlock, LoweringError, NativeBlockState, lower_tiny_bloc
 
 pub use nx86_object::{NativeObject, ObjectError};
 
+mod dispatch;
+pub use dispatch::{
+    DEFAULT_MAX_STEPS, DispatchError, DispatchExit, DispatchOutcome, Dispatcher,
+    run_dispatched_function,
+};
+
 pub const CRATE_NAME: &str = "nx86-backend";
 
 #[must_use]
@@ -93,6 +99,7 @@ impl NativeOutcome {
             | LoweringError::RegisterOutOfRange { .. }
             | LoweringError::StackTooLarge { .. }
             | LoweringError::AddressOverflow { .. }
+            | LoweringError::UnknownBranchTarget { .. }
             | LoweringError::Assembler(_) => NativeStatus::Error,
         };
         Self {
@@ -174,10 +181,11 @@ fn call_generated_block(
 #[cfg(test)]
 mod tests {
     use nx86_core::guest::CpuState;
-    use nx86_ir::{Block, Function, Inst, Op, Reg, Terminator, Type, Value};
+    use nx86_ir::{Block, BlockId, Function, Inst, Op, Reg, Terminator, Type, Value};
 
     use super::{
-        NativeObject, NativeStatus, lower_tiny_block, native_object, run_tiny_native_block,
+        NativeObject, NativeStatus, lower_tiny_block, native_object, run_dispatched_function,
+        run_tiny_native_block,
     };
 
     #[test]
@@ -349,5 +357,148 @@ mod tests {
                 terminator_address: 8,
             }],
         }
+    }
+
+    /// Two straight-line blocks connected by an unconditional branch: block 0
+    /// sets x0 = 5 and branches to block 1 (at guest PC 0x8), which copies x0
+    /// into x1 and halts. Final state: x0 = x1 = 5, pc = 0xC, halted.
+    fn two_block_branch_function() -> Function {
+        Function {
+            name: "two_block".to_owned(),
+            entry_address: 0,
+            value_count: 2,
+            blocks: vec![
+                Block {
+                    instructions: vec![
+                        Inst {
+                            result: Some(Value(0)),
+                            op: Op::Const {
+                                ty: Type::I64,
+                                value: 5,
+                            },
+                            guest_address: 0,
+                        },
+                        Inst {
+                            result: None,
+                            op: Op::SetReg {
+                                reg: Reg::X(0),
+                                value: Value(0),
+                            },
+                            guest_address: 0,
+                        },
+                    ],
+                    terminator: Terminator::Branch { target: BlockId(1) },
+                    terminator_address: 4,
+                },
+                Block {
+                    instructions: vec![
+                        Inst {
+                            result: Some(Value(1)),
+                            op: Op::GetReg { reg: Reg::X(0) },
+                            guest_address: 8,
+                        },
+                        Inst {
+                            result: None,
+                            op: Op::SetReg {
+                                reg: Reg::X(1),
+                                value: Value(1),
+                            },
+                            guest_address: 8,
+                        },
+                    ],
+                    terminator: Terminator::Halt {
+                        reason: "svc #0x0".to_owned(),
+                    },
+                    terminator_address: 8,
+                },
+            ],
+        }
+    }
+
+    fn two_block_expected_state() -> CpuState {
+        let mut expected = CpuState::new();
+        expected.set_x(0, 5);
+        expected.set_x(1, 5);
+        expected.set_pc(12);
+        expected.halt("svc #0x0");
+        expected
+    }
+
+    /// Per-block native objects for `function`, as the cache would persist them.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn objects_for(function: &Function) -> Vec<NativeObject> {
+        nx86_x64_v4::lower_function(function)
+            .expect("function should lower")
+            .into_iter()
+            .map(|block| NativeObject {
+                entry_address: block.entry_pc,
+                guest_end: block.entry_pc,
+                stack_size: u32::try_from(block.lowered.stack_size()).unwrap_or(0),
+                code: block.lowered.bytes().to_vec(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dispatcher_runs_two_blocks_or_reports_host() {
+        let function = two_block_branch_function();
+        let mut initial = CpuState::new();
+        initial.set_pc(0);
+
+        let outcome = run_dispatched_function(&function, &initial, &two_block_expected_state());
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(outcome.status, NativeStatus::MatchesInterpreter);
+
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        assert_eq!(outcome.status, NativeStatus::Unavailable);
+
+        assert!(!outcome.dump.is_empty());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn dispatcher_routes_blocks_loaded_from_cache() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = nx86_cache::CacheManager::open(dir.path()).expect("open cache");
+        let function = two_block_branch_function();
+
+        // Persist each block as a cached object, then reload and dispatch them.
+        for object in objects_for(&function) {
+            cache.insert(&object).expect("insert object");
+        }
+        let manifest = cache.scan().expect("scan");
+        let loaded: Vec<NativeObject> = manifest
+            .entries
+            .iter()
+            .map(|entry| cache.load(entry.entry_address).expect("load object"))
+            .collect();
+
+        let dispatcher = super::Dispatcher::from_objects(loaded.iter()).expect("build dispatcher");
+        assert_eq!(dispatcher.block_count(), 2);
+
+        let mut initial = CpuState::new();
+        initial.set_pc(0);
+        let outcome = dispatcher
+            .run(&initial, Some("svc #0x0"))
+            .expect("dispatch run");
+
+        assert_eq!(outcome.exit, super::DispatchExit::Halted);
+        assert_eq!(outcome.final_state, two_block_expected_state());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn dispatcher_reports_missing_block() {
+        // Register only the entry block, so routing to block 1 finds no block.
+        let function = two_block_branch_function();
+        let objects = objects_for(&function);
+        let dispatcher = super::Dispatcher::from_objects(&objects[..1]).expect("build dispatcher");
+
+        let mut initial = CpuState::new();
+        initial.set_pc(0);
+        let outcome = dispatcher.run(&initial, None).expect("dispatch run");
+
+        assert_eq!(outcome.exit, super::DispatchExit::MissingBlock { pc: 0x8 });
     }
 }

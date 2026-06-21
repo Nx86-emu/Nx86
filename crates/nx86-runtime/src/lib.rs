@@ -2,7 +2,7 @@ use nx86_arm64_decode::{
     DecodeError, DecodedInstruction, InstructionKind, LogicalOp, MemSize, decode_program,
 };
 use nx86_arm64_lift::lift_program;
-use nx86_backend::run_tiny_native_block;
+use nx86_backend::{run_dispatched_function, run_tiny_native_block};
 use nx86_core::guest::{CpuState, CpuStateDiff, Nzcv};
 use nx86_testsuite::{Framebuffer, MemoryDiff, SyntheticArm64Test, SyntheticTestError};
 use nx86_vmm::{GuestAddress, GuestMemory, PAGE_SIZE, PagePermissions, VmmFault};
@@ -233,8 +233,11 @@ pub struct SyntheticRunResult {
     /// cross-check against the AArch64 interpreter.
     pub nxir: NxirOutcome,
     /// Best-effort Phase 18 native x86_64 execution of the same verified NxIR
-    /// function, when the host can run generated x86_64 code.
+    /// function via the single-block path, when the host can run generated code.
     pub native: NativeOutcome,
+    /// Best-effort Phase 22 multi-block execution of the same verified NxIR
+    /// function through the dispatcher (per-block objects routed by guest PC).
+    pub dispatched: NativeOutcome,
 }
 
 /// Outcome of the NxIR differential cross-check.
@@ -279,7 +282,7 @@ pub fn run_synthetic_test(
     let memory_diffs = compare_expected_memory(&memory, test)?;
     let framebuffer = read_framebuffer(&memory, test)?;
 
-    let (nxir, native) = run_translation_differentials(
+    let (nxir, native, dispatched) = run_translation_differentials(
         test,
         &instructions,
         entry_point,
@@ -295,6 +298,7 @@ pub fn run_synthetic_test(
         framebuffer,
         nxir,
         native,
+        dispatched,
     })
 }
 
@@ -309,13 +313,14 @@ fn run_translation_differentials(
     initial_state: &CpuState,
     interpreter_state: &CpuState,
     interpreter_memory: &GuestMemory,
-) -> (NxirOutcome, NativeOutcome) {
+) -> (NxirOutcome, NativeOutcome, NativeOutcome) {
     let mut function = match lift_program("synthetic", instructions, entry_point) {
         Ok(function) => function,
         Err(error) => {
             let message = error.to_string();
             return (
                 NxirOutcome::failed(&message),
+                NativeOutcome::error(String::new(), message.clone()),
                 NativeOutcome::error(String::new(), message),
             );
         }
@@ -328,6 +333,7 @@ fn run_translation_differentials(
         let message = error.to_string();
         return (
             NxirOutcome::failed(&message),
+            NativeOutcome::error(String::new(), message.clone()),
             NativeOutcome::error(String::new(), message),
         );
     }
@@ -335,8 +341,9 @@ fn run_translation_differentials(
 
     let nxir = evaluate_verified_nxir(test, &function, dump, interpreter_state, interpreter_memory);
     let native = run_tiny_native_block(&function, initial_state, interpreter_state);
+    let dispatched = run_dispatched_function(&function, initial_state, interpreter_state);
 
-    (nxir, native)
+    (nxir, native, dispatched)
 }
 
 fn evaluate_verified_nxir(
@@ -518,6 +525,40 @@ mod tests {
         assert_eq!(result.native.status, NativeStatus::MatchesInterpreter);
         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
         assert_eq!(result.native.status, NativeStatus::Unavailable);
+    }
+
+    #[test]
+    fn dispatcher_runs_multi_block_program() {
+        // mov x0, #1 ; b +8 (skip the next mov) ; mov x0, #2 ; svc #0. This lifts
+        // to multiple blocks, so the single-block path declines it while the
+        // dispatcher routes block-to-block by guest PC.
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "multi-block-branch"
+            entry-point = "0x0"
+
+            [program]
+            arm64-hex = "20 00 80 D2 02 00 00 14 40 00 80 D2 01 00 00 D4"
+
+            [expected.registers]
+            x0 = "0x1"
+            pc = "0x10"
+            halted = "true"
+            "#,
+        )
+        .expect("test should parse");
+
+        let result = run_synthetic_test(&test).expect("test should run");
+
+        assert!(result.register_diffs.is_empty());
+        // Multiple blocks are outside the single-block native path.
+        assert_eq!(result.native.status, NativeStatus::Unsupported);
+        assert!(!result.dispatched.dump.is_empty());
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(result.dispatched.status, NativeStatus::MatchesInterpreter);
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        assert_eq!(result.dispatched.status, NativeStatus::Unavailable);
     }
 
     #[test]
