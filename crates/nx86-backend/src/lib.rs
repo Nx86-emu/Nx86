@@ -172,9 +172,11 @@ fn call_generated_block(
     executable: &ExecutableMemory,
     state: &mut NativeBlockState,
 ) -> Result<(), ExecError> {
-    // SAFETY: `lower_tiny_block` is the only producer of bytes passed here. It
-    // emits an `extern "C" fn(*mut NativeBlockState)` block that only reads and
-    // writes fields within the provided state pointer.
+    // SAFETY: the bytes behind `executable` are produced by the trusted lowerer
+    // — `lower_tiny_block` or `lower_function` (`nx86-x64-v4`), including bytes
+    // round-tripped through `.nxo` cache objects, which only ever store lowerer
+    // output. The lowerer emits an `extern "C" fn(*mut NativeBlockState)` block
+    // that reads and writes only fields within the provided state pointer.
     unsafe { executable.call_with_state(state) }
 }
 

@@ -245,12 +245,24 @@ impl CacheManager {
         }
     }
 
-    /// Delete every cached object. Returns the number of objects removed.
+    /// Delete every cached object file. Returns the number of files removed.
+    ///
+    /// This removes every `.nxo` file by extension, not just objects the scan
+    /// recognizes, so a corrupt or truncated object cannot survive a clear.
     pub fn clear(&self) -> Result<usize, CacheError> {
-        let manifest = self.scan()?;
+        let read_dir = match fs::read_dir(&self.dir) {
+            Ok(read_dir) => read_dir,
+            Err(source) if source.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(source) => return Err(CacheError::io(&self.dir, source)),
+        };
+
         let mut removed = 0;
-        for entry in &manifest.entries {
-            let path = self.dir.join(&entry.file_name);
+        for entry in read_dir {
+            let entry = entry.map_err(|source| CacheError::io(&self.dir, source))?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("nxo") {
+                continue;
+            }
             match fs::remove_file(&path) {
                 Ok(()) => removed += 1,
                 Err(source) if source.kind() == ErrorKind::NotFound => {}
@@ -417,6 +429,32 @@ mod tests {
 
         assert_eq!(cache.clear().expect("clear"), 2);
         assert_eq!(cache.scan().expect("scan").object_count(), 0);
+    }
+
+    #[test]
+    fn clear_removes_corrupt_objects() {
+        let dir = tempdir().expect("temp dir");
+        let cache = CacheManager::open(dir.path()).expect("open cache");
+        cache.insert(&object(0x1, vec![0xC3])).expect("insert");
+        // A corrupt object the scan does not recognize must still be cleared.
+        std::fs::write(dir.path().join("000000000000beef.nxo"), b"not an object")
+            .expect("write corrupt object");
+
+        // scan only sees the one valid object, but clear removes both files.
+        assert_eq!(cache.scan().expect("scan").object_count(), 1);
+        assert_eq!(cache.clear().expect("clear"), 2);
+
+        let remaining = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .ok()
+                    .and_then(|entry| entry.path().extension().map(|ext| ext == "nxo"))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(remaining, 0);
     }
 
     #[test]
