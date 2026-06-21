@@ -10,10 +10,13 @@ shell. It contains a first-launch wizard, Library, Compile, Tests, and Settings
 screens, persistent settings, placeholder title storage, worker IPC smoke,
 synthetic ARM64 test display, guest CPU state, a narrow AArch64 decoder, a tiny
 synthetic interpreter, an NxIR differential oracle, a VMM skeleton, and the
-first internal x86_64 native-codegen path for a single-block synthetic integer
-program. It does not implement real title import, Switch runtime execution,
-profile-guided rebuilding, native memory or conditional-branch lowering,
-graphics, or Switch rendering.
+first internal x86_64 native-codegen path for synthetic integer programs. The
+native path includes register allocation and spills, persistent `.nxo` objects,
+a managed cache, multi-block dispatch through unconditional branches,
+compile-on-demand fallback, and versioned runtime profiles. It does not
+implement real title import, Switch runtime execution, profile-guided
+rebuilding, native memory or conditional-branch lowering, graphics, or Switch
+rendering.
 
 ## Active Phase 0-24 Crates
 
@@ -33,7 +36,9 @@ graphics, or Switch rendering.
 - `nx86-regalloc`: basic linear-scan register allocator for a single NxIR block (pool registers with stack-slot spills).
 - `nx86-object`: AOT object format v0 — `.nxo` serialization of a native block with guest mapping and a validation hash.
 - `nx86-cache`: cache manager v0 — `.nxo` object directory with a manifest, shallow/full integrity checks, size accounting, and insert/load/remove/clear.
-- `nx86-profile`: versioned JSONL runtime profile writer/reader with crash-tail recovery and file-wide branch-pair deduplication.
+- `nx86-profile`: strict versioned JSONL runtime profiles with typed events,
+  crash-tail recovery, file-wide branch-pair deduplication, Unix file locking,
+  destination hardening, and partial-append rollback.
 - `nx86-vmm`: 64 GiB guest memory arena boundary and software page-table helpers.
 - `nx86-debug`: tracing-based logging setup.
 - `nx86-testsuite`: synthetic ARM64 test file format, framebuffer spec, and result diffs.

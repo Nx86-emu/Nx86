@@ -13,9 +13,10 @@ integration. Profile-guided rebuild remains Phase 25.
 - `nx86-profile` writes one versioned JSON event per line and reads the same
   typed records without accepting unsupported versions or malformed complete
   lines.
-- An invalid unterminated final line is treated as crash-truncated data. The
-  reader reports recovery, and the writer truncates that tail before appending.
-  A valid final record missing only its newline is preserved.
+- Only a syntactically incomplete final JSON value is treated as crash-truncated
+  data. The reader reports recovery, and the writer truncates that tail before
+  appending. A valid final record missing only its newline is preserved, while
+  a syntactically complete but schema-invalid unterminated record is rejected.
 - Branch discovery follows the selected file-wide uniqueness policy: each
   `(source_pc, target_pc)` pair is written once, including across writer reopen.
   JIT, helper, and slowmem observations are not incorrectly deduplicated as
@@ -26,12 +27,19 @@ integration. Profile-guided rebuild remains Phase 25.
 - Existing profile destinations must be regular files. Symlinks and directories
   are rejected, and parent directories are created for new local profile files.
 - Cache names are validated against the deterministic `.nxo` key shape, and
-  helper/slowmem identifiers reject path-like or free-form values.
+  helper/slowmem identifiers reject path-like or free-form values. Zero-byte
+  JIT blocks and impossible slowmem access widths are also rejected.
 - Records reject unknown, duplicate, empty, and oversized input. This prevents
-  ignored JSON fields from carrying data outside the documented schema.
+  ignored JSON fields from carrying data outside the documented schema; each
+  accepted line is limited to 16 KiB.
 - Unix profile writers hold an exclusive file lock for their lifetime, while
-  readers take a shared lock. Failed partial appends roll back to the last known
-  complete record boundary.
+  readers take a nonblocking shared lock. Concurrent writers and live reads are
+  rejected rather than violating file-wide branch uniqueness or exposing a
+  partial append. Unix opens also use `O_NOFOLLOW` to close the destination
+  symlink race.
+- Failed partial appends roll back to the last known complete record boundary.
+  If truncating the failed append also fails, `ProfileError::WriteRollback`
+  preserves both I/O failures instead of claiming the profile is intact.
 
 ## Boundary Checks
 
@@ -55,7 +63,7 @@ cargo test --workspace --all-targets   # 156 tests, 0 failures
 cargo build --workspace
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --document-private-items --locked
 cargo check -p nx86-backend --tests --target x86_64-unknown-linux-gnu --locked
-cargo audit
+cargo audit                              # 0 known vulnerabilities
 actionlint .github/workflows/ci.yml .github/workflows/linux-x86_64-v4.yml
 shellcheck .github/scripts/*.sh
 ```
