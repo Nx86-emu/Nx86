@@ -234,6 +234,48 @@ pub struct ProfileLog {
     pub recovered_truncated_tail: bool,
 }
 
+impl ProfileLog {
+    /// Extract `JitBlock` events as rebuild candidates, deduplicated by
+    /// `guest_pc` (first occurrence wins). Each candidate carries the
+    /// `guest_pc` needed to recompile the block through the AOT pipeline.
+    #[must_use]
+    pub fn jit_block_candidates(&self) -> Vec<JitBlockCandidate<'_>> {
+        let mut seen = HashSet::new();
+        self.records
+            .iter()
+            .filter_map(|record| match &record.event {
+                ProfileEvent::JitBlock {
+                    guest_pc,
+                    code_size_bytes,
+                    cache_file_name,
+                } => {
+                    if seen.insert(*guest_pc) {
+                        Some(JitBlockCandidate {
+                            guest_pc: *guest_pc,
+                            code_size_bytes: *code_size_bytes,
+                            cache_file_name,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                ProfileEvent::BranchTarget { .. }
+                | ProfileEvent::HelperCall { .. }
+                | ProfileEvent::Slowmem { .. } => None,
+            })
+            .collect()
+    }
+}
+
+/// A JIT-compiled block identified from a runtime profile as a candidate for
+/// AOT promotion. Borrows string data from the profile record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JitBlockCandidate<'a> {
+    pub guest_pc: u64,
+    pub code_size_bytes: u64,
+    pub cache_file_name: &'a str,
+}
+
 /// Read all complete records from a profile. An invalid unterminated final line
 /// is treated as a crash-truncated tail; malformed complete lines are errors.
 pub fn read_profile(path: impl AsRef<Path>) -> Result<ProfileLog, ProfileError> {
@@ -562,8 +604,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        MemoryAccessKind, ProfileError, ProfileEvent, ProfileRecord, ProfileSink, ProfileWriter,
-        RecordOutcome, read_profile,
+        JitBlockCandidate, MemoryAccessKind, ProfileError, ProfileEvent, ProfileLog, ProfileRecord,
+        ProfileSink, ProfileWriter, RecordOutcome, read_profile,
     };
 
     fn all_events() -> Vec<ProfileEvent> {
@@ -884,5 +926,57 @@ mod tests {
             ProfileWriter::open(link),
             Err(ProfileError::NotRegularFile { .. })
         ));
+    }
+
+    #[test]
+    fn jit_block_candidates_filters_correctly() {
+        let log = ProfileLog {
+            records: all_events().into_iter().map(ProfileRecord::new).collect(),
+            recovered_truncated_tail: false,
+        };
+        let candidates = log.jit_block_candidates();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0],
+            JitBlockCandidate {
+                guest_pc: 0x1000,
+                code_size_bytes: 42,
+                cache_file_name: "0000000000001000.nxo",
+            }
+        );
+    }
+
+    #[test]
+    fn jit_block_candidates_from_empty_profile() {
+        let log = ProfileLog::default();
+        assert!(log.jit_block_candidates().is_empty());
+    }
+
+    #[test]
+    fn jit_block_candidates_deduplicates_by_guest_pc() {
+        let log = ProfileLog {
+            records: vec![
+                ProfileRecord::new(ProfileEvent::JitBlock {
+                    guest_pc: 0x1000,
+                    code_size_bytes: 42,
+                    cache_file_name: "0000000000001000.nxo".to_owned(),
+                }),
+                ProfileRecord::new(ProfileEvent::JitBlock {
+                    guest_pc: 0x2000,
+                    code_size_bytes: 64,
+                    cache_file_name: "0000000000002000.nxo".to_owned(),
+                }),
+                ProfileRecord::new(ProfileEvent::JitBlock {
+                    guest_pc: 0x1000,
+                    code_size_bytes: 42,
+                    cache_file_name: "0000000000001000.nxo".to_owned(),
+                }),
+            ],
+            recovered_truncated_tail: false,
+        };
+        let candidates = log.jit_block_candidates();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].guest_pc, 0x1000);
+        assert_eq!(candidates[1].guest_pc, 0x2000);
     }
 }

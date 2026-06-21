@@ -1,13 +1,16 @@
+use nx86_cache::CacheManager;
 use nx86_core::guest::CpuState;
 use nx86_ir::{Function, Terminator};
 use nx86_jit::{ExecError, ExecutableMemory};
 use nx86_x64_v4::{LoweredBlock, LoweringError, NativeBlockState, lower_tiny_block};
+use thiserror::Error;
 
+pub use nx86_cache::CacheError;
 pub use nx86_jit::{EmergencyJit, JitCompilation, JitError, JitEvent};
 pub use nx86_object::{NativeObject, ObjectError};
 pub use nx86_profile::{
-    MemoryAccessKind, ProfileError, ProfileEvent, ProfileLog, ProfileRecord, ProfileSink,
-    ProfileWriter, RecordOutcome, read_profile,
+    JitBlockCandidate, MemoryAccessKind, ProfileError, ProfileEvent, ProfileLog, ProfileRecord,
+    ProfileSink, ProfileWriter, RecordOutcome, read_profile,
 };
 
 mod dispatch;
@@ -125,6 +128,91 @@ impl NativeOutcome {
     }
 }
 
+/// The result of a profile-guided rebuild pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RebuildOutcome {
+    /// Total unique `JitBlock` events found in the profile.
+    pub total_jit_blocks: usize,
+    /// Blocks successfully recompiled and inserted into the cache.
+    pub promoted: usize,
+    /// Blocks skipped because the source function has no matching block.
+    pub skipped_unknown_pc: usize,
+    /// Blocks that failed compilation.
+    pub errors: usize,
+    /// Diagnostic messages from failed compilations (one per error).
+    pub error_messages: Vec<String>,
+    /// Snapshot of native coverage after the rebuild.
+    pub coverage: CoverageSnapshot,
+}
+
+/// Native coverage metrics derived from a rebuild pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoverageSnapshot {
+    /// Blocks promoted from JIT to AOT by this rebuild.
+    pub promoted_blocks: usize,
+    /// Total native objects in the cache after rebuild.
+    pub total_native_blocks: usize,
+    /// Profile blocks whose source PC has no matching block (unpromotable).
+    pub unpromotable_unknown_pc: usize,
+    /// Profile blocks that failed compilation (potentially transient).
+    pub failed_compilation: usize,
+}
+
+/// A failure during profile-guided rebuild.
+#[derive(Debug, Error)]
+pub enum RebuildError {
+    #[error("cache scan during rebuild failed: {0}")]
+    Cache(#[source] CacheError),
+}
+
+/// Read a runtime profile and recompile every JIT-discovered block through the
+/// AOT pipeline, inserting promoted objects into the cache. The source function
+/// is taken from `jit`, which must have been created with the same function that
+/// produced the profile.
+pub fn rebuild_from_profile(
+    profile: &ProfileLog,
+    jit: &EmergencyJit,
+    cache: &CacheManager,
+) -> Result<RebuildOutcome, RebuildError> {
+    let candidates = profile.jit_block_candidates();
+    let total_jit_blocks = candidates.len();
+    let mut promoted = 0usize;
+    let mut skipped_unknown_pc = 0usize;
+    let mut errors = 0usize;
+    let mut error_messages = Vec::new();
+
+    for candidate in &candidates {
+        match jit.compile(candidate.guest_pc) {
+            Ok(Some(_compilation)) => {
+                promoted += 1;
+            }
+            Ok(None) => {
+                skipped_unknown_pc += 1;
+            }
+            Err(error) => {
+                errors += 1;
+                error_messages.push(format!("{:#x}: {error}", candidate.guest_pc));
+            }
+        }
+    }
+
+    let total_native_blocks = cache.scan().map_err(RebuildError::Cache)?.object_count();
+
+    Ok(RebuildOutcome {
+        total_jit_blocks,
+        promoted,
+        skipped_unknown_pc,
+        errors,
+        error_messages,
+        coverage: CoverageSnapshot {
+            promoted_blocks: promoted,
+            total_native_blocks,
+            unpromotable_unknown_pc: skipped_unknown_pc,
+            failed_compilation: errors,
+        },
+    })
+}
+
 pub fn run_tiny_native_block(
     function: &Function,
     initial_state: &CpuState,
@@ -191,8 +279,8 @@ mod tests {
     use nx86_ir::{Block, BlockId, Function, Inst, Op, Reg, Terminator, Type, Value};
 
     use super::{
-        NativeObject, NativeStatus, lower_tiny_block, native_object, run_dispatched_function,
-        run_tiny_native_block,
+        CoverageSnapshot, NativeObject, NativeStatus, RebuildOutcome, lower_tiny_block,
+        native_object, rebuild_from_profile, run_dispatched_function, run_tiny_native_block,
     };
 
     #[test]
@@ -624,5 +712,238 @@ mod tests {
                 ..
             } if cache_file_name == "0000000000000008.nxo"
         ));
+    }
+
+    #[test]
+    fn rebuild_from_profile_promotes_jit_blocks() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = nx86_cache::CacheManager::open(dir.path()).expect("open cache");
+        let function = two_block_branch_function();
+        let jit = nx86_jit::EmergencyJit::new(function, cache.clone()).expect("create JIT");
+
+        let profile = nx86_profile::ProfileLog {
+            records: vec![nx86_profile::ProfileRecord::new(
+                nx86_profile::ProfileEvent::JitBlock {
+                    guest_pc: 0x8,
+                    code_size_bytes: 42,
+                    cache_file_name: "0000000000000008.nxo".to_owned(),
+                },
+            )],
+            recovered_truncated_tail: false,
+        };
+
+        let outcome = rebuild_from_profile(&profile, &jit, &cache).expect("rebuild");
+
+        assert_eq!(
+            outcome,
+            RebuildOutcome {
+                total_jit_blocks: 1,
+                promoted: 1,
+                skipped_unknown_pc: 0,
+                errors: 0,
+                error_messages: Vec::new(),
+                coverage: CoverageSnapshot {
+                    promoted_blocks: 1,
+                    total_native_blocks: 1,
+                    unpromotable_unknown_pc: 0,
+                    failed_compilation: 0,
+                },
+            }
+        );
+        assert_eq!(
+            cache.load(0x8).expect("load promoted object").entry_address,
+            0x8
+        );
+    }
+
+    #[test]
+    fn rebuild_from_profile_skips_unknown_pc() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = nx86_cache::CacheManager::open(dir.path()).expect("open cache");
+        let function = two_block_branch_function();
+        let jit = nx86_jit::EmergencyJit::new(function, cache.clone()).expect("create JIT");
+
+        let profile = nx86_profile::ProfileLog {
+            records: vec![nx86_profile::ProfileRecord::new(
+                nx86_profile::ProfileEvent::JitBlock {
+                    guest_pc: 0xdead,
+                    code_size_bytes: 16,
+                    cache_file_name: "000000000000dead.nxo".to_owned(),
+                },
+            )],
+            recovered_truncated_tail: false,
+        };
+
+        let outcome = rebuild_from_profile(&profile, &jit, &cache).expect("rebuild");
+
+        assert_eq!(outcome.promoted, 0);
+        assert_eq!(outcome.skipped_unknown_pc, 1);
+        assert_eq!(outcome.coverage.unpromotable_unknown_pc, 1);
+        assert_eq!(outcome.coverage.failed_compilation, 0);
+        assert_eq!(cache.scan().expect("scan").object_count(), 0);
+    }
+
+    #[test]
+    fn rebuild_from_profile_handles_empty_profile() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = nx86_cache::CacheManager::open(dir.path()).expect("open cache");
+        let function = two_block_branch_function();
+        let jit = nx86_jit::EmergencyJit::new(function, cache.clone()).expect("create JIT");
+
+        let profile = nx86_profile::ProfileLog::default();
+        let outcome = rebuild_from_profile(&profile, &jit, &cache).expect("rebuild");
+
+        assert_eq!(outcome.total_jit_blocks, 0);
+        assert_eq!(outcome.promoted, 0);
+        assert_eq!(outcome.coverage.total_native_blocks, 0);
+    }
+
+    #[test]
+    fn rebuild_from_profile_counts_compilation_errors() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = nx86_cache::CacheManager::open(dir.path()).expect("open cache");
+        // Build a function with an out-of-range register (x255) at guest_pc 0x0.
+        // The verifier does not check register indices, so `EmergencyJit::new`
+        // succeeds, but lowering fails with `RegisterOutOfRange`.
+        let function = Function {
+            name: "bad_reg".to_owned(),
+            entry_address: 0,
+            value_count: 1,
+            blocks: vec![Block {
+                instructions: vec![Inst {
+                    result: Some(Value(0)),
+                    op: Op::GetReg { reg: Reg::X(255) },
+                    guest_address: 0,
+                }],
+                terminator: Terminator::Halt {
+                    reason: "svc #0x0".to_owned(),
+                },
+                terminator_address: 4,
+            }],
+        };
+        let jit = nx86_jit::EmergencyJit::new(function, cache.clone()).expect("create JIT");
+
+        let profile = nx86_profile::ProfileLog {
+            records: vec![nx86_profile::ProfileRecord::new(
+                nx86_profile::ProfileEvent::JitBlock {
+                    guest_pc: 0x0,
+                    code_size_bytes: 16,
+                    cache_file_name: "0000000000000000.nxo".to_owned(),
+                },
+            )],
+            recovered_truncated_tail: false,
+        };
+
+        let outcome = rebuild_from_profile(&profile, &jit, &cache).expect("rebuild");
+
+        assert_eq!(outcome.total_jit_blocks, 1);
+        assert_eq!(outcome.promoted, 0);
+        assert_eq!(outcome.errors, 1);
+        assert_eq!(outcome.error_messages.len(), 1);
+        assert!(
+            outcome.error_messages[0].contains("register"),
+            "error should mention register: {}",
+            outcome.error_messages[0]
+        );
+        assert_eq!(outcome.coverage.failed_compilation, 1);
+        assert_eq!(outcome.coverage.unpromotable_unknown_pc, 0);
+    }
+
+    #[test]
+    fn rebuild_from_profile_is_idempotent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = nx86_cache::CacheManager::open(dir.path()).expect("open cache");
+        let function = two_block_branch_function();
+        let jit = nx86_jit::EmergencyJit::new(function, cache.clone()).expect("create JIT");
+
+        let profile = nx86_profile::ProfileLog {
+            records: vec![nx86_profile::ProfileRecord::new(
+                nx86_profile::ProfileEvent::JitBlock {
+                    guest_pc: 0x8,
+                    code_size_bytes: 42,
+                    cache_file_name: "0000000000000008.nxo".to_owned(),
+                },
+            )],
+            recovered_truncated_tail: false,
+        };
+
+        let first = rebuild_from_profile(&profile, &jit, &cache).expect("first rebuild");
+        let second = rebuild_from_profile(&profile, &jit, &cache).expect("second rebuild");
+
+        assert_eq!(first.promoted, 1);
+        assert_eq!(second.promoted, 1);
+        assert_eq!(
+            cache
+                .load(0x8)
+                .expect("load after second rebuild")
+                .entry_address,
+            0x8
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn promoted_blocks_skip_jit_on_second_run() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = nx86_cache::CacheManager::open(dir.path()).expect("open cache");
+        let profile_path = dir.path().join("runtime-v1.jsonl");
+        let function = two_block_branch_function();
+
+        // Run 1: load only block 0, let block 1 get JIT-compiled and profiled.
+        let objects = objects_for(&function);
+        // SAFETY: `objects_for` directly wraps bytes from the trusted lowerer;
+        // no persistence or external mutation occurs before construction.
+        let dispatcher =
+            unsafe { super::Dispatcher::from_objects(&objects[..1]) }.expect("build dispatcher");
+        let jit = nx86_jit::EmergencyJit::new(function, cache.clone()).expect("create JIT");
+        let profile_writer =
+            nx86_profile::ProfileWriter::open(&profile_path).expect("open runtime profile");
+        let mut dispatcher = dispatcher
+            .with_emergency_jit(jit)
+            .with_profile_sink(profile_writer);
+
+        let mut initial = CpuState::new();
+        initial.set_pc(0);
+        let outcome = dispatcher.run(&initial, None).expect("run 1");
+        assert_eq!(outcome.exit, super::DispatchExit::Halted);
+        assert_eq!(outcome.jit_events.len(), 1);
+        assert_eq!(outcome.jit_events[0].guest_pc, 0x8);
+        drop(dispatcher);
+
+        // Rebuild: read the profile and promote JIT blocks to AOT.
+        let profile = nx86_profile::read_profile(&profile_path).expect("read profile");
+        let jit_blocks = profile.jit_block_candidates();
+        assert_eq!(jit_blocks.len(), 1);
+        assert_eq!(jit_blocks[0].guest_pc, 0x8);
+
+        let function = two_block_branch_function();
+        let jit =
+            nx86_jit::EmergencyJit::new(function, cache.clone()).expect("create JIT for rebuild");
+        let outcome = rebuild_from_profile(&profile, &jit, &cache).expect("rebuild");
+        assert_eq!(outcome.promoted, 1);
+
+        // Run 2: load ALL objects from cache — promoted block 1 should be present.
+        let manifest = cache.scan().expect("scan cache");
+        let loaded: Vec<NativeObject> = manifest
+            .entries
+            .iter()
+            .map(|entry| cache.load(entry.entry_address).expect("load object"))
+            .collect();
+        // SAFETY: every object was emitted by the trusted lowerer through
+        // `EmergencyJit::compile`, persisted in this test's private temporary
+        // cache, and loaded without outside mutation.
+        let mut dispatcher = unsafe { super::Dispatcher::from_objects(loaded.iter()) }
+            .expect("build dispatcher from cache");
+
+        let mut initial = CpuState::new();
+        initial.set_pc(0);
+        let outcome = dispatcher.run(&initial, None).expect("run 2");
+        assert_eq!(outcome.exit, super::DispatchExit::Halted);
+        assert_eq!(outcome.final_state, two_block_expected_state());
+        assert!(
+            outcome.jit_events.is_empty(),
+            "second run should use promoted objects, not JIT"
+        );
     }
 }

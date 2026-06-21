@@ -6,6 +6,7 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+nx86-cache = { path = "../nx86-cache" }
 nx86-core = { path = "../nx86-core" }
 nx86-ir = { path = "../nx86-ir" }
 nx86-jit = { path = "../nx86-jit" }
@@ -15,7 +16,6 @@ nx86-x64-v4 = { path = "../nx86-x64-v4" }
 thiserror.workspace = true
 
 [dev-dependencies]
-nx86-cache = { path = "../nx86-cache" }
 tempfile.workspace = true
 
 [lints]

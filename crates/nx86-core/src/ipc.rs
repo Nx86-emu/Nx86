@@ -32,6 +32,7 @@ pub enum IpcCommand {
 pub enum WorkerKind {
     CompilerSmoke,
     RuntimeSmoke,
+    RebuildProfile,
 }
 
 impl WorkerKind {
@@ -40,6 +41,7 @@ impl WorkerKind {
         match self {
             Self::CompilerSmoke => "compiler-smoke",
             Self::RuntimeSmoke => "runtime-smoke",
+            Self::RebuildProfile => "rebuild-profile",
         }
     }
 }
@@ -197,5 +199,20 @@ mod tests {
     #[test]
     fn worker_kind_has_cli_label() {
         assert_eq!(WorkerKind::CompilerSmoke.label(), "compiler-smoke");
+        assert_eq!(WorkerKind::RuntimeSmoke.label(), "runtime-smoke");
+        assert_eq!(WorkerKind::RebuildProfile.label(), "rebuild-profile");
+    }
+
+    #[test]
+    fn rebuild_profile_command_round_trips() {
+        let command = IpcCommand::StartWorker {
+            kind: WorkerKind::RebuildProfile,
+            job_id: "rebuild-1".to_owned(),
+        };
+
+        let encoded = encode_command(&command).expect("command should encode");
+        let decoded = decode_command(&encoded).expect("command should decode");
+
+        assert_eq!(decoded, command);
     }
 }
