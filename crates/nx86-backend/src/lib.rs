@@ -1331,6 +1331,7 @@ mod tests {
 
         // Run 1: load only block 0, let block 1 get JIT-compiled and profiled.
         let objects = objects_for(&function);
+        cache.insert(&objects[0]).expect("cache AOT entry block");
         // SAFETY: `objects_for` directly wraps bytes from the trusted lowerer;
         // no persistence or external mutation occurs before construction.
         let dispatcher =
@@ -1362,7 +1363,8 @@ mod tests {
         let outcome = rebuild_from_profile(&profile, &jit, &cache).expect("rebuild");
         assert_eq!(outcome.promoted, 1);
 
-        // Run 2: load ALL objects from cache — promoted block 1 should be present.
+        // Run 2: load the original AOT entry block and promoted block 1 from
+        // cache. The complete cache should execute without emergency JIT.
         let manifest = cache.scan().expect("scan cache");
         let loaded: Vec<NativeObject> = manifest
             .entries
