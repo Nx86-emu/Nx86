@@ -2,7 +2,7 @@ use nx86_core::guest::{CpuState, Nzcv};
 use nx86_ir::verify::{self, VerifyError};
 use nx86_ir::{BinaryOp, Block, BlockId, Function, Inst, Op, Reg, Terminator, Type, Value};
 use nx86_regalloc::{Allocation, Location, allocate};
-use nx86_x64_asm::{AsmError, Assembler, CodeBuffer, Mem64, PatchKind, Reg64};
+use nx86_x64_asm::{AsmError, Assembler, CodeBuffer, Label, Mem64, PatchKind, Reg64};
 use thiserror::Error;
 
 pub const CRATE_NAME: &str = "nx86-x64-v4";
@@ -12,6 +12,19 @@ const SP_OFFSET: i32 = X0_OFFSET + 31 * 8;
 const PC_OFFSET: i32 = SP_OFFSET + 8;
 const NZCV_BITS_OFFSET: i32 = PC_OFFSET + 8;
 const HALTED_OFFSET: i32 = NZCV_BITS_OFFSET + 8;
+const FASTMEM_BASE_OFFSET: i32 = HALTED_OFFSET + 8;
+const FASTMEM_PERMISSIONS_OFFSET: i32 = FASTMEM_BASE_OFFSET + 8;
+const SLOWMEM_CONTEXT_OFFSET: i32 = FASTMEM_PERMISSIONS_OFFSET + 8;
+const SLOWMEM_READ_OFFSET: i32 = SLOWMEM_CONTEXT_OFFSET + 8;
+const SLOWMEM_WRITE_OFFSET: i32 = SLOWMEM_READ_OFFSET + 8;
+const SLOWMEM_VALUE_OFFSET: i32 = SLOWMEM_WRITE_OFFSET + 8;
+const MEMORY_FAULT_OFFSET: i32 = SLOWMEM_VALUE_OFFSET + 8;
+const SAVED_REGISTER_BYTES: u32 = 32;
+const FASTMEM_READ: i32 = 1;
+const FASTMEM_WRITE: i32 = 2;
+const PAGE_MASK: i32 = 4095;
+const PAGE_SHIFT: u8 = 12;
+const ARENA_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 #[must_use]
 pub const fn crate_name() -> &'static str {
@@ -88,6 +101,20 @@ pub struct NativeBlockState {
     pub pc: u64,
     pub nzcv_bits: u64,
     pub halted: u64,
+    /// Host base of the contiguous 64 GiB fastmem arena, or zero.
+    pub fastmem_base: u64,
+    /// Byte-per-page fastmem permission table, or zero.
+    pub fastmem_permissions: u64,
+    /// Opaque pointer consumed by the slowmem callbacks.
+    pub slowmem_context: u64,
+    /// `extern "C"` slowmem read callback address.
+    pub slowmem_read: u64,
+    /// `extern "C"` slowmem write callback address.
+    pub slowmem_write: u64,
+    /// Successful slowmem reads place their value here.
+    pub slowmem_value: u64,
+    /// Nonzero callback status asks the native block to side-exit.
+    pub memory_fault: u64,
 }
 
 impl NativeBlockState {
@@ -99,6 +126,13 @@ impl NativeBlockState {
             pc: cpu.pc(),
             nzcv_bits: u64::from(cpu.nzcv().bits()),
             halted: u64::from(cpu.halted()),
+            fastmem_base: 0,
+            fastmem_permissions: 0,
+            slowmem_context: 0,
+            slowmem_read: 0,
+            slowmem_write: 0,
+            slowmem_value: 0,
+            memory_fault: 0,
         }
     }
 
@@ -132,6 +166,8 @@ pub enum LoweringError {
     UnsupportedBlockCount { count: usize },
     #[error("tiny native lowering does not support {op}")]
     UnsupportedOp { op: &'static str },
+    #[error("tiny native lowering does not support guest memory type {ty:?}")]
+    UnsupportedMemoryType { ty: Type },
     #[error("tiny native lowering does not support {terminator}")]
     UnsupportedTerminator { terminator: &'static str },
     #[error("branch target {target:?} is outside the function block table")]
@@ -260,7 +296,9 @@ where
     let allocation = allocate(block, value_count);
     let stack_size = stack_size(allocation.spill_count())?;
     let mut asm = Assembler::new();
+    let memory_fault_exit = asm.create_label();
     asm.prologue();
+    emit_native_register_prologue(&mut asm);
     if stack_size > 0 {
         asm.sub_reg_imm32(Reg64::Rsp, stack_size);
     }
@@ -268,9 +306,10 @@ where
     // dispatcher routes to the next guest PC; `Halt` sets it in the terminator.
     asm.mov_reg_imm64(Reg64::Rax, 0);
     asm.mov_mem_reg(state_mem(HALTED_OFFSET), Reg64::Rax);
+    asm.mov_mem_reg(state_mem(MEMORY_FAULT_OFFSET), Reg64::Rax);
 
     for inst in &block.instructions {
-        lower_inst(&mut asm, inst, &allocation)?;
+        lower_inst(&mut asm, inst, &allocation, memory_fault_exit)?;
     }
 
     let chain_successor = emit_terminator(&mut asm, block, resolve_target)?;
@@ -278,6 +317,7 @@ where
     if stack_size > 0 {
         asm.add_reg_imm32(Reg64::Rsp, stack_size);
     }
+    emit_native_register_epilogue(&mut asm);
     // An unconditional branch tears down its frame and ends in a patchable
     // chain-exit slot (so a hot edge can later jump straight to its successor);
     // every other terminator uses the plain `ret` epilogue. The slot must come
@@ -286,6 +326,15 @@ where
         Some(_) => asm.chain_epilogue(),
         None => asm.epilogue(),
     }
+
+    // Slowmem failures side-exit after restoring the complete native frame.
+    // The backend reads the retained typed VMM error from the helper context.
+    asm.bind_label(memory_fault_exit)?;
+    if stack_size > 0 {
+        asm.add_reg_imm32(Reg64::Rsp, stack_size);
+    }
+    emit_native_register_epilogue(&mut asm);
+    asm.epilogue();
 
     let code = asm.finish()?;
     let chain_exits = build_chain_exits(&code, block.entry_address(), chain_successor);
@@ -370,7 +419,12 @@ fn emit_set_pc(asm: &mut Assembler, pc: u64) {
     asm.mov_mem_reg(state_mem(PC_OFFSET), Reg64::Rax);
 }
 
-fn lower_inst(asm: &mut Assembler, inst: &Inst, alloc: &Allocation) -> Result<(), LoweringError> {
+fn lower_inst(
+    asm: &mut Assembler,
+    inst: &Inst,
+    alloc: &Allocation,
+    memory_fault_exit: Label,
+) -> Result<(), LoweringError> {
     match &inst.op {
         Op::Const {
             ty: Type::I64,
@@ -428,15 +482,46 @@ fn lower_inst(asm: &mut Assembler, inst: &Inst, alloc: &Allocation) -> Result<()
                 op: "non-i64 binary operation",
             });
         }
-        Op::Trunc { .. } | Op::ZeroExtend { .. } => {
-            return Err(LoweringError::UnsupportedOp {
-                op: "integer width conversion",
-            });
+        Op::Trunc { value } | Op::ZeroExtend { value } => {
+            let result = result_value(
+                inst,
+                if matches!(inst.op, Op::Trunc { .. }) {
+                    "trunc"
+                } else {
+                    "zero-extend"
+                },
+            )?;
+            materialize_value(asm, *value, alloc, Reg64::Rax)?;
+            match location(alloc, result)? {
+                Location::Register(dst) => asm.mov_reg_reg32(dst, Reg64::Rax),
+                Location::Spill(slot) => {
+                    asm.mov_reg_reg32(Reg64::Rax, Reg64::Rax);
+                    asm.mov_mem_reg(spill_slot(slot)?, Reg64::Rax);
+                }
+            }
         }
-        Op::Load { .. } | Op::Store { .. } => {
-            return Err(LoweringError::UnsupportedOp {
-                op: "guest memory operation",
-            });
+        Op::Load { ty, address } => {
+            let result = result_value(inst, "load")?;
+            emit_guest_load(
+                asm,
+                *ty,
+                *address,
+                result,
+                inst.guest_address,
+                alloc,
+                memory_fault_exit,
+            )?;
+        }
+        Op::Store { ty, address, value } => {
+            emit_guest_store(
+                asm,
+                *ty,
+                *address,
+                *value,
+                inst.guest_address,
+                alloc,
+                memory_fault_exit,
+            )?;
         }
         Op::SetFlags { .. } => {
             return Err(LoweringError::UnsupportedOp { op: "lazy flags" });
@@ -444,6 +529,182 @@ fn lower_inst(asm: &mut Assembler, inst: &Inst, alloc: &Allocation) -> Result<()
     }
 
     Ok(())
+}
+
+fn emit_guest_load(
+    asm: &mut Assembler,
+    ty: Type,
+    address: Value,
+    result: Value,
+    guest_address: u64,
+    alloc: &Allocation,
+    memory_fault_exit: Label,
+) -> Result<(), LoweringError> {
+    let size = memory_size(ty)?;
+    let slow = asm.create_label();
+    let done = asm.create_label();
+    materialize_value(asm, address, alloc, Reg64::Rax)?;
+    emit_fastmem_check(asm, size, FASTMEM_READ, slow)?;
+    match ty {
+        Type::I32 => asm.mov_reg_mem32(Reg64::Rax, Mem64::indexed(Reg64::R14, Reg64::Rax, 0)),
+        Type::I64 => asm.mov_reg_mem(Reg64::Rax, Mem64::indexed(Reg64::R14, Reg64::Rax, 0)),
+        other => return Err(LoweringError::UnsupportedMemoryType { ty: other }),
+    }
+    store_into_value(asm, result, alloc, Reg64::Rax)?;
+    asm.jmp(done)?;
+
+    asm.bind_label(slow)?;
+    emit_slowmem_call(
+        asm,
+        SLOWMEM_READ_OFFSET,
+        size,
+        guest_address,
+        None,
+        memory_fault_exit,
+    )?;
+    asm.mov_reg_mem(Reg64::Rax, state_mem(SLOWMEM_VALUE_OFFSET));
+    if ty == Type::I32 {
+        asm.mov_reg_reg32(Reg64::Rax, Reg64::Rax);
+    }
+    store_into_value(asm, result, alloc, Reg64::Rax)?;
+    asm.bind_label(done)?;
+    Ok(())
+}
+
+fn emit_guest_store(
+    asm: &mut Assembler,
+    ty: Type,
+    address: Value,
+    value: Value,
+    guest_address: u64,
+    alloc: &Allocation,
+    memory_fault_exit: Label,
+) -> Result<(), LoweringError> {
+    let size = memory_size(ty)?;
+    let slow = asm.create_label();
+    let done = asm.create_label();
+    materialize_value(asm, address, alloc, Reg64::Rax)?;
+    emit_fastmem_check(asm, size, FASTMEM_WRITE, slow)?;
+    materialize_value(asm, value, alloc, Reg64::Rcx)?;
+    match ty {
+        Type::I32 => asm.mov_mem_reg32(Mem64::indexed(Reg64::R14, Reg64::Rax, 0), Reg64::Rcx),
+        Type::I64 => asm.mov_mem_reg(Mem64::indexed(Reg64::R14, Reg64::Rax, 0), Reg64::Rcx),
+        other => return Err(LoweringError::UnsupportedMemoryType { ty: other }),
+    }
+    asm.jmp(done)?;
+
+    asm.bind_label(slow)?;
+    materialize_value(asm, value, alloc, Reg64::Rcx)?;
+    emit_slowmem_call(
+        asm,
+        SLOWMEM_WRITE_OFFSET,
+        size,
+        guest_address,
+        Some(Reg64::Rcx),
+        memory_fault_exit,
+    )?;
+    asm.bind_label(done)?;
+    Ok(())
+}
+
+fn memory_size(ty: Type) -> Result<u64, LoweringError> {
+    match ty {
+        Type::I32 => Ok(4),
+        Type::I64 => Ok(8),
+        other => Err(LoweringError::UnsupportedMemoryType { ty: other }),
+    }
+}
+
+/// Branch to `slow` unless RAX names one eligible, in-arena, single-page access.
+fn emit_fastmem_check(
+    asm: &mut Assembler,
+    size: u64,
+    permission: i32,
+    slow: Label,
+) -> Result<(), LoweringError> {
+    asm.cmp_reg_imm32(Reg64::R14, 0);
+    asm.jz(slow)?;
+    asm.cmp_reg_imm32(Reg64::R13, 0);
+    asm.jz(slow)?;
+    asm.mov_reg_imm64(Reg64::Rcx, ARENA_SIZE_BYTES - size);
+    asm.cmp_reg_reg(Reg64::Rax, Reg64::Rcx);
+    asm.ja(slow)?;
+    asm.mov_reg_reg(Reg64::Rcx, Reg64::Rax);
+    asm.and_reg_imm32(Reg64::Rcx, PAGE_MASK);
+    asm.cmp_reg_imm32(Reg64::Rcx, i32::try_from(4096 - size).unwrap_or(0));
+    asm.ja(slow)?;
+    asm.mov_reg_reg(Reg64::Rcx, Reg64::Rax);
+    asm.shr_reg_imm8(Reg64::Rcx, PAGE_SHIFT);
+    asm.movzx_reg_mem8(Reg64::Rcx, Mem64::indexed(Reg64::R13, Reg64::Rcx, 0));
+    asm.test_reg_imm32(Reg64::Rcx, permission);
+    asm.jz(slow)?;
+    Ok(())
+}
+
+fn emit_slowmem_call(
+    asm: &mut Assembler,
+    callback_offset: i32,
+    size: u64,
+    guest_address: u64,
+    value: Option<Reg64>,
+    memory_fault_exit: Label,
+) -> Result<(), LoweringError> {
+    // Preserve every allocator and scratch register across the Rust ABI call.
+    for reg in [
+        Reg64::Rax,
+        Reg64::Rcx,
+        Reg64::Rdx,
+        Reg64::Rsi,
+        Reg64::R8,
+        Reg64::R9,
+        Reg64::R10,
+        Reg64::R11,
+    ] {
+        asm.push_reg(reg);
+    }
+    asm.mov_reg_reg(Reg64::Rdx, Reg64::Rax);
+    if value.is_none() {
+        asm.mov_reg_imm64(Reg64::Rcx, 0);
+    }
+    asm.mov_reg_imm64(Reg64::R8, size);
+    asm.mov_reg_reg(Reg64::Rdi, Reg64::R12);
+    asm.mov_reg_reg(Reg64::Rsi, Reg64::R15);
+    asm.mov_reg_imm64(Reg64::R9, guest_address);
+    asm.mov_reg_mem(Reg64::Rax, state_mem(callback_offset));
+    asm.call_reg(Reg64::Rax);
+    asm.mov_mem_reg(state_mem(MEMORY_FAULT_OFFSET), Reg64::Rax);
+    for reg in [
+        Reg64::R11,
+        Reg64::R10,
+        Reg64::R9,
+        Reg64::R8,
+        Reg64::Rsi,
+        Reg64::Rdx,
+        Reg64::Rcx,
+        Reg64::Rax,
+    ] {
+        asm.pop_reg(reg);
+    }
+    asm.mov_reg_mem(Reg64::Rax, state_mem(MEMORY_FAULT_OFFSET));
+    asm.cmp_reg_imm32(Reg64::Rax, 0);
+    asm.jnz(memory_fault_exit)?;
+    Ok(())
+}
+
+fn emit_native_register_prologue(asm: &mut Assembler) {
+    for reg in [Reg64::R12, Reg64::R13, Reg64::R14, Reg64::R15] {
+        asm.push_reg(reg);
+    }
+    asm.mov_reg_reg(Reg64::R15, Reg64::Rdi);
+    asm.mov_reg_mem(Reg64::R14, state_mem(FASTMEM_BASE_OFFSET));
+    asm.mov_reg_mem(Reg64::R13, state_mem(FASTMEM_PERMISSIONS_OFFSET));
+    asm.mov_reg_mem(Reg64::R12, state_mem(SLOWMEM_CONTEXT_OFFSET));
+}
+
+fn emit_native_register_epilogue(asm: &mut Assembler) {
+    for reg in [Reg64::R15, Reg64::R14, Reg64::R13, Reg64::R12] {
+        asm.pop_reg(reg);
+    }
 }
 
 fn result_value(inst: &Inst, op: &'static str) -> Result<Value, LoweringError> {
@@ -478,7 +739,7 @@ fn location(alloc: &Allocation, value: Value) -> Result<Location, LoweringError>
 }
 
 fn spill_slot(slot: u32) -> Result<Mem64, LoweringError> {
-    let offset = i32::try_from((u64::from(slot) + 1) * 8)
+    let offset = i32::try_from(u64::from(SAVED_REGISTER_BYTES) + (u64::from(slot) + 1) * 8)
         .map_err(|_| LoweringError::StackTooLarge { value_count: slot })?;
     Ok(Mem64::new(Reg64::Rbp, -offset))
 }
@@ -559,11 +820,13 @@ const fn x_offset(index: u8) -> i32 {
 }
 
 const fn state_mem(offset: i32) -> Mem64 {
-    Mem64::new(Reg64::Rdi, offset)
+    Mem64::new(Reg64::R15, offset)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+
     use nx86_ir::{Block, BlockId, Function, Inst, Op, Reg, Terminator, Type, Value};
 
     use super::{NativeBlockState, lower_function, lower_function_block, lower_tiny_block};
@@ -578,7 +841,7 @@ mod tests {
         // The four SSA values all fit in pool registers, so nothing spills.
         assert_eq!(lowered.stack_size(), 0);
         assert!(lowered.dump().contains("mov rdx, 0x1"));
-        assert!(lowered.dump().contains("mov [rdi+0x100], rax"));
+        assert!(lowered.dump().contains("mov [r15+0x100], rax"));
         assert!(lowered.dump().contains("ret"));
     }
 
@@ -598,6 +861,19 @@ mod tests {
     }
 
     #[test]
+    fn lowers_guest_memory_with_fast_and_slow_paths() {
+        let function = tiny_memory_function();
+
+        let lowered = lower_tiny_block(&function).expect("guest memory should lower");
+        let dump = lowered.dump();
+
+        assert!(dump.contains("mov [r14+rax], rcx"));
+        assert!(dump.contains("mov rax, [r14+rax]"));
+        assert!(dump.contains("movzx rcx, byte [r13+rcx]"));
+        assert!(dump.contains("call rax"));
+    }
+
+    #[test]
     fn lower_function_routes_branch_to_target_pc() {
         let function = two_block_branch_function();
         let blocks = lower_function(&function).expect("two-block function should lower");
@@ -609,13 +885,13 @@ mod tests {
         // Block 0 branches: it sets PC to block 1's entry (0x8) and does not halt.
         let branch_dump = blocks[0].lowered.dump();
         assert!(branch_dump.contains("mov rax, 0x8"));
-        assert!(branch_dump.contains("mov [rdi+0x100], rax"));
+        assert!(branch_dump.contains("mov [r15+0x100], rax"));
         assert!(!branch_dump.contains("mov rax, 0x1"));
 
         // Block 1 halts: it sets the halted flag (offset 0x110) to 1.
         let halt_dump = blocks[1].lowered.dump();
         assert!(halt_dump.contains("mov rax, 0x1"));
-        assert!(halt_dump.contains("mov [rdi+0x110], rax"));
+        assert!(halt_dump.contains("mov [r15+0x110], rax"));
     }
 
     #[test]
@@ -654,7 +930,7 @@ mod tests {
             .expect("function should verify")
             .expect("block should exist");
         assert_eq!(block.entry_pc, 0x8);
-        assert!(block.lowered.dump().contains("mov [rdi+0x110], rax"));
+        assert!(block.lowered.dump().contains("mov [r15+0x110], rax"));
 
         assert!(
             lower_function_block(&function, 0xdead)
@@ -746,6 +1022,25 @@ mod tests {
         let round_trip = state.to_cpu_state(Some("svc #0x0"));
 
         assert_eq!(round_trip, cpu);
+    }
+
+    #[test]
+    fn native_memory_abi_offsets_are_stable() {
+        assert_eq!(std::mem::offset_of!(NativeBlockState, x), 0);
+        assert_eq!(std::mem::offset_of!(NativeBlockState, sp), 248);
+        assert_eq!(std::mem::offset_of!(NativeBlockState, pc), 256);
+        assert_eq!(std::mem::offset_of!(NativeBlockState, halted), 272);
+        assert_eq!(std::mem::offset_of!(NativeBlockState, fastmem_base), 280);
+        assert_eq!(
+            std::mem::offset_of!(NativeBlockState, fastmem_permissions),
+            288
+        );
+        assert_eq!(std::mem::offset_of!(NativeBlockState, slowmem_context), 296);
+        assert_eq!(std::mem::offset_of!(NativeBlockState, slowmem_read), 304);
+        assert_eq!(std::mem::offset_of!(NativeBlockState, slowmem_write), 312);
+        assert_eq!(std::mem::offset_of!(NativeBlockState, slowmem_value), 320);
+        assert_eq!(std::mem::offset_of!(NativeBlockState, memory_fault), 328);
+        assert_eq!(size_of::<NativeBlockState>(), 336);
     }
 
     #[test]
@@ -917,6 +1212,64 @@ mod tests {
                     reason: "svc #0x0".to_owned(),
                 },
                 terminator_address: 8,
+            }],
+        }
+    }
+
+    fn tiny_memory_function() -> Function {
+        Function {
+            name: "tiny_memory".to_owned(),
+            entry_address: 0,
+            value_count: 3,
+            deopt_points: Vec::new(),
+            blocks: vec![Block {
+                instructions: vec![
+                    Inst {
+                        result: Some(Value(0)),
+                        op: Op::Const {
+                            ty: Type::I64,
+                            value: 0x1000,
+                        },
+                        guest_address: 0,
+                    },
+                    Inst {
+                        result: Some(Value(1)),
+                        op: Op::Const {
+                            ty: Type::I64,
+                            value: 0x1122_3344_5566_7788,
+                        },
+                        guest_address: 4,
+                    },
+                    Inst {
+                        result: None,
+                        op: Op::Store {
+                            ty: Type::I64,
+                            address: Value(0),
+                            value: Value(1),
+                        },
+                        guest_address: 8,
+                    },
+                    Inst {
+                        result: Some(Value(2)),
+                        op: Op::Load {
+                            ty: Type::I64,
+                            address: Value(0),
+                        },
+                        guest_address: 12,
+                    },
+                    Inst {
+                        result: None,
+                        op: Op::SetReg {
+                            reg: Reg::X(0),
+                            value: Value(2),
+                        },
+                        guest_address: 12,
+                    },
+                ],
+                terminator: Terminator::Halt {
+                    reason: "svc #0x0".to_owned(),
+                },
+                terminator_address: 16,
             }],
         }
     }

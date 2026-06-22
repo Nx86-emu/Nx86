@@ -2,7 +2,7 @@ use nx86_arm64_decode::{
     DecodeError, DecodedInstruction, InstructionKind, LogicalOp, MemSize, decode_program,
 };
 use nx86_arm64_lift::lift_program;
-use nx86_backend::{run_dispatched_function, run_tiny_native_block};
+use nx86_backend::{run_dispatched_function_in, run_tiny_native_block_in};
 use nx86_core::guest::{CpuState, CpuStateDiff, Nzcv};
 use nx86_testsuite::{Framebuffer, MemoryDiff, SyntheticArm64Test, SyntheticTestError};
 use nx86_vmm::{GuestAddress, GuestMemory, PAGE_SIZE, PagePermissions, VmmFault};
@@ -340,10 +340,59 @@ fn run_translation_differentials(
     let dump = function.dump();
 
     let nxir = evaluate_verified_nxir(test, &function, dump, interpreter_state, interpreter_memory);
-    let native = run_tiny_native_block(&function, initial_state, interpreter_state);
-    let dispatched = run_dispatched_function(&function, initial_state, interpreter_state);
+    let native = run_native_memory_differential(
+        test,
+        &function,
+        initial_state,
+        interpreter_state,
+        interpreter_memory,
+        false,
+    );
+    let dispatched = run_native_memory_differential(
+        test,
+        &function,
+        initial_state,
+        interpreter_state,
+        interpreter_memory,
+        true,
+    );
 
     (nxir, native, dispatched)
+}
+
+fn run_native_memory_differential(
+    test: &SyntheticArm64Test,
+    function: &nx86_ir::Function,
+    initial_state: &CpuState,
+    interpreter_state: &CpuState,
+    interpreter_memory: &GuestMemory,
+    dispatched: bool,
+) -> NativeOutcome {
+    let mut memory = match GuestMemory::new() {
+        Ok(memory) => memory,
+        Err(error) => return NativeOutcome::error(function.dump(), error),
+    };
+    if let Err(error) = map_regions(&mut memory, test) {
+        return NativeOutcome::error(function.dump(), error);
+    }
+    let mut outcome = if dispatched {
+        run_dispatched_function_in(function, initial_state, interpreter_state, &mut memory)
+    } else {
+        run_tiny_native_block_in(function, initial_state, interpreter_state, &mut memory)
+    };
+    if outcome.agrees() {
+        let memory_agrees = match (
+            read_observable_regions(interpreter_memory, test),
+            read_observable_regions(&memory, test),
+        ) {
+            (Ok(interpreter_regions), Ok(native_regions)) => interpreter_regions == native_regions,
+            _ => false,
+        };
+        if !memory_agrees {
+            outcome.status = NativeStatus::DisagreesWithInterpreter;
+        }
+    }
+    outcome
 }
 
 fn evaluate_verified_nxir(

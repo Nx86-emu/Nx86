@@ -152,13 +152,27 @@ impl Reg64 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mem64 {
     pub base: Reg64,
+    pub index: Option<Reg64>,
     pub disp: i32,
 }
 
 impl Mem64 {
     #[must_use]
     pub const fn new(base: Reg64, disp: i32) -> Self {
-        Self { base, disp }
+        Self {
+            base,
+            index: None,
+            disp,
+        }
+    }
+
+    #[must_use]
+    pub const fn indexed(base: Reg64, index: Reg64, disp: i32) -> Self {
+        Self {
+            base,
+            index: Some(index),
+            disp,
+        }
     }
 }
 
@@ -282,16 +296,44 @@ impl Assembler {
         self.emit_reg_reg(0x89, dst, src);
     }
 
+    /// Move the low 32 bits and zero the destination's upper 32 bits.
+    pub fn mov_reg_reg32(&mut self, dst: Reg64, src: Reg64) {
+        self.dump
+            .push(format!("mov {}d, {}d", dst.name(), src.name()));
+        self.emit_reg_reg_width(0x89, dst, src, false);
+    }
+
     pub fn mov_reg_mem(&mut self, dst: Reg64, src: Mem64) {
         self.dump
             .push(format!("mov {}, {}", dst.name(), mem_name(src)));
         self.emit_reg_mem(0x8B, dst, src);
     }
 
+    /// Load a 32-bit value and zero the upper half of the destination register.
+    pub fn mov_reg_mem32(&mut self, dst: Reg64, src: Mem64) {
+        self.dump
+            .push(format!("mov {}d, dword {}", dst.name(), mem_name(src)));
+        self.emit_reg_mem_width(0x8B, dst, src, false);
+    }
+
+    pub fn movzx_reg_mem8(&mut self, dst: Reg64, src: Mem64) {
+        self.dump
+            .push(format!("movzx {}, byte {}", dst.name(), mem_name(src)));
+        emit_rex(&mut self.bytes, true, Some(dst), src.index, Some(src.base));
+        self.bytes.extend_from_slice(&[0x0F, 0xB6]);
+        emit_mem_modrm(&mut self.bytes, dst.low3(), src);
+    }
+
     pub fn mov_mem_reg(&mut self, dst: Mem64, src: Reg64) {
         self.dump
             .push(format!("mov {}, {}", mem_name(dst), src.name()));
         self.emit_mem_reg(0x89, dst, src);
+    }
+
+    pub fn mov_mem_reg32(&mut self, dst: Mem64, src: Reg64) {
+        self.dump
+            .push(format!("mov dword {}, {}d", mem_name(dst), src.name()));
+        self.emit_mem_reg_width(0x89, dst, src, false);
     }
 
     pub fn add_reg_reg(&mut self, dst: Reg64, src: Reg64) {
@@ -322,6 +364,19 @@ impl Assembler {
         self.emit_reg_reg(0x39, lhs, rhs);
     }
 
+    pub fn cmp_reg_imm32(&mut self, lhs: Reg64, value: i32) {
+        self.dump.push(format!("cmp {}, {value:#x}", lhs.name()));
+        self.emit_reg_imm32(7, lhs, value);
+    }
+
+    pub fn test_reg_imm32(&mut self, reg: Reg64, value: i32) {
+        self.dump.push(format!("test {}, {value:#x}", reg.name()));
+        emit_rex(&mut self.bytes, true, None, None, Some(reg));
+        self.bytes.push(0xF7);
+        self.bytes.push(modrm(0b11, 0, reg.low3()));
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
     pub fn and_reg_reg(&mut self, dst: Reg64, src: Reg64) {
         self.dump
             .push(format!("and {}, {}", dst.name(), src.name()));
@@ -339,13 +394,63 @@ impl Assembler {
         self.emit_reg_reg(0x31, dst, src);
     }
 
+    pub fn and_reg_imm32(&mut self, dst: Reg64, value: i32) {
+        self.dump.push(format!("and {}, {value:#x}", dst.name()));
+        self.emit_reg_imm32(4, dst, value);
+    }
+
+    pub fn shr_reg_imm8(&mut self, dst: Reg64, value: u8) {
+        self.dump.push(format!("shr {}, {value}", dst.name()));
+        emit_rex(&mut self.bytes, true, None, None, Some(dst));
+        self.bytes
+            .extend_from_slice(&[0xC1, modrm(0b11, 5, dst.low3()), value]);
+    }
+
     pub fn jmp(&mut self, label: Label) -> Result<(), AsmError> {
+        self.emit_label_rel32(label, &[0xE9], "jmp")
+    }
+
+    pub fn jz(&mut self, label: Label) -> Result<(), AsmError> {
+        self.emit_label_rel32(label, &[0x0F, 0x84], "jz")
+    }
+
+    pub fn jnz(&mut self, label: Label) -> Result<(), AsmError> {
+        self.emit_label_rel32(label, &[0x0F, 0x85], "jnz")
+    }
+
+    pub fn ja(&mut self, label: Label) -> Result<(), AsmError> {
+        self.emit_label_rel32(label, &[0x0F, 0x87], "ja")
+    }
+
+    pub fn call_reg(&mut self, target: Reg64) {
+        self.dump.push(format!("call {}", target.name()));
+        emit_rex(&mut self.bytes, false, None, None, Some(target));
+        self.bytes.push(0xFF);
+        self.bytes.push(modrm(0b11, 2, target.low3()));
+    }
+
+    pub fn push_reg(&mut self, reg: Reg64) {
+        self.dump.push(format!("push {}", reg.name()));
+        self.push_reg_raw(reg);
+    }
+
+    pub fn pop_reg(&mut self, reg: Reg64) {
+        self.dump.push(format!("pop {}", reg.name()));
+        self.pop_reg_raw(reg);
+    }
+
+    fn emit_label_rel32(
+        &mut self,
+        label: Label,
+        opcode: &[u8],
+        mnemonic: &str,
+    ) -> Result<(), AsmError> {
         let index = label.0;
         if self.labels.get(index).is_none() {
             return Err(AsmError::InvalidLabel { label: label.0 });
         }
-        self.dump.push(format!("jmp .L{}", label.0));
-        self.bytes.push(0xE9);
+        self.dump.push(format!("{mnemonic} .L{}", label.0));
+        self.bytes.extend_from_slice(opcode);
         let offset = self.bytes.len();
         self.bytes.extend_from_slice(&0_i32.to_le_bytes());
         let next_ip = self.bytes.len();
@@ -374,19 +479,31 @@ impl Assembler {
     }
 
     fn emit_reg_reg(&mut self, opcode: u8, dst: Reg64, src: Reg64) {
-        emit_rex(&mut self.bytes, true, Some(src), None, Some(dst));
+        self.emit_reg_reg_width(opcode, dst, src, true);
+    }
+
+    fn emit_reg_reg_width(&mut self, opcode: u8, dst: Reg64, src: Reg64, wide: bool) {
+        emit_rex(&mut self.bytes, wide, Some(src), None, Some(dst));
         self.bytes.push(opcode);
         self.bytes.push(modrm(0b11, src.low3(), dst.low3()));
     }
 
     fn emit_reg_mem(&mut self, opcode: u8, dst: Reg64, src: Mem64) {
-        emit_rex(&mut self.bytes, true, Some(dst), None, Some(src.base));
+        self.emit_reg_mem_width(opcode, dst, src, true);
+    }
+
+    fn emit_reg_mem_width(&mut self, opcode: u8, dst: Reg64, src: Mem64, wide: bool) {
+        emit_rex(&mut self.bytes, wide, Some(dst), src.index, Some(src.base));
         self.bytes.push(opcode);
         emit_mem_modrm(&mut self.bytes, dst.low3(), src);
     }
 
     fn emit_mem_reg(&mut self, opcode: u8, dst: Mem64, src: Reg64) {
-        emit_rex(&mut self.bytes, true, Some(src), None, Some(dst.base));
+        self.emit_mem_reg_width(opcode, dst, src, true);
+    }
+
+    fn emit_mem_reg_width(&mut self, opcode: u8, dst: Mem64, src: Reg64, wide: bool) {
+        emit_rex(&mut self.bytes, wide, Some(src), dst.index, Some(dst.base));
         self.bytes.push(opcode);
         emit_mem_modrm(&mut self.bytes, src.low3(), dst);
     }
@@ -442,7 +559,7 @@ const fn modrm(mode: u8, reg: u8, rm: u8) -> u8 {
 fn emit_mem_modrm(bytes: &mut Vec<u8>, reg_field: u8, mem: Mem64) {
     let base = mem.base;
     let base_low = base.low3();
-    let needs_sib = matches!(base, Reg64::Rsp | Reg64::R12);
+    let needs_sib = mem.index.is_some() || matches!(base, Reg64::Rsp | Reg64::R12);
     let force_disp8_zero = mem.disp == 0 && matches!(base, Reg64::Rbp | Reg64::R13);
     let displacement = if mem.disp == 0 && !force_disp8_zero {
         Displacement::None
@@ -458,7 +575,8 @@ fn emit_mem_modrm(bytes: &mut Vec<u8>, reg_field: u8, mem: Mem64) {
     let rm = if needs_sib { 0b100 } else { base_low };
     bytes.push(modrm(mode, reg_field, rm));
     if needs_sib {
-        bytes.push((0b100 << 3) | base_low);
+        let index = mem.index.map_or(0b100, Reg64::low3);
+        bytes.push((index << 3) | base_low);
     }
 
     match displacement {
@@ -485,12 +603,17 @@ impl Displacement {
 }
 
 fn mem_name(mem: Mem64) -> String {
+    let index = mem
+        .index
+        .map_or_else(String::new, |index| format!("+{}", index.name()));
     match mem.disp.cmp(&0) {
-        std::cmp::Ordering::Equal => format!("[{}]", mem.base.name()),
-        std::cmp::Ordering::Greater => format!("[{}+{:#x}]", mem.base.name(), mem.disp),
+        std::cmp::Ordering::Equal => format!("[{}{index}]", mem.base.name()),
+        std::cmp::Ordering::Greater => {
+            format!("[{}{index}+{:#x}]", mem.base.name(), mem.disp)
+        }
         std::cmp::Ordering::Less => {
             let disp = i64::from(mem.disp).abs();
-            format!("[{}-{disp:#x}]", mem.base.name())
+            format!("[{}{index}-{disp:#x}]", mem.base.name())
         }
     }
 }
@@ -573,6 +696,25 @@ mod tests {
             &[
                 0x48, 0x89, 0x87, 0x00, 0x01, 0x00, 0x00, 0x48, 0x8B, 0x87, 0x00, 0x01, 0x00, 0x00,
                 0x48, 0x89, 0x45, 0xF8, 0x48, 0x8B, 0x44, 0x24, 0x10,
+            ]
+        );
+    }
+
+    #[test]
+    fn emits_indexed_and_width_specific_memory_bytes() {
+        let mut asm = Assembler::new();
+
+        asm.mov_reg_mem(Reg64::Rax, Mem64::indexed(Reg64::R14, Reg64::Rcx, 0));
+        asm.mov_mem_reg(Mem64::indexed(Reg64::R14, Reg64::Rax, 0), Reg64::Rcx);
+        asm.mov_reg_mem32(Reg64::Rax, Mem64::indexed(Reg64::R14, Reg64::Rcx, 0));
+        asm.movzx_reg_mem8(Reg64::Rcx, Mem64::indexed(Reg64::R13, Reg64::Rcx, 0));
+
+        let code = asm.finish().expect("assembler should finish");
+        assert_eq!(
+            code.bytes(),
+            &[
+                0x49, 0x8B, 0x04, 0x0E, 0x49, 0x89, 0x0C, 0x06, 0x41, 0x8B, 0x04, 0x0E, 0x49, 0x0F,
+                0xB6, 0x4C, 0x0D, 0x00,
             ]
         );
     }

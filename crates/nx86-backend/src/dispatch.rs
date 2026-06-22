@@ -23,6 +23,7 @@ use nx86_jit::PatchStage;
 use nx86_jit::{EmergencyJit, ExecError, ExecutableMemory, JitError, JitEvent};
 use nx86_object::NativeObject;
 use nx86_profile::{ProfileError, ProfileEvent, ProfileSink};
+use nx86_vmm::GuestMemory;
 #[cfg(any(
     test,
     all(
@@ -35,7 +36,10 @@ use nx86_x64_v4::ChainExitKind;
 use nx86_x64_v4::{ChainExit, LoweringError, NativeBlockState, lower_function};
 use thiserror::Error;
 
-use crate::{ChainStats, NativeOutcome, NativeStatus, call_generated_block, chain::ChainCache};
+use crate::{
+    ChainStats, NativeMemoryContext, NativeMemoryError, NativeOutcome, NativeStatus,
+    call_generated_block, chain::ChainCache,
+};
 
 /// Default cap on dispatched block calls, guarding against runaway loops.
 pub const DEFAULT_MAX_STEPS: usize = 10_000;
@@ -275,7 +279,32 @@ impl Dispatcher {
         initial: &CpuState,
         halt_reason: Option<&str>,
     ) -> Result<DispatchOutcome, DispatchError> {
+        self.run_with_memory(initial, halt_reason, None)
+    }
+
+    /// Run with guest memory attached for direct fastmem and checked slowmem
+    /// fallback.
+    pub fn run_in(
+        &mut self,
+        initial: &CpuState,
+        memory: &mut GuestMemory,
+        halt_reason: Option<&str>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.run_with_memory(initial, halt_reason, Some(memory))
+    }
+
+    fn run_with_memory(
+        &mut self,
+        initial: &CpuState,
+        halt_reason: Option<&str>,
+        memory: Option<&mut GuestMemory>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         let mut native = NativeBlockState::from_cpu_state(initial);
+        let (mut memory_context, fastmem_base, fastmem_permissions) = match memory {
+            Some(memory) => NativeMemoryContext::attached(memory),
+            None => (NativeMemoryContext::missing(), 0, 0),
+        };
+        memory_context.configure(&mut native, fastmem_base, fastmem_permissions);
         let mut jit_events = Vec::new();
         let mut steps = 0;
         let chain_stats_before = self.chains.stats();
@@ -285,6 +314,13 @@ impl Dispatcher {
             if let Some(block) = self.blocks.get(&pc) {
                 let patched_successor = block.patched_successor();
                 call_generated_block(&block.executable, &mut native)?;
+                if native.memory_fault != 0 {
+                    return Err(DispatchError::Memory(
+                        memory_context
+                            .take_failure()
+                            .unwrap_or(NativeMemoryError::MissingContext),
+                    ));
+                }
                 steps += 1;
                 if patched_successor.is_some() {
                     self.chains.record_native_entry();
@@ -571,6 +607,8 @@ pub enum DispatchError {
     EmergencyJit(#[from] JitError),
     #[error("runtime profile recording failed: {0}")]
     Profile(#[from] ProfileError),
+    #[error("native memory execution failed: {0}")]
+    Memory(#[from] NativeMemoryError),
     #[error("multiple native blocks use guest entry pc {pc:#x}")]
     DuplicateBlock { pc: u64 },
     #[error("dispatcher has no native blocks")]
@@ -600,6 +638,24 @@ pub fn run_dispatched_function(
     function: &Function,
     initial: &CpuState,
     interpreter_state: &CpuState,
+) -> NativeOutcome {
+    run_dispatched_function_with_memory(function, initial, interpreter_state, None)
+}
+
+pub fn run_dispatched_function_in(
+    function: &Function,
+    initial: &CpuState,
+    interpreter_state: &CpuState,
+    memory: &mut GuestMemory,
+) -> NativeOutcome {
+    run_dispatched_function_with_memory(function, initial, interpreter_state, Some(memory))
+}
+
+fn run_dispatched_function_with_memory(
+    function: &Function,
+    initial: &CpuState,
+    interpreter_state: &CpuState,
+    memory: Option<&mut GuestMemory>,
 ) -> NativeOutcome {
     // Lower first so a dump is available even when execution is unavailable
     // (e.g. on the Apple Silicon dev host), mirroring the single-block path.
@@ -642,7 +698,11 @@ pub fn run_dispatched_function(
         native_incoming: HashMap::new(),
     };
 
-    let outcome = match dispatcher.run(initial, None) {
+    let execution = match memory {
+        Some(memory) => dispatcher.run_in(initial, memory, None),
+        None => dispatcher.run(initial, None),
+    };
+    let outcome = match execution {
         Ok(outcome) => outcome,
         Err(error) => return NativeOutcome::error(dump, error),
     };

@@ -12,7 +12,7 @@
 //! `SVC` exit; indirect or out-of-range successors are recorded as
 //! [`EdgeKind::Unresolved`] and not followed. `BL`/call discovery (multiple
 //! functions from one image) arrives with broader decoder coverage; the seam is
-//! marked in [`explore`].
+//! marked in `explore`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -25,7 +25,7 @@ const INSTRUCTION_BYTES: u64 = 4;
 
 /// A read-only window over a contiguous block of guest code at a fixed base.
 ///
-/// Recovery reads one 4-byte word at a time through [`CodeView::word_bytes`],
+/// Recovery reads one 4-byte word at a time through `CodeView::word_bytes`,
 /// so addresses outside the window (or misaligned) decode as
 /// [`EdgeKind::Unresolved`] rather than panicking.
 #[derive(Clone, Copy, Debug)]

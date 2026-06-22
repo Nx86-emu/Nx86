@@ -1,7 +1,10 @@
+use std::{marker::PhantomData, ptr::NonNull};
+
 use nx86_cache::CacheManager;
 use nx86_core::guest::CpuState;
 use nx86_ir::{Function, Terminator};
 use nx86_jit::{ExecError, ExecutableMemory};
+use nx86_vmm::{GuestAddress, GuestMemory, VmmFault};
 use nx86_x64_v4::{LoweredBlock, LoweringError, NativeBlockState, lower_tiny_block};
 use thiserror::Error;
 
@@ -18,7 +21,7 @@ mod dispatch;
 pub use chain::{ChainStats, DEFAULT_CHAIN_THRESHOLD};
 pub use dispatch::{
     DEFAULT_MAX_STEPS, DispatchError, DispatchExit, DispatchOutcome, Dispatcher,
-    run_dispatched_function,
+    run_dispatched_function, run_dispatched_function_in,
 };
 
 pub const CRATE_NAME: &str = "nx86-backend";
@@ -81,6 +84,154 @@ pub struct NativeOutcome {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Error)]
+pub enum NativeMemoryError {
+    #[error("native guest memory operation has no attached GuestMemory")]
+    MissingContext,
+    #[error("native guest memory helper received unsupported access size {size}")]
+    InvalidSize { size: u64 },
+    #[error("native guest memory fault at guest pc {guest_pc:#x}: {source}")]
+    Vmm {
+        guest_pc: u64,
+        #[source]
+        source: VmmFault,
+    },
+}
+
+pub(crate) struct NativeMemoryContext<'a> {
+    memory: Option<NonNull<GuestMemory>>,
+    failure: Option<NativeMemoryError>,
+    _borrow: PhantomData<&'a mut GuestMemory>,
+}
+
+impl<'a> NativeMemoryContext<'a> {
+    pub(crate) fn attached(memory: &'a mut GuestMemory) -> (Self, u64, u64) {
+        let (base, permissions) = memory.fastmem_view().map_or((0, 0), |view| {
+            (
+                view.base_address() as u64,
+                view.permissions_address() as u64,
+            )
+        });
+        (
+            Self {
+                memory: Some(NonNull::from(memory)),
+                failure: None,
+                _borrow: PhantomData,
+            },
+            base,
+            permissions,
+        )
+    }
+
+    pub(crate) const fn missing() -> Self {
+        Self {
+            memory: None,
+            failure: None,
+            _borrow: PhantomData,
+        }
+    }
+
+    pub(crate) fn configure(
+        &mut self,
+        state: &mut NativeBlockState,
+        fastmem_base: u64,
+        fastmem_permissions: u64,
+    ) {
+        state.fastmem_base = fastmem_base;
+        state.fastmem_permissions = fastmem_permissions;
+        state.slowmem_context = self as *mut Self as u64;
+        state.slowmem_read = slowmem_read as *const () as usize as u64;
+        state.slowmem_write = slowmem_write as *const () as usize as u64;
+        state.slowmem_value = 0;
+        state.memory_fault = 0;
+    }
+
+    pub(crate) fn take_failure(&mut self) -> Option<NativeMemoryError> {
+        self.failure.take()
+    }
+}
+
+#[allow(unsafe_code)]
+extern "C" fn slowmem_read(
+    context: *mut NativeMemoryContext<'_>,
+    state: *mut NativeBlockState,
+    address: u64,
+    _value: u64,
+    size: u64,
+    guest_pc: u64,
+) -> u64 {
+    // SAFETY: generated code receives both pointers from `configure`; the call
+    // completes synchronously while their stack owners remain alive.
+    let (context, state) = unsafe { (&mut *context, &mut *state) };
+    let Some(memory) = context.memory else {
+        context.failure = Some(NativeMemoryError::MissingContext);
+        state.pc = guest_pc;
+        return 1;
+    };
+    let Ok(size) = usize::try_from(size) else {
+        context.failure = Some(NativeMemoryError::InvalidSize { size });
+        state.pc = guest_pc;
+        return 1;
+    };
+    if !matches!(size, 4 | 8) {
+        context.failure = Some(NativeMemoryError::InvalidSize { size: size as u64 });
+        state.pc = guest_pc;
+        return 1;
+    }
+    // SAFETY: the context owns the exclusive GuestMemory borrow for this run.
+    match unsafe { memory.as_ref() }.read(GuestAddress(address), size) {
+        Ok(bytes) => {
+            let mut value = [0u8; 8];
+            value[..size].copy_from_slice(&bytes);
+            state.slowmem_value = u64::from_le_bytes(value);
+            0
+        }
+        Err(source) => {
+            context.failure = Some(NativeMemoryError::Vmm { guest_pc, source });
+            state.pc = guest_pc;
+            1
+        }
+    }
+}
+
+#[allow(unsafe_code)]
+extern "C" fn slowmem_write(
+    context: *mut NativeMemoryContext<'_>,
+    state: *mut NativeBlockState,
+    address: u64,
+    value: u64,
+    size: u64,
+    guest_pc: u64,
+) -> u64 {
+    // SAFETY: generated code receives both pointers from `configure`; the call
+    // completes synchronously while their stack owners remain alive.
+    let (context, state) = unsafe { (&mut *context, &mut *state) };
+    let Some(mut memory) = context.memory else {
+        context.failure = Some(NativeMemoryError::MissingContext);
+        state.pc = guest_pc;
+        return 1;
+    };
+    let Ok(size) = usize::try_from(size) else {
+        context.failure = Some(NativeMemoryError::InvalidSize { size });
+        state.pc = guest_pc;
+        return 1;
+    };
+    if !matches!(size, 4 | 8) {
+        context.failure = Some(NativeMemoryError::InvalidSize { size: size as u64 });
+        state.pc = guest_pc;
+        return 1;
+    }
+    // SAFETY: the context owns the exclusive GuestMemory borrow for this run.
+    match unsafe { memory.as_mut() }.write(GuestAddress(address), &value.to_le_bytes()[..size]) {
+        Ok(()) => 0,
+        Err(source) => {
+            context.failure = Some(NativeMemoryError::Vmm { guest_pc, source });
+            state.pc = guest_pc;
+            1
+        }
+    }
+}
+
 impl NativeOutcome {
     #[must_use]
     pub const fn agrees(&self) -> bool {
@@ -102,6 +253,7 @@ impl NativeOutcome {
         let status = match &error {
             LoweringError::UnsupportedBlockCount { .. }
             | LoweringError::UnsupportedOp { .. }
+            | LoweringError::UnsupportedMemoryType { .. }
             | LoweringError::UnsupportedTerminator { .. } => NativeStatus::Unsupported,
             LoweringError::InvalidIr(_)
             | LoweringError::MissingResult { .. }
@@ -220,6 +372,26 @@ pub fn run_tiny_native_block(
     initial_state: &CpuState,
     interpreter_state: &CpuState,
 ) -> NativeOutcome {
+    run_tiny_native_block_with_memory(function, initial_state, interpreter_state, None)
+}
+
+/// Execute one lowered block with guest memory attached for fastmem and checked
+/// slowmem fallback.
+pub fn run_tiny_native_block_in(
+    function: &Function,
+    initial_state: &CpuState,
+    interpreter_state: &CpuState,
+    memory: &mut GuestMemory,
+) -> NativeOutcome {
+    run_tiny_native_block_with_memory(function, initial_state, interpreter_state, Some(memory))
+}
+
+fn run_tiny_native_block_with_memory(
+    function: &Function,
+    initial_state: &CpuState,
+    interpreter_state: &CpuState,
+    memory: Option<&mut GuestMemory>,
+) -> NativeOutcome {
     let lowered = match lower_tiny_block(function) {
         Ok(lowered) => lowered,
         Err(error) => return NativeOutcome::from_lowering_error(String::new(), error),
@@ -235,8 +407,21 @@ pub fn run_tiny_native_block(
     };
 
     let mut native_state = NativeBlockState::from_cpu_state(initial_state);
+    let (mut memory_context, fastmem_base, fastmem_permissions) = match memory {
+        Some(memory) => NativeMemoryContext::attached(memory),
+        None => (NativeMemoryContext::missing(), 0, 0),
+    };
+    memory_context.configure(&mut native_state, fastmem_base, fastmem_permissions);
     if let Err(error) = call_generated_block(&executable, &mut native_state) {
         return NativeOutcome::error(dump, error);
+    }
+    if native_state.memory_fault != 0 {
+        return NativeOutcome::error(
+            dump,
+            memory_context
+                .take_failure()
+                .unwrap_or(NativeMemoryError::MissingContext),
+        );
     }
 
     let final_state = native_state.apply_to_cpu_state(initial_state.clone(), halt_reason(function));
@@ -351,6 +536,57 @@ mod tests {
         assert_eq!(outcome.status, NativeStatus::Error);
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn native_memory_uses_fastmem_and_slowmem_fallback() {
+        use nx86_vmm::{GuestAddress, GuestMemory, PagePermissions};
+
+        let function = tiny_memory_function();
+        let initial = CpuState::new();
+        let mut expected = CpuState::new();
+        expected.set_x(0, 0x1122_3344_5566_7788);
+        expected.set_pc(20);
+        expected.halt("svc #0x0");
+
+        let mut fastmem = GuestMemory::new().expect("fastmem arena");
+        fastmem
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("fastmem page");
+        let fast = super::run_tiny_native_block_in(&function, &initial, &expected, &mut fastmem);
+        assert_eq!(
+            fast.status,
+            NativeStatus::MatchesInterpreter,
+            "{:?}",
+            fast.error
+        );
+        assert_eq!(
+            fastmem.read(GuestAddress(0x1000), 8).expect("stored bytes"),
+            0x1122_3344_5566_7788u64.to_le_bytes()
+        );
+
+        let mut slowmem = GuestMemory::new_logical();
+        slowmem
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("logical page");
+        let slow = super::run_tiny_native_block_in(&function, &initial, &expected, &mut slowmem);
+        assert_eq!(
+            slow.status,
+            NativeStatus::MatchesInterpreter,
+            "{:?}",
+            slow.error
+        );
+
+        let mut unmapped = GuestMemory::new().expect("fastmem arena");
+        let fault = super::run_tiny_native_block_in(&function, &initial, &expected, &mut unmapped);
+        assert_eq!(fault.status, NativeStatus::Error);
+        assert!(
+            fault
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not mapped"))
+        );
+    }
+
     #[test]
     fn native_object_round_trips_through_bytes() {
         let function = tiny_add_function();
@@ -456,6 +692,65 @@ mod tests {
                     reason: "svc #0x0".to_owned(),
                 },
                 terminator_address: 8,
+            }],
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn tiny_memory_function() -> Function {
+        Function {
+            name: "tiny_memory".to_owned(),
+            entry_address: 0,
+            value_count: 3,
+            deopt_points: Vec::new(),
+            blocks: vec![Block {
+                instructions: vec![
+                    Inst {
+                        result: Some(Value(0)),
+                        op: Op::Const {
+                            ty: Type::I64,
+                            value: 0x1000,
+                        },
+                        guest_address: 0,
+                    },
+                    Inst {
+                        result: Some(Value(1)),
+                        op: Op::Const {
+                            ty: Type::I64,
+                            value: 0x1122_3344_5566_7788,
+                        },
+                        guest_address: 4,
+                    },
+                    Inst {
+                        result: None,
+                        op: Op::Store {
+                            ty: Type::I64,
+                            address: Value(0),
+                            value: Value(1),
+                        },
+                        guest_address: 8,
+                    },
+                    Inst {
+                        result: Some(Value(2)),
+                        op: Op::Load {
+                            ty: Type::I64,
+                            address: Value(0),
+                        },
+                        guest_address: 12,
+                    },
+                    Inst {
+                        result: None,
+                        op: Op::SetReg {
+                            reg: Reg::X(0),
+                            value: Value(2),
+                        },
+                        guest_address: 12,
+                    },
+                ],
+                terminator: Terminator::Halt {
+                    reason: "svc #0x0".to_owned(),
+                },
+                terminator_address: 16,
             }],
         }
     }
