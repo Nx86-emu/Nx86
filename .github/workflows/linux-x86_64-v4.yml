@@ -112,7 +112,10 @@ jobs:
           NOTE
 
           tar -czf "dist/${RELEASE_NAME}.tar.gz" -C dist "$RELEASE_NAME"
-          sha256sum "dist/${RELEASE_NAME}.tar.gz" > "dist/${RELEASE_NAME}.tar.gz.sha256"
+          (
+            cd dist
+            sha256sum "${RELEASE_NAME}.tar.gz" > "${RELEASE_NAME}.tar.gz.sha256"
+          )
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
