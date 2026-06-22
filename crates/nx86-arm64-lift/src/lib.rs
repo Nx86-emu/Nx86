@@ -17,6 +17,12 @@ use nx86_ir::verify::{self, VerifyError};
 use nx86_ir::{BinaryOp, Block, BlockId, FlagOp, Function, Inst, Op, Reg, Terminator, Type, Value};
 use thiserror::Error;
 
+pub mod recover;
+
+pub use recover::{
+    CodeView, EdgeKind, RecoverError, RecoveredBlock, RecoveredCfg, RecoveredFunction, recover_cfg,
+};
+
 #[derive(Debug, Error)]
 pub enum LiftError {
     #[error("branch at {address:#x} targets {target:#x}, which is not an instruction boundary")]

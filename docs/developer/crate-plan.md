@@ -26,7 +26,9 @@ rendering.
 - `nx86-title-db`: SQLite title database, deterministic title folder creation, and TOML sidecars.
 - `nx86-arm64-decode`: narrow decoder for MOV/ADD/SUB/logical/loads/stores/B/B.cond/ADDS/SUBS/SVC.
 - `nx86-ir`: NxIR data model (module/function/block/SSA values) and the verifier.
-- `nx86-arm64-lift`: AArch64 → NxIR lifter with basic-block CFG construction.
+- `nx86-arm64-lift`: AArch64 → NxIR lifter with basic-block CFG construction,
+  plus recursive-descent CFG recovery (`recover`) that derives blocks and
+  function candidates from an entry PC for the Inspector.
 - `nx86-ir-opt`: NxIR optimization passes (dead-flag elimination).
 - `nx86-runtime`: tiny synthetic interpreter (with guest memory), NxIR evaluator, native backend attempt, and the differential synthetic-test harness.
 - `nx86-backend`: native execution orchestration, interpreter comparison, and the multi-block dispatcher with emergency-JIT fallback.
