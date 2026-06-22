@@ -10,7 +10,7 @@ use thiserror::Error;
 
 mod eval;
 
-pub use eval::{EvalError, evaluate};
+pub use eval::{EvalError, EvalOutcome, evaluate};
 pub use nx86_backend::{NativeOutcome, NativeStatus};
 
 #[derive(Clone, Debug)]
@@ -363,8 +363,10 @@ fn evaluate_verified_nxir(
         };
     }
 
+    // Lifted programs never contain guards, so evaluation always exits normally;
+    // take the reconstructed state either way.
     let nxir_state = match evaluate(function, &mut memory) {
-        Ok(state) => state,
+        Ok(outcome) => outcome.into_state(),
         Err(error) => {
             return NxirOutcome {
                 dump,

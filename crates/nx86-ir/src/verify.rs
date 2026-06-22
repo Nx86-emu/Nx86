@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use thiserror::Error;
 
-use crate::{BlockId, Function, Module, Type, Value};
+use crate::{BlockId, DeoptId, Function, Module, Terminator, Type, Value};
 
 /// A well-formedness error found by the verifier.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -35,6 +35,8 @@ pub enum VerifyError {
     UnexpectedResult { value: Value },
     #[error("branch targets block{} but the function has {block_count} block(s)", target.0)]
     BranchTargetOutOfRange { target: BlockId, block_count: usize },
+    #[error("guard targets deopt{} but the function has {count} deopt point(s)", deopt.0)]
+    DeoptPointOutOfRange { deopt: DeoptId, count: usize },
     #[error("multiple blocks use guest entry address {entry_address:#x}")]
     DuplicateBlockEntry { entry_address: u64 },
     #[error(
@@ -130,6 +132,18 @@ pub fn verify(function: &Function) -> Result<(), VerifyError> {
                 });
             }
         }
+
+        // A guard's deopt side-exit must reference a real deopt point. This is
+        // the "no guard without recovery" rule (SPEC §20.1): a verified guard can
+        // never fail to find its recovery metadata.
+        if let Terminator::Guard { deopt, .. } = &block.terminator
+            && deopt.0 as usize >= function.deopt_points.len()
+        {
+            return Err(VerifyError::DeoptPointOutOfRange {
+                deopt: *deopt,
+                count: function.deopt_points.len(),
+            });
+        }
     }
 
     Ok(())
@@ -138,13 +152,40 @@ pub fn verify(function: &Function) -> Result<(), VerifyError> {
 #[cfg(test)]
 mod tests {
     use super::{VerifyError, verify};
-    use crate::{BinaryOp, Block, Function, Inst, Op, Reg, Terminator, Type, Value};
+    use crate::{
+        BinaryOp, Block, BlockId, Cond, DeoptId, DeoptPoint, Function, Inst, Op, Reg, Terminator,
+        Type, Value,
+    };
+
+    /// A two-block function whose entry block ends in a guard: it passes to
+    /// block1 or side-exits to deopt point 0.
+    fn guard_function() -> Function {
+        let mut function = valid_function();
+        function.blocks.push(Block {
+            instructions: Vec::new(),
+            terminator: Terminator::Halt {
+                reason: "pass".to_owned(),
+            },
+            terminator_address: 0x8,
+        });
+        function.blocks[0].terminator = Terminator::Guard {
+            cond: Cond::Eq,
+            if_pass: BlockId(1),
+            deopt: DeoptId(0),
+        };
+        function.deopt_points = vec![DeoptPoint {
+            resume_pc: 0x100,
+            reason: "guard:eq".to_owned(),
+        }];
+        function
+    }
 
     fn valid_function() -> Function {
         Function {
             name: "add".to_owned(),
             entry_address: 0,
             value_count: 3,
+            deopt_points: Vec::new(),
             blocks: vec![Block {
                 instructions: vec![
                     Inst {
@@ -199,6 +240,7 @@ mod tests {
             entry_address: 0,
             value_count: 0,
             blocks: Vec::new(),
+            deopt_points: Vec::new(),
         };
         assert!(matches!(
             verify(&function),
@@ -299,7 +341,43 @@ mod tests {
     fn out_of_range_branch_is_rejected() {
         let mut function = valid_function();
         function.blocks[0].terminator = Terminator::Branch {
-            target: crate::BlockId(5),
+            target: BlockId(5),
+        };
+        assert!(matches!(
+            verify(&function),
+            Err(VerifyError::BranchTargetOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn valid_guard_passes() {
+        assert_eq!(verify(&guard_function()), Ok(()));
+    }
+
+    #[test]
+    fn guard_with_unknown_deopt_point_is_rejected() {
+        let mut function = guard_function();
+        function.blocks[0].terminator = Terminator::Guard {
+            cond: Cond::Eq,
+            if_pass: BlockId(1),
+            deopt: DeoptId(1), // only deopt0 exists
+        };
+        assert!(matches!(
+            verify(&function),
+            Err(VerifyError::DeoptPointOutOfRange {
+                deopt: DeoptId(1),
+                count: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn guard_with_out_of_range_pass_target_is_rejected() {
+        let mut function = guard_function();
+        function.blocks[0].terminator = Terminator::Guard {
+            cond: Cond::Eq,
+            if_pass: BlockId(5),
+            deopt: DeoptId(0),
         };
         assert!(matches!(
             verify(&function),

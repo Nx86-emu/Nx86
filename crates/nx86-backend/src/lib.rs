@@ -256,7 +256,10 @@ fn halt_reason(function: &Function) -> Option<&str> {
     let block = function.blocks.first()?;
     match &block.terminator {
         Terminator::Halt { reason } => Some(reason.as_str()),
-        Terminator::Branch { .. } | Terminator::CondBranch { .. } | Terminator::Return => None,
+        Terminator::Branch { .. }
+        | Terminator::CondBranch { .. }
+        | Terminator::Guard { .. }
+        | Terminator::Return => None,
     }
 }
 
@@ -396,6 +399,7 @@ mod tests {
             name: "tiny_add".to_owned(),
             entry_address: 0,
             value_count: 4,
+            deopt_points: Vec::new(),
             blocks: vec![Block {
                 instructions: vec![
                     Inst {
@@ -462,6 +466,7 @@ mod tests {
             name: "two_block".to_owned(),
             entry_address: 0,
             value_count: 2,
+            deopt_points: Vec::new(),
             blocks: vec![
                 Block {
                     instructions: vec![
@@ -613,6 +618,7 @@ mod tests {
             name: "two_halts".to_owned(),
             entry_address: 0,
             value_count: 0,
+            deopt_points: Vec::new(),
             blocks: vec![
                 Block {
                     instructions: Vec::new(),
@@ -809,6 +815,7 @@ mod tests {
             name: "bad_reg".to_owned(),
             entry_address: 0,
             value_count: 1,
+            deopt_points: Vec::new(),
             blocks: vec![Block {
                 instructions: vec![Inst {
                     result: Some(Value(0)),

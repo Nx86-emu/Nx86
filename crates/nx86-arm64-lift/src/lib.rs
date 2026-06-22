@@ -166,6 +166,7 @@ pub fn lift_program(
         entry_address,
         blocks,
         value_count: value_counter,
+        deopt_points: Vec::new(),
     };
     verify::verify(&function)?;
     Ok(function)

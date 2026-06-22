@@ -25,7 +25,9 @@ rendering.
 - `nx86-core`: shared config, storage layout, IPC model, guest CPU state, flag (NZCV) and condition-code semantics, and Linux XDG-backed persistence.
 - `nx86-title-db`: SQLite title database, deterministic title folder creation, TOML sidecars, and synthetic-program title content for the Inspector.
 - `nx86-arm64-decode`: narrow decoder for MOV/ADD/SUB/logical/loads/stores/B/B.cond/ADDS/SUBS/SVC.
-- `nx86-ir`: NxIR data model (module/function/block/SSA values) and the verifier.
+- `nx86-ir`: NxIR data model (module/function/block/SSA values), the verifier,
+  and speculation primitives — a guard terminator with a per-function deopt-point
+  table (Phase 28).
 - `nx86-arm64-lift`: AArch64 → NxIR lifter with basic-block CFG construction,
   plus recursive-descent CFG recovery (`recover`) that derives blocks and
   function candidates from an entry PC for the Inspector.
@@ -34,7 +36,7 @@ rendering.
   program's bytes and entry PC it produces disassembly, the recovered CFG, the
   lifted NxIR dump, and the native (x86_64) mapping, degrading gracefully when
   lifting or lowering is unavailable.
-- `nx86-runtime`: tiny synthetic interpreter (with guest memory), NxIR evaluator, native backend attempt, and the differential synthetic-test harness.
+- `nx86-runtime`: tiny synthetic interpreter (with guest memory), NxIR evaluator (with guard/deopt routing via `EvalOutcome`), native backend attempt, and the differential synthetic-test harness.
 - `nx86-backend`: native execution orchestration, interpreter comparison, and the multi-block dispatcher with emergency-JIT fallback.
 - `nx86-x64-asm`: internal x86_64 assembler API, labels, code buffer, and dump.
 - `nx86-jit`: Linux x86_64 executable memory, trusted generated-code call wrappers, and on-demand single-block compilation into the object cache.

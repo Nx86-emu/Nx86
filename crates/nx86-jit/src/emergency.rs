@@ -79,6 +79,7 @@ impl EmergencyJit {
             nx86_ir::Terminator::Halt { reason } => Some(reason.clone()),
             nx86_ir::Terminator::Branch { .. }
             | nx86_ir::Terminator::CondBranch { .. }
+            | nx86_ir::Terminator::Guard { .. }
             | nx86_ir::Terminator::Return => None,
         };
         Ok(Some(JitCompilation {
@@ -151,6 +152,7 @@ mod tests {
             name: "jit_two_block".to_owned(),
             entry_address: 0,
             value_count: 2,
+            deopt_points: Vec::new(),
             blocks: vec![
                 Block {
                     instructions: vec![

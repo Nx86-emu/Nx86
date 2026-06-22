@@ -244,7 +244,10 @@ fn function_halt_reasons(function: &Function) -> BTreeMap<u64, String> {
         .iter()
         .filter_map(|block| match &block.terminator {
             Terminator::Halt { reason } => Some((block.entry_address(), reason.clone())),
-            Terminator::Branch { .. } | Terminator::CondBranch { .. } | Terminator::Return => None,
+            Terminator::Branch { .. }
+            | Terminator::CondBranch { .. }
+            | Terminator::Guard { .. }
+            | Terminator::Return => None,
         })
         .collect()
 }

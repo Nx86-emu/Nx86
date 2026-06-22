@@ -73,6 +73,7 @@ mod tests {
             name: "two-cmp".to_owned(),
             entry_address: 0,
             value_count: 4,
+            deopt_points: Vec::new(),
             blocks: vec![
                 Block {
                     instructions: vec![
@@ -126,6 +127,7 @@ mod tests {
             name: "one-cmp".to_owned(),
             entry_address: 0,
             value_count: 2,
+            deopt_points: Vec::new(),
             blocks: vec![Block {
                 instructions: vec![
                     const_i64(Value(0), 1, 0x0),

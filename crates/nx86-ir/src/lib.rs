@@ -27,6 +27,11 @@ pub struct Value(pub u32);
 #[serde(transparent)]
 pub struct BlockId(pub u32);
 
+/// Index of a [`DeoptPoint`] within a [`Function`]'s deopt table.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct DeoptId(pub u32);
+
 /// NxIR value types.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -174,12 +179,25 @@ pub enum Terminator {
     /// Synthetic program exit (guest `SVC`). `pc` becomes the address after the
     /// halting instruction.
     Halt { reason: String },
+    /// Speculative guard (Phase 28). Materializes NZCV from the current lazy flag
+    /// source and tests `cond`. If it holds, control continues to `if_pass`;
+    /// otherwise the guard fails and control side-exits to the deopt point
+    /// `deopt`, which reconstructs guest-visible state and resumes. A guard is a
+    /// terminator because a failed guard transfers control, and NxIR blocks carry
+    /// exactly one terminator.
+    Guard {
+        cond: Cond,
+        if_pass: BlockId,
+        deopt: DeoptId,
+    },
     /// Return from the function.
     Return,
 }
 
 impl Terminator {
-    /// The block targets this terminator may branch to.
+    /// The block targets this terminator may branch to. The deopt side-exit of a
+    /// [`Self::Guard`] is **not** a block successor — it leaves the function for
+    /// the deopt handler, like [`Self::Halt`].
     #[must_use]
     pub fn successors(&self) -> Vec<BlockId> {
         match self {
@@ -187,9 +205,24 @@ impl Terminator {
             Self::CondBranch {
                 if_true, if_false, ..
             } => vec![*if_true, *if_false],
+            Self::Guard { if_pass, .. } => vec![*if_pass],
             Self::Halt { .. } | Self::Return => Vec::new(),
         }
     }
+}
+
+/// A deopt point: where speculative execution recovers when a [`Terminator::Guard`]
+/// fails. v0 records the guest PC to resume at plus a human-readable reason; the
+/// live evaluator already holds the rest of the guest-visible state. Full
+/// register/slot reconstruction metadata and object/sidecar persistence arrive
+/// with native guard emission in a later phase.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct DeoptPoint {
+    /// Guest PC the deopt handler resumes execution at.
+    pub resume_pc: u64,
+    /// Why this deopt point exists (for diagnostics and the Inspector).
+    pub reason: String,
 }
 
 /// A basic block: straight-line instructions ending in one terminator.
@@ -221,6 +254,11 @@ pub struct Function {
     pub entry_address: u64,
     pub blocks: Vec<Block>,
     pub value_count: u32,
+    /// Deopt table: side-exit recovery points referenced by [`Terminator::Guard`]
+    /// via [`DeoptId`]. Empty for functions without guards (lifted code never
+    /// emits guards; they come from later speculative optimization).
+    #[serde(default)]
+    pub deopt_points: Vec<DeoptPoint>,
 }
 
 impl Function {
@@ -235,6 +273,13 @@ impl Function {
                 let _ = writeln!(output, "    {}", format_inst(inst));
             }
             let _ = writeln!(output, "    {}", format_terminator(&block.terminator));
+        }
+        for (index, point) in self.deopt_points.iter().enumerate() {
+            let _ = writeln!(
+                output,
+                "  deopt{index}: resume @{:#x} {:?}",
+                point.resume_pc, point.reason
+            );
         }
         output
     }
@@ -340,6 +385,16 @@ fn format_terminator(terminator: &Terminator) -> String {
             if_false.0
         ),
         Terminator::Halt { reason } => format!("halt {reason:?}"),
+        Terminator::Guard {
+            cond,
+            if_pass,
+            deopt,
+        } => format!(
+            "guard.{} block{} else deopt{}",
+            cond.suffix(),
+            if_pass.0,
+            deopt.0
+        ),
         Terminator::Return => "ret".to_owned(),
     }
 }
@@ -356,6 +411,7 @@ mod tests {
             name: "add".to_owned(),
             entry_address: 0,
             value_count: 4,
+            deopt_points: Vec::new(),
             blocks: vec![Block {
                 instructions: vec![
                     Inst {
@@ -438,6 +494,50 @@ mod tests {
     }
 
     #[test]
+    fn guard_and_deopt_table_render_and_round_trip() {
+        use super::{BlockId, Cond, DeoptId, DeoptPoint};
+
+        let function = Function {
+            name: "guarded".to_owned(),
+            entry_address: 0,
+            value_count: 0,
+            deopt_points: vec![DeoptPoint {
+                resume_pc: 0x1234,
+                reason: "guard:eq".to_owned(),
+            }],
+            blocks: vec![
+                Block {
+                    instructions: Vec::new(),
+                    terminator: Terminator::Guard {
+                        cond: Cond::Eq,
+                        if_pass: BlockId(1),
+                        deopt: DeoptId(0),
+                    },
+                    terminator_address: 0x0,
+                },
+                Block {
+                    instructions: Vec::new(),
+                    terminator: Terminator::Return,
+                    terminator_address: 0x4,
+                },
+            ],
+        };
+
+        let dump = function.dump();
+        assert!(dump.contains("guard.eq block1 else deopt0"), "{dump}");
+        assert!(
+            dump.contains("deopt0: resume @0x1234 \"guard:eq\""),
+            "{dump}"
+        );
+        // The guard's pass edge is its only block successor; the deopt is a side-exit.
+        assert_eq!(function.blocks[0].terminator.successors(), vec![BlockId(1)]);
+
+        let json = serde_json::to_string(&function).expect("function should serialize");
+        let decoded: Function = serde_json::from_str(&json).expect("function should deserialize");
+        assert_eq!(decoded, function);
+    }
+
+    #[test]
     fn op_metadata_is_consistent() {
         let binary = Op::Binary {
             op: BinaryOp::Add,
@@ -470,6 +570,7 @@ mod tests {
             name: "cmp".to_owned(),
             entry_address: 0,
             value_count: 2,
+            deopt_points: Vec::new(),
             blocks: vec![
                 Block {
                     instructions: vec![
@@ -530,6 +631,7 @@ mod tests {
             name: "branch".to_owned(),
             entry_address: 0,
             value_count: 0,
+            deopt_points: Vec::new(),
             blocks: vec![
                 Block {
                     instructions: Vec::new(),

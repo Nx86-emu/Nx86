@@ -6,7 +6,7 @@
 //! memory for every synthetic program.
 
 use nx86_core::guest::{CpuState, Nzcv};
-use nx86_ir::{BinaryOp, FlagOp, Function, Inst, Op, Reg, Terminator, Type, Value};
+use nx86_ir::{BinaryOp, DeoptId, FlagOp, Function, Inst, Op, Reg, Terminator, Type, Value};
 use nx86_vmm::{GuestAddress, GuestMemory, VmmFault};
 use thiserror::Error;
 
@@ -28,11 +28,53 @@ pub enum EvalError {
     UnsupportedMemoryType { ty: Type },
     #[error("memory fault: {0}")]
     Memory(#[from] VmmFault),
+    #[error("guard failed but deopt{} does not exist", deopt.0)]
+    DeoptFailure { deopt: DeoptId },
 }
 
-/// Evaluate a verified NxIR function against `memory`, returning the final
-/// guest CPU state.
-pub fn evaluate(function: &Function, memory: &mut GuestMemory) -> Result<CpuState, EvalError> {
+/// How NxIR evaluation finished. Deopt is a translator-internal recovery exit
+/// (a failed speculative guard), not guest-visible architectural state, so it is
+/// reported here rather than on [`CpuState`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EvalOutcome {
+    /// The program exited normally — a guest `SVC` halt or a function return.
+    Exit(CpuState),
+    /// A guard failed and control routed to its deopt point. `state` is the
+    /// reconstructed guest-visible state at the deopt point's `resume_pc`.
+    Deopt {
+        state: CpuState,
+        deopt: DeoptId,
+        reason: String,
+    },
+}
+
+impl EvalOutcome {
+    /// The reconstructed guest state, regardless of how evaluation finished.
+    #[must_use]
+    pub const fn state(&self) -> &CpuState {
+        match self {
+            Self::Exit(state) | Self::Deopt { state, .. } => state,
+        }
+    }
+
+    /// Consume the outcome and take the reconstructed guest state.
+    #[must_use]
+    pub fn into_state(self) -> CpuState {
+        match self {
+            Self::Exit(state) | Self::Deopt { state, .. } => state,
+        }
+    }
+
+    /// Whether evaluation finished by routing a failed guard to its deopt point.
+    #[must_use]
+    pub const fn is_deopt(&self) -> bool {
+        matches!(self, Self::Deopt { .. })
+    }
+}
+
+/// Evaluate a verified NxIR function against `memory`, returning how it finished
+/// (a normal exit or a guard-driven deopt) and the reconstructed guest state.
+pub fn evaluate(function: &Function, memory: &mut GuestMemory) -> Result<EvalOutcome, EvalError> {
     let mut cpu = CpuState::new();
     cpu.set_pc(function.entry_address);
     let mut values = vec![0u64; function.value_count as usize];
@@ -65,15 +107,45 @@ pub fn evaluate(function: &Function, memory: &mut GuestMemory) -> Result<CpuStat
                 };
                 block_index = taken.0 as usize;
             }
+            Terminator::Guard {
+                cond,
+                if_pass,
+                deopt,
+            } => {
+                // Same lazy-flag materialization as a conditional branch. If the
+                // guard holds, fall through to `if_pass`; otherwise it failed and
+                // control side-exits to the deopt handler.
+                let nzcv = materialize(pending_flags);
+                cpu.set_nzcv(nzcv);
+                if nzcv.satisfies(*cond) {
+                    block_index = if_pass.0 as usize;
+                } else {
+                    // Route to the deopt point, reconstructing the resume PC. A
+                    // missing point is a deopt failure: crash loudly rather than
+                    // continue with unrecovered state (SPEC §20.4). A verified
+                    // function can never reach this — the verifier range-checks
+                    // every guard's `DeoptId`.
+                    let point = function
+                        .deopt_points
+                        .get(deopt.0 as usize)
+                        .ok_or(EvalError::DeoptFailure { deopt: *deopt })?;
+                    cpu.set_pc(point.resume_pc);
+                    return Ok(EvalOutcome::Deopt {
+                        state: cpu,
+                        deopt: *deopt,
+                        reason: point.reason.clone(),
+                    });
+                }
+            }
             Terminator::Halt { reason } => {
                 cpu.set_nzcv(materialize(pending_flags));
                 cpu.set_pc(block.terminator_address + 4);
                 cpu.halt(reason.clone());
-                return Ok(cpu);
+                return Ok(EvalOutcome::Exit(cpu));
             }
             Terminator::Return => {
                 cpu.set_nzcv(materialize(pending_flags));
-                return Ok(cpu);
+                return Ok(EvalOutcome::Exit(cpu));
             }
         }
     }
@@ -224,4 +296,137 @@ fn store_mem(
         other => return Err(EvalError::UnsupportedMemoryType { ty: other }),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use nx86_ir::{
+        Block, BlockId, Cond, DeoptId, DeoptPoint, FlagOp, Function, Inst, Op, Terminator, Type,
+        Value,
+    };
+    use nx86_vmm::GuestMemory;
+
+    use super::{EvalError, EvalOutcome, evaluate};
+
+    const DEOPT_RESUME_PC: u64 = 0x2000;
+
+    /// A function that compares two constants and guards on equality:
+    ///
+    /// ```text
+    /// block0: v0 = const a; v1 = const b; setflags.subs v0, v1;
+    ///         guard.eq block1 else deopt0
+    /// block1: halt "passed"
+    /// ```
+    ///
+    /// When `with_point` is false the deopt table is empty, so a failing guard
+    /// has nowhere to recover (a deopt failure).
+    fn guard_eq_function(a: u64, b: u64, deopt: DeoptId, with_point: bool) -> Function {
+        let deopt_points = if with_point {
+            vec![DeoptPoint {
+                resume_pc: DEOPT_RESUME_PC,
+                reason: "guard:eq".to_owned(),
+            }]
+        } else {
+            Vec::new()
+        };
+        Function {
+            name: "guarded".to_owned(),
+            entry_address: 0,
+            value_count: 2,
+            deopt_points,
+            blocks: vec![
+                Block {
+                    instructions: vec![
+                        Inst {
+                            result: Some(Value(0)),
+                            op: Op::Const {
+                                ty: Type::I64,
+                                value: a,
+                            },
+                            guest_address: 0,
+                        },
+                        Inst {
+                            result: Some(Value(1)),
+                            op: Op::Const {
+                                ty: Type::I64,
+                                value: b,
+                            },
+                            guest_address: 0,
+                        },
+                        Inst {
+                            result: None,
+                            op: Op::SetFlags {
+                                op: FlagOp::Sub,
+                                lhs: Value(0),
+                                rhs: Value(1),
+                            },
+                            guest_address: 0,
+                        },
+                    ],
+                    terminator: Terminator::Guard {
+                        cond: Cond::Eq,
+                        if_pass: BlockId(1),
+                        deopt,
+                    },
+                    terminator_address: 0,
+                },
+                Block {
+                    instructions: Vec::new(),
+                    terminator: Terminator::Halt {
+                        reason: "passed".to_owned(),
+                    },
+                    terminator_address: 0x4,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn guard_that_holds_continues_to_pass_block() {
+        let function = guard_eq_function(5, 5, DeoptId(0), true);
+        let mut memory = GuestMemory::new_logical();
+
+        let outcome = evaluate(&function, &mut memory).expect("evaluation should succeed");
+
+        assert!(!outcome.is_deopt());
+        assert!(outcome.state().halted());
+        assert_eq!(outcome.state().halt_reason(), Some("passed"));
+    }
+
+    #[test]
+    fn failed_guard_routes_to_deopt_handler() {
+        let function = guard_eq_function(5, 3, DeoptId(0), true);
+        let mut memory = GuestMemory::new_logical();
+
+        let outcome = evaluate(&function, &mut memory).expect("evaluation should succeed");
+
+        let EvalOutcome::Deopt {
+            state,
+            deopt,
+            reason,
+        } = outcome
+        else {
+            panic!("expected a deopt, got {outcome:?}");
+        };
+        assert_eq!(deopt, DeoptId(0));
+        assert_eq!(reason, "guard:eq");
+        assert_eq!(state.pc(), DEOPT_RESUME_PC);
+        assert!(!state.halted());
+    }
+
+    #[test]
+    fn missing_deopt_point_is_a_deopt_failure() {
+        // The guard fails (5 != 3) and references deopt0, but the table is empty:
+        // there is no recovery metadata, so evaluation crashes loudly instead of
+        // continuing with unrecovered state.
+        let function = guard_eq_function(5, 3, DeoptId(0), false);
+        let mut memory = GuestMemory::new_logical();
+
+        let error = evaluate(&function, &mut memory).expect_err("deopt failure expected");
+
+        assert!(matches!(
+            error,
+            EvalError::DeoptFailure { deopt: DeoptId(0) }
+        ));
+    }
 }

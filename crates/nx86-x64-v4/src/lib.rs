@@ -281,6 +281,11 @@ where
                 terminator: "conditional branch",
             });
         }
+        Terminator::Guard { .. } => {
+            return Err(LoweringError::UnsupportedTerminator {
+                terminator: "guard",
+            });
+        }
     }
     Ok(())
 }
@@ -573,6 +578,50 @@ mod tests {
     }
 
     #[test]
+    fn lowering_rejects_guards_for_now() {
+        use nx86_ir::{Cond, DeoptId, DeoptPoint};
+
+        // A verified two-block guard function: native guard emission is deferred
+        // (it needs native flag materialization), so the lowerer reports it
+        // unsupported, exactly like a conditional branch.
+        let function = Function {
+            name: "guarded".to_owned(),
+            entry_address: 0,
+            value_count: 0,
+            deopt_points: vec![DeoptPoint {
+                resume_pc: 0x100,
+                reason: "guard:eq".to_owned(),
+            }],
+            blocks: vec![
+                Block {
+                    instructions: Vec::new(),
+                    terminator: Terminator::Guard {
+                        cond: Cond::Eq,
+                        if_pass: BlockId(1),
+                        deopt: DeoptId(0),
+                    },
+                    terminator_address: 0,
+                },
+                Block {
+                    instructions: Vec::new(),
+                    terminator: Terminator::Halt {
+                        reason: "passed".to_owned(),
+                    },
+                    terminator_address: 0x4,
+                },
+            ],
+        };
+
+        let error = lower_function(&function).expect_err("guards are not lowered yet");
+        assert!(matches!(
+            error,
+            super::LoweringError::UnsupportedTerminator {
+                terminator: "guard"
+            }
+        ));
+    }
+
+    #[test]
     fn lowers_block_with_spills() {
         // Seven values live at once exceed the six-register pool, forcing one
         // spill slot (rounded up to 16 bytes).
@@ -694,6 +743,7 @@ mod tests {
             name: "spill".to_owned(),
             entry_address: 0,
             value_count: 7,
+            deopt_points: Vec::new(),
             blocks: vec![Block {
                 instructions,
                 terminator: Terminator::Halt {
@@ -709,6 +759,7 @@ mod tests {
             name: "tiny_add".to_owned(),
             entry_address: 0,
             value_count: 4,
+            deopt_points: Vec::new(),
             blocks: vec![Block {
                 instructions: vec![
                     Inst {
@@ -775,6 +826,7 @@ mod tests {
             name: "two_block".to_owned(),
             entry_address: 0,
             value_count: 2,
+            deopt_points: Vec::new(),
             blocks: vec![
                 Block {
                     instructions: vec![
