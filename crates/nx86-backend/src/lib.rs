@@ -1379,7 +1379,7 @@ mod tests {
 
         let mut initial = CpuState::new();
         initial.set_pc(0);
-        let outcome = dispatcher.run(&initial, None).expect("run 2");
+        let outcome = dispatcher.run(&initial, Some("svc #0x0")).expect("run 2");
         assert_eq!(outcome.exit, super::DispatchExit::Halted);
         assert_eq!(outcome.final_state, two_block_expected_state());
         assert!(
