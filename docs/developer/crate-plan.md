@@ -18,18 +18,22 @@ implement real title import, Switch runtime execution, profile-guided
 rebuilding, native memory or conditional-branch lowering, graphics, or Switch
 rendering.
 
-## Active Phase 0-24 Crates
+## Active Phase 0-27 Crates
 
 - `nx86-app`: binary entrypoint, logging setup, config load, GUI launch.
-- `nx86-gui`: egui shell, wizard, theme, navigation, title list, worker progress, synthetic test display, decode display, tiny interpreter status, framebuffer rendering, and NxIR/native dump agreement.
+- `nx86-gui`: egui shell, wizard, theme, navigation, title list, worker progress, synthetic test display, decode display, tiny interpreter status, framebuffer rendering, NxIR/native dump agreement, and the Inspector screen (title-sourced disassembly, recovered CFG, NxIR, and native-mapping views).
 - `nx86-core`: shared config, storage layout, IPC model, guest CPU state, flag (NZCV) and condition-code semantics, and Linux XDG-backed persistence.
-- `nx86-title-db`: SQLite title database, deterministic title folder creation, and TOML sidecars.
+- `nx86-title-db`: SQLite title database, deterministic title folder creation, TOML sidecars, and synthetic-program title content for the Inspector.
 - `nx86-arm64-decode`: narrow decoder for MOV/ADD/SUB/logical/loads/stores/B/B.cond/ADDS/SUBS/SVC.
 - `nx86-ir`: NxIR data model (module/function/block/SSA values) and the verifier.
 - `nx86-arm64-lift`: AArch64 → NxIR lifter with basic-block CFG construction,
   plus recursive-descent CFG recovery (`recover`) that derives blocks and
   function candidates from an entry PC for the Inspector.
 - `nx86-ir-opt`: NxIR optimization passes (dead-flag elimination).
+- `nx86-inspector`: host-independent Inspector composition — from a guest
+  program's bytes and entry PC it produces disassembly, the recovered CFG, the
+  lifted NxIR dump, and the native (x86_64) mapping, degrading gracefully when
+  lifting or lowering is unavailable.
 - `nx86-runtime`: tiny synthetic interpreter (with guest memory), NxIR evaluator, native backend attempt, and the differential synthetic-test harness.
 - `nx86-backend`: native execution orchestration, interpreter comparison, and the multi-block dispatcher with emergency-JIT fallback.
 - `nx86-x64-asm`: internal x86_64 assembler API, labels, code buffer, and dump.

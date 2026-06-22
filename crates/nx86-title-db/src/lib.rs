@@ -33,12 +33,11 @@ impl TitleDatabase {
         title_id: TitleId,
         display_name: impl Into<String>,
     ) -> Result<TitleEntry, TitleDbError> {
-        let display_name = display_name.into();
         let now = unix_now();
         let title_root = self.layout.ensure_title_dirs(title_id.as_str())?;
         let entry = TitleEntry {
             title_id,
-            display_name,
+            display_name: display_name.into(),
             source_kind: TitleSourceKind::Placeholder,
             content_path: None,
             folder_path: title_root,
@@ -46,6 +45,61 @@ impl TitleDatabase {
             updated_at_unix_secs: now,
         };
 
+        self.insert_title(&entry)?;
+        write_sidecars(&entry)?;
+        Ok(entry)
+    }
+
+    /// Create a title backed by a synthetic test program.
+    ///
+    /// The caller-supplied `program_toml` is persisted verbatim under the
+    /// title's `content/` directory; parsing of the synthetic format stays in
+    /// the higher layers. Only the project's own synthetic format flows through
+    /// here — never copyrighted game dumps or firmware.
+    pub fn create_synthetic_title(
+        &self,
+        title_id: TitleId,
+        display_name: impl Into<String>,
+        program_toml: &str,
+    ) -> Result<TitleEntry, TitleDbError> {
+        let now = unix_now();
+        let title_root = self.layout.ensure_title_dirs(title_id.as_str())?;
+        let content_path = title_root.join(SYNTHETIC_CONTENT_FILE);
+        let entry = TitleEntry {
+            title_id,
+            display_name: display_name.into(),
+            source_kind: TitleSourceKind::Synthetic,
+            content_path: Some(content_path.clone()),
+            folder_path: title_root,
+            created_at_unix_secs: now,
+            updated_at_unix_secs: now,
+        };
+
+        // Insert first, so a duplicate title id fails before any file is written
+        // and never clobbers an existing title's content.
+        self.insert_title(&entry)?;
+        fs::write(&content_path, program_toml).map_err(|source| TitleDbError::WriteContent {
+            path: content_path,
+            source,
+        })?;
+        write_sidecars(&entry)?;
+        Ok(entry)
+    }
+
+    /// Read a title's stored content (e.g. the synthetic program TOML), if any.
+    pub fn read_content(&self, entry: &TitleEntry) -> Result<Option<String>, TitleDbError> {
+        let Some(content_path) = entry.content_path.as_ref() else {
+            return Ok(None);
+        };
+        let contents =
+            fs::read_to_string(content_path).map_err(|source| TitleDbError::ReadContent {
+                path: content_path.clone(),
+                source,
+            })?;
+        Ok(Some(contents))
+    }
+
+    fn insert_title(&self, entry: &TitleEntry) -> Result<(), TitleDbError> {
         self.connection.execute(
             "INSERT INTO titles (
                 title_id,
@@ -69,9 +123,7 @@ impl TitleDatabase {
                 entry.updated_at_unix_secs,
             ],
         )?;
-
-        write_sidecars(&entry)?;
-        Ok(entry)
+        Ok(())
     }
 
     pub fn list_titles(&self) -> Result<Vec<TitleEntry>, TitleDbError> {
@@ -219,6 +271,7 @@ impl From<TitleId> for String {
 #[serde(rename_all = "kebab-case")]
 pub enum TitleSourceKind {
     Placeholder,
+    Synthetic,
 }
 
 impl TitleSourceKind {
@@ -226,6 +279,7 @@ impl TitleSourceKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Placeholder => "placeholder",
+            Self::Synthetic => "synthetic",
         }
     }
 }
@@ -236,6 +290,7 @@ impl TryFrom<&str> for TitleSourceKind {
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
             "placeholder" => Ok(Self::Placeholder),
+            "synthetic" => Ok(Self::Synthetic),
             _ => Err(TitleDbError::InvalidSourceKind {
                 value: value.to_owned(),
             }),
@@ -298,7 +353,7 @@ fn write_sidecars(entry: &TitleEntry) -> Result<(), TitleDbError> {
     };
     let settings = TitleSettingsSidecar {
         import_enabled: false,
-        storage_mode: "placeholder".to_owned(),
+        storage_mode: entry.source_kind.as_str().to_owned(),
     };
 
     write_toml(entry.folder_path.join("title.nxmeta"), &meta)?;
@@ -333,6 +388,9 @@ fn read_toml<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, 
         source,
     })
 }
+
+/// Title-relative path where synthetic program content is persisted.
+const SYNTHETIC_CONTENT_FILE: &str = "content/program.nxsynth.toml";
 
 fn unix_now() -> i64 {
     SystemTime::now()
@@ -375,6 +433,16 @@ pub enum TitleDbError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to write title content {path}: {source}")]
+    WriteContent {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to read title content {path}: {source}")]
+    ReadContent {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 #[cfg(test)]
@@ -382,7 +450,7 @@ mod tests {
     use nx86_core::{config::StorageConfig, storage::StorageLayout};
     use tempfile::tempdir;
 
-    use super::{TitleDatabase, TitleDbError, TitleId};
+    use super::{TitleDatabase, TitleDbError, TitleId, TitleSourceKind};
 
     #[test]
     fn title_id_normalizes_uppercase() {
@@ -455,6 +523,95 @@ mod tests {
             .rewrite_sidecars(&title_id)
             .expect("sidecars should rewrite");
         assert_eq!(rewritten, sidecars);
+    }
+
+    #[test]
+    fn synthetic_title_persists_and_reads_back_content() {
+        let root = tempdir().expect("temp dir should be created");
+        let storage =
+            StorageConfig::from_roots(root.path().join("data"), root.path().join("cache"));
+        let layout = StorageLayout::from_config(root.path().join("config"), &storage);
+        let title_id = TitleId::parse("0100ABCD12345678").expect("title id should parse");
+        let program = "[program]\narm64-hex = \"20 00 80 D2\"\n";
+
+        let database = TitleDatabase::open(layout.clone()).expect("database should open");
+        let entry = database
+            .create_synthetic_title(title_id.clone(), "Synthetic Title", program)
+            .expect("synthetic title should be created");
+
+        assert_eq!(entry.source_kind, TitleSourceKind::Synthetic);
+        let content_path = entry
+            .content_path
+            .as_ref()
+            .expect("synthetic title carries content");
+        assert!(content_path.is_file());
+
+        let contents = database
+            .read_content(&entry)
+            .expect("content should read")
+            .expect("synthetic title has content");
+        assert_eq!(contents, program);
+
+        // The source kind survives a round-trip through the database and sidecar.
+        let reopened = TitleDatabase::open(layout).expect("database should reopen");
+        let listed = reopened.list_titles().expect("titles should list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source_kind, TitleSourceKind::Synthetic);
+        let sidecars = reopened
+            .read_sidecars(&title_id)
+            .expect("sidecars should read");
+        assert_eq!(sidecars.settings.storage_mode, "synthetic");
+    }
+
+    #[test]
+    fn duplicate_title_id_is_rejected_without_clobbering_content() {
+        let root = tempdir().expect("temp dir should be created");
+        let storage =
+            StorageConfig::from_roots(root.path().join("data"), root.path().join("cache"));
+        let layout = StorageLayout::from_config(root.path().join("config"), &storage);
+        let title_id = TitleId::parse("0100ABCD12345678").expect("title id should parse");
+        let original = "[program]\narm64-hex = \"20 00 80 D2\"\n";
+
+        let database = TitleDatabase::open(layout).expect("database should open");
+        let entry = database
+            .create_synthetic_title(title_id.clone(), "Original", original)
+            .expect("first title should be created");
+
+        // A second create with the same id must fail at the database insert and
+        // leave the already-stored content untouched (insert precedes the write).
+        let error = database
+            .create_synthetic_title(
+                title_id,
+                "Replacement",
+                "[program]\narm64-hex = \"FF FF\"\n",
+            )
+            .expect_err("duplicate title id should be rejected");
+        assert!(matches!(error, TitleDbError::Sqlite(_)));
+
+        let contents = database
+            .read_content(&entry)
+            .expect("content should read")
+            .expect("title still has content");
+        assert_eq!(contents, original);
+    }
+
+    #[test]
+    fn placeholder_title_has_no_content() {
+        let root = tempdir().expect("temp dir should be created");
+        let storage =
+            StorageConfig::from_roots(root.path().join("data"), root.path().join("cache"));
+        let layout = StorageLayout::from_config(root.path().join("config"), &storage);
+        let title_id = TitleId::parse("0100ABCD12345678").expect("title id should parse");
+        let database = TitleDatabase::open(layout).expect("database should open");
+        let entry = database
+            .create_placeholder(title_id, "Placeholder Title")
+            .expect("placeholder should be created");
+
+        assert!(entry.content_path.is_none());
+        assert_eq!(
+            database.read_content(&entry).expect("read should succeed"),
+            None
+        );
     }
 
     #[test]

@@ -15,6 +15,7 @@ use nx86_core::{
     ipc::{CancelledEvent, IpcEvent, WorkerKind, decode_event},
     storage::StorageLayout,
 };
+use nx86_inspector::inspect_program;
 use nx86_runtime::{NativeStatus, run_synthetic_test};
 use nx86_testsuite::SyntheticArm64Test;
 use nx86_title_db::{TitleDatabase, TitleEntry, TitleId};
@@ -89,6 +90,7 @@ pub struct Nx86App {
     library_ui: screens::LibraryUiState,
     compile_ui: screens::CompileUiState,
     test_ui: screens::TestUiState,
+    inspector_ui: screens::InspectorUiState,
     worker_process: Option<WorkerProcess>,
 }
 
@@ -113,6 +115,7 @@ impl Nx86App {
             library_ui: screens::LibraryUiState::default(),
             compile_ui: screens::CompileUiState::default(),
             test_ui: screens::TestUiState::default(),
+            inspector_ui: screens::InspectorUiState::default(),
             worker_process: None,
         };
         app.initialize_services_if_ready();
@@ -134,6 +137,7 @@ impl Nx86App {
             library_ui: screens::LibraryUiState::default(),
             compile_ui: screens::CompileUiState::default(),
             test_ui: screens::TestUiState::default(),
+            inspector_ui: screens::InspectorUiState::default(),
             worker_process: None,
         }
     }
@@ -264,6 +268,159 @@ impl Nx86App {
         }
     }
 
+    fn import_synthetic_title(&mut self) {
+        let Some(database) = &self.title_database else {
+            self.library_ui.message = Some("title database is not available".to_owned());
+            return;
+        };
+
+        let title_id = match TitleId::parse(&self.library_ui.new_title_id) {
+            Ok(title_id) => title_id,
+            Err(error) => {
+                self.library_ui.message = Some(error.to_string());
+                return;
+            }
+        };
+
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Nx86 synthetic ARM64 test", &["toml"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                self.library_ui.message = Some(error.to_string());
+                return;
+            }
+        };
+
+        // Validate it really is our synthetic format before storing it; only the
+        // project's own synthetic tests flow through here — never game dumps.
+        let test = match SyntheticArm64Test::parse(&source) {
+            Ok(test) => test,
+            Err(error) => {
+                self.library_ui.message = Some(format!("not a synthetic test: {error}"));
+                return;
+            }
+        };
+
+        let typed_name = self.library_ui.new_display_name.trim();
+        let display_name = if typed_name.is_empty() {
+            test.metadata.name.clone()
+        } else {
+            typed_name.to_owned()
+        };
+        if display_name.is_empty() {
+            self.library_ui.message = Some("display name is required".to_owned());
+            return;
+        }
+
+        match database.create_synthetic_title(title_id, display_name, &source) {
+            Ok(_) => {
+                self.library_ui.new_title_id.clear();
+                self.library_ui.new_display_name.clear();
+                self.library_ui.message = Some("synthetic title imported".to_owned());
+                self.refresh_titles();
+            }
+            Err(error) => {
+                self.library_ui.message = Some(error.to_string());
+            }
+        }
+    }
+
+    fn inspect_title(&mut self, title_id: &str) {
+        self.inspector_ui.message = None;
+        self.inspector_ui.selected_title = Some(title_id.to_owned());
+
+        let entry_and_content = {
+            let Some(database) = &self.title_database else {
+                self.inspector_ui.message = Some("title database is not available".to_owned());
+                return;
+            };
+            let parsed = match TitleId::parse(title_id) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    self.inspector_ui.message = Some(error.to_string());
+                    return;
+                }
+            };
+            let entry = match database.get_title(&parsed) {
+                Ok(Some(entry)) => entry,
+                Ok(None) => {
+                    self.inspector_ui.message = Some("title not found".to_owned());
+                    return;
+                }
+                Err(error) => {
+                    self.inspector_ui.message = Some(error.to_string());
+                    return;
+                }
+            };
+            match database.read_content(&entry) {
+                Ok(Some(content)) => (entry, content),
+                Ok(None) => {
+                    self.inspector_ui.view = None;
+                    self.inspector_ui.message = Some("title has no inspectable content".to_owned());
+                    return;
+                }
+                Err(error) => {
+                    self.inspector_ui.message = Some(error.to_string());
+                    return;
+                }
+            }
+        };
+
+        let (entry, content) = entry_and_content;
+        self.build_inspector_view(&entry, &content);
+    }
+
+    fn build_inspector_view(&mut self, entry: &TitleEntry, content: &str) {
+        let test = match SyntheticArm64Test::parse(content) {
+            Ok(test) => test,
+            Err(error) => {
+                self.inspector_ui.view = None;
+                self.inspector_ui.message =
+                    Some(format!("content is not a synthetic test: {error}"));
+                return;
+            }
+        };
+
+        let program_entry = match test.entry_point() {
+            Ok(entry) => entry,
+            Err(error) => {
+                self.inspector_ui.view = None;
+                self.inspector_ui.message = Some(format!("entry point failed: {error}"));
+                return;
+            }
+        };
+
+        match inspect_program(&test.program.bytes, program_entry) {
+            Ok(report) => {
+                self.inspector_ui.view = Some(screens::InspectorView {
+                    title_id: entry.title_id.to_string(),
+                    display_name: entry.display_name.clone(),
+                    source_kind: entry.source_kind.as_str().to_owned(),
+                    content_path: entry
+                        .content_path
+                        .as_ref()
+                        .map_or_else(|| "-".to_owned(), |path| path.display().to_string()),
+                    entry: report.entry,
+                    disassembly: report.disassembly_text(),
+                    functions: report.function_list_text(),
+                    cfg: report.cfg.to_string(),
+                    nxir: report.nxir_text(),
+                    native: report.native_text(),
+                });
+            }
+            Err(error) => {
+                self.inspector_ui.view = None;
+                self.inspector_ui.message = Some(format!("inspection failed: {error}"));
+            }
+        }
+    }
+
     fn complete_wizard(&mut self) {
         match self.config.complete_first_launch() {
             Ok(()) => {
@@ -346,6 +503,7 @@ impl Nx86App {
             ) {
                 screens::LibraryAction::None => {}
                 screens::LibraryAction::CreatePlaceholder => self.create_placeholder_title(),
+                screens::LibraryAction::ImportSynthetic => self.import_synthetic_title(),
                 screens::LibraryAction::Refresh => {
                     self.refresh_titles();
                     self.refresh_cache_status();
@@ -367,6 +525,12 @@ impl Nx86App {
                 screens::TestAction::PickFile => self.pick_synthetic_test_file(),
                 screens::TestAction::LoadPath => self.load_synthetic_test_from_state(),
             },
+            AppScreen::Inspector => {
+                match screens::inspector(ui, &self.titles, &mut self.inspector_ui) {
+                    screens::InspectorAction::None => {}
+                    screens::InspectorAction::Inspect(title_id) => self.inspect_title(&title_id),
+                }
+            }
             AppScreen::Settings => {
                 if screens::settings(ui, &mut self.config, self.storage_layout.as_ref()) {
                     theme::apply_theme(ui.ctx(), self.config.ui.theme_mode);
@@ -752,5 +916,49 @@ mod tests {
             status.contains("unavailable") || status.contains("matches interpreter")
         }));
         assert!(app.test_ui.native_dump.is_some());
+    }
+
+    #[test]
+    fn inspector_view_is_built_from_synthetic_content() {
+        use std::path::PathBuf;
+
+        use nx86_title_db::{TitleEntry, TitleId, TitleSourceKind};
+
+        let content = r#"
+            [metadata]
+            name = "inspector add"
+
+            [program]
+            arm64-hex = "20 00 80 D2 01 00 00 D4"
+
+            [expected.registers]
+            x0 = "0x1"
+            "#;
+        let entry = TitleEntry {
+            title_id: TitleId::parse("0100ABCD12345678").expect("title id should parse"),
+            display_name: "Inspector Add".to_owned(),
+            source_kind: TitleSourceKind::Synthetic,
+            content_path: Some(PathBuf::from("content/program.nxsynth.toml")),
+            folder_path: PathBuf::from("titles/0100ABCD12345678"),
+            created_at_unix_secs: 0,
+            updated_at_unix_secs: 0,
+        };
+        let mut app = Nx86App::new_for_test(AppConfig::default());
+
+        app.build_inspector_view(&entry, content);
+
+        let view = app
+            .inspector_ui
+            .view
+            .expect("inspector view should be built");
+        assert_eq!(view.title_id, "0100ABCD12345678");
+        assert_eq!(view.source_kind, "synthetic");
+        assert!(view.disassembly.contains("mov x0"));
+        assert!(!view.functions.is_empty());
+        assert!(!view.cfg.is_empty());
+        assert!(view.nxir.contains("fn inspected"));
+        // The native mapping is always populated — a real dump on hosts that can
+        // lower, or an "unavailable" reason otherwise; never empty.
+        assert!(!view.native.is_empty());
     }
 }

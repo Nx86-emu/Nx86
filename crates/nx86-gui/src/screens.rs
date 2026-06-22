@@ -22,6 +22,7 @@ pub struct LibraryUiState {
 pub enum LibraryAction {
     None,
     CreatePlaceholder,
+    ImportSynthetic,
     Refresh,
     ClearCache,
 }
@@ -104,6 +105,34 @@ pub enum TestAction {
     None,
     PickFile,
     LoadPath,
+}
+
+/// Pre-rendered Inspector views for one inspected title. The GUI layer builds
+/// these strings (from `nx86-inspector`) so this screen only renders text.
+pub struct InspectorView {
+    pub title_id: String,
+    pub display_name: String,
+    pub source_kind: String,
+    pub content_path: String,
+    pub entry: u64,
+    pub disassembly: String,
+    pub functions: String,
+    pub cfg: String,
+    pub nxir: String,
+    pub native: String,
+}
+
+#[derive(Default)]
+pub struct InspectorUiState {
+    pub selected_title: Option<String>,
+    pub message: Option<String>,
+    pub view: Option<InspectorView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InspectorAction {
+    None,
+    Inspect(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,6 +225,9 @@ pub fn library(
     ui.horizontal(|ui| {
         if ui.button("Create Placeholder").clicked() {
             action = LibraryAction::CreatePlaceholder;
+        }
+        if ui.button("Import Synthetic Test…").clicked() {
+            action = LibraryAction::ImportSynthetic;
         }
         if ui.button("Refresh").clicked() {
             action = LibraryAction::Refresh;
@@ -479,6 +511,109 @@ pub fn tests(ui: &mut egui::Ui, state: &mut TestUiState) -> TestAction {
     }
 
     action
+}
+
+pub fn inspector(
+    ui: &mut egui::Ui,
+    titles: &[TitleEntry],
+    state: &mut InspectorUiState,
+) -> InspectorAction {
+    screen_header(ui, "Inspector", "Phase 27");
+    ui.label("Inspect a title's recovered structure, NxIR, and native mapping.");
+
+    let mut action = InspectorAction::None;
+    if let Some(message) = &state.message {
+        ui.add_space(6.0);
+        ui.label(message);
+    }
+
+    ui.add_space(12.0);
+    ui.strong("Titles");
+    egui::Grid::new("inspector-titles")
+        .num_columns(4)
+        .min_col_width(130.0)
+        .spacing([20.0, 10.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("Title");
+            ui.strong("Title ID");
+            ui.strong("Source");
+            ui.strong("");
+            ui.end_row();
+
+            if titles.is_empty() {
+                ui.label("Library is empty");
+                ui.label("-");
+                ui.label("-");
+                ui.label("-");
+                ui.end_row();
+            }
+
+            for title in titles {
+                ui.label(&title.display_name);
+                ui.monospace(title.title_id.as_str());
+                ui.label(title.source_kind.as_str());
+                // Only titles that carry content (synthetic programs in v0) can
+                // be inspected; placeholders have nothing to decode.
+                if title.content_path.is_some() {
+                    if ui.button("Inspect").clicked() {
+                        action = InspectorAction::Inspect(title.title_id.as_str().to_owned());
+                    }
+                } else {
+                    ui.label("no content");
+                }
+                ui.end_row();
+            }
+        });
+
+    if let Some(view) = &state.view {
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(12.0);
+        ui.heading(&view.display_name);
+        egui::Grid::new("inspector-structure")
+            .num_columns(2)
+            .min_col_width(120.0)
+            .spacing([18.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Title ID");
+                ui.monospace(&view.title_id);
+                ui.end_row();
+                ui.label("Source");
+                ui.monospace(&view.source_kind);
+                ui.end_row();
+                ui.label("Content");
+                ui.monospace(&view.content_path);
+                ui.end_row();
+                ui.label("Entry");
+                ui.monospace(format!("{:#x}", view.entry));
+                ui.end_row();
+            });
+
+        inspector_dump(ui, "Disassembly", "inspector-disasm", &view.disassembly);
+        inspector_dump(ui, "Functions", "inspector-functions", &view.functions);
+        inspector_dump(ui, "Control-flow graph", "inspector-cfg", &view.cfg);
+        inspector_dump(ui, "NxIR", "inspector-nxir", &view.nxir);
+        inspector_dump(
+            ui,
+            "Native x86_64 mapping",
+            "inspector-native",
+            &view.native,
+        );
+    }
+
+    action
+}
+
+fn inspector_dump(ui: &mut egui::Ui, title: &str, id_salt: &str, body: &str) {
+    ui.add_space(10.0);
+    ui.strong(title);
+    egui::ScrollArea::vertical()
+        .id_salt(id_salt)
+        .max_height(180.0)
+        .show(ui, |ui| {
+            ui.monospace(body);
+        });
 }
 
 pub fn settings(ui: &mut egui::Ui, config: &mut AppConfig, layout: Option<&StorageLayout>) -> bool {

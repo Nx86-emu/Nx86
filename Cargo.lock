@@ -1540,6 +1540,7 @@ dependencies = [
  "nx86-arm64-decode",
  "nx86-cache",
  "nx86-core",
+ "nx86-inspector",
  "nx86-runtime",
  "nx86-testsuite",
  "nx86-title-db",
@@ -1563,6 +1564,12 @@ version = "0.1.0"
 [[package]]
 name = "nx86-inspector"
 version = "0.1.0"
+dependencies = [
+ "nx86-arm64-decode",
+ "nx86-arm64-lift",
+ "nx86-x64-v4",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "nx86-ir"

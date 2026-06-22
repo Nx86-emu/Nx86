@@ -206,11 +206,18 @@ pub enum AppScreen {
     Library,
     Compile,
     Tests,
+    Inspector,
     Settings,
 }
 
 impl AppScreen {
-    pub const ALL: [Self; 4] = [Self::Library, Self::Compile, Self::Tests, Self::Settings];
+    pub const ALL: [Self; 5] = [
+        Self::Library,
+        Self::Compile,
+        Self::Tests,
+        Self::Inspector,
+        Self::Settings,
+    ];
 
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -218,6 +225,7 @@ impl AppScreen {
             Self::Library => "Library",
             Self::Compile => "Compile",
             Self::Tests => "Tests",
+            Self::Inspector => "Inspector",
             Self::Settings => "Settings",
         }
     }
