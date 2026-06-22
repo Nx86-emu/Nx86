@@ -18,11 +18,11 @@ implement real title import, Switch runtime execution, profile-guided
 rebuilding, native memory or conditional-branch lowering, graphics, or Switch
 rendering.
 
-## Active Phase 0-27 Crates
+## Active Phase 0-29 Crates
 
 - `nx86-app`: binary entrypoint, logging setup, config load, GUI launch.
 - `nx86-gui`: egui shell, wizard, theme, navigation, title list, worker progress, synthetic test display, decode display, tiny interpreter status, framebuffer rendering, NxIR/native dump agreement, and the Inspector screen (title-sourced disassembly, recovered CFG, NxIR, and native-mapping views).
-- `nx86-core`: shared config, storage layout, IPC model, guest CPU state, flag (NZCV) and condition-code semantics, and Linux XDG-backed persistence.
+- `nx86-core`: shared config, storage layout, IPC model, guest CPU state, flag (NZCV) and condition-code semantics, Linux XDG-backed persistence, and the experimental native-patch-chaining preference.
 - `nx86-title-db`: SQLite title database, deterministic title folder creation, TOML sidecars, and synthetic-program title content for the Inspector.
 - `nx86-arm64-decode`: narrow decoder for MOV/ADD/SUB/logical/loads/stores/B/B.cond/ADDS/SUBS/SVC.
 - `nx86-ir`: NxIR data model (module/function/block/SSA values), the verifier,
@@ -37,10 +37,10 @@ rendering.
   lifted NxIR dump, and the native (x86_64) mapping, degrading gracefully when
   lifting or lowering is unavailable.
 - `nx86-runtime`: tiny synthetic interpreter (with guest memory), NxIR evaluator (with guard/deopt routing via `EvalOutcome`), native backend attempt, and the differential synthetic-test harness.
-- `nx86-backend`: native execution orchestration, interpreter comparison, and the multi-block dispatcher with emergency-JIT fallback.
-- `nx86-x64-asm`: internal x86_64 assembler API, labels, code buffer, and dump.
-- `nx86-jit`: Linux x86_64 executable memory, trusted generated-code call wrappers, and on-demand single-block compilation into the object cache.
-- `nx86-x64-v4`: single-block and per-block NxIR integer lowering to x86_64 bytes, including unconditional-branch routing for the dispatcher.
+- `nx86-backend`: native execution orchestration, interpreter comparison, and the multi-block dispatcher with emergency-JIT fallback, software chain caching, guarded native chain installation, statistics, and invalidation.
+- `nx86-x64-asm`: internal x86_64 assembler API, labels, code buffer, dump, and fixed-size runtime patch sites.
+- `nx86-jit`: Linux x86_64 executable memory, trusted generated-code call wrappers, W^X runtime patching, and on-demand single-block compilation into the object cache.
+- `nx86-x64-v4`: single-block and per-block NxIR integer lowering to x86_64 bytes, including unconditional-branch routing and chain-exit metadata for the dispatcher.
 - `nx86-regalloc`: basic linear-scan register allocator for a single NxIR block (pool registers with stack-slot spills).
 - `nx86-object`: AOT object format v0 — `.nxo` serialization of a native block with guest mapping and a validation hash.
 - `nx86-cache`: cache manager v0 — `.nxo` object directory with a manifest, shallow/full integrity checks, size accounting, and insert/load/remove/clear.

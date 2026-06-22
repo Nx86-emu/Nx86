@@ -13,7 +13,9 @@ pub use nx86_profile::{
     ProfileSink, ProfileWriter, RecordOutcome, read_profile,
 };
 
+mod chain;
 mod dispatch;
+pub use chain::{ChainStats, DEFAULT_CHAIN_THRESHOLD};
 pub use dispatch::{
     DEFAULT_MAX_STEPS, DispatchError, DispatchExit, DispatchOutcome, Dispatcher,
     run_dispatched_function,
@@ -524,6 +526,84 @@ mod tests {
         expected
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "native-patch-chaining"
+    ))]
+    fn three_block_forward_function() -> Function {
+        Function {
+            name: "three_block_forward".to_owned(),
+            entry_address: 0,
+            value_count: 2,
+            deopt_points: Vec::new(),
+            blocks: vec![
+                Block {
+                    instructions: vec![
+                        Inst {
+                            result: Some(Value(0)),
+                            op: Op::Const {
+                                ty: Type::I64,
+                                value: 5,
+                            },
+                            guest_address: 0,
+                        },
+                        Inst {
+                            result: None,
+                            op: Op::SetReg {
+                                reg: Reg::X(0),
+                                value: Value(0),
+                            },
+                            guest_address: 0,
+                        },
+                    ],
+                    terminator: Terminator::Branch { target: BlockId(1) },
+                    terminator_address: 4,
+                },
+                Block {
+                    instructions: vec![
+                        Inst {
+                            result: Some(Value(1)),
+                            op: Op::GetReg { reg: Reg::X(0) },
+                            guest_address: 8,
+                        },
+                        Inst {
+                            result: None,
+                            op: Op::SetReg {
+                                reg: Reg::X(1),
+                                value: Value(1),
+                            },
+                            guest_address: 8,
+                        },
+                    ],
+                    terminator: Terminator::Branch { target: BlockId(2) },
+                    terminator_address: 8,
+                },
+                Block {
+                    instructions: Vec::new(),
+                    terminator: Terminator::Halt {
+                        reason: "svc #0x0".to_owned(),
+                    },
+                    terminator_address: 12,
+                },
+            ],
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "native-patch-chaining"
+    ))]
+    fn three_block_expected_state() -> CpuState {
+        let mut expected = CpuState::new();
+        expected.set_x(0, 5);
+        expected.set_x(1, 5);
+        expected.set_pc(16);
+        expected.halt("svc #0x0");
+        expected
+    }
+
     /// Per-block native objects for `function`, as the cache would persist them.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn objects_for(function: &Function) -> Vec<NativeObject> {
@@ -611,6 +691,62 @@ mod tests {
         assert_eq!(outcome.final_state, two_block_expected_state());
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        feature = "native-patch-chaining"
+    ))]
+    #[test]
+    fn hot_forward_edge_executes_natively_and_unpatches_on_invalidation() {
+        let function = three_block_forward_function();
+        let mut dispatcher = super::Dispatcher::from_function(&function)
+            .expect("build dispatcher")
+            .with_native_patch_chaining(true);
+        let mut initial = CpuState::new();
+        initial.set_pc(0);
+
+        let first = dispatcher.run(&initial, None).expect("first warmup run");
+        assert_eq!(first.final_state, three_block_expected_state());
+        assert_eq!(first.chain_stats.native_installs, 0);
+
+        let second = dispatcher.run(&initial, None).expect("second warmup run");
+        assert_eq!(second.final_state, three_block_expected_state());
+        assert_eq!(second.chain_stats.native_installs, 1);
+
+        let chained = dispatcher.run(&initial, None).expect("native chained run");
+        assert_eq!(chained.final_state, three_block_expected_state());
+        assert_eq!(chained.chain_stats.native_chain_entries, 1);
+
+        dispatcher
+            .set_native_patch_chaining(false)
+            .expect("disable native chaining");
+        let native_disabled = dispatcher.run(&initial, None).expect("software-only run");
+        assert_eq!(native_disabled.final_state, three_block_expected_state());
+        assert_eq!(native_disabled.chain_stats.native_chain_entries, 0);
+
+        dispatcher
+            .set_native_patch_chaining(true)
+            .expect("re-enable native chaining");
+        let rearmed = dispatcher.run(&initial, None).expect("re-arm native chain");
+        assert_eq!(rearmed.chain_stats.native_installs, 1);
+        let rechained = dispatcher.run(&initial, None).expect("re-chained run");
+        assert_eq!(rechained.chain_stats.native_chain_entries, 1);
+
+        dispatcher.invalidate(8).expect("invalidate chained target");
+        assert_eq!(dispatcher.chain_stats().invalidations, 1);
+        let restored = dispatcher
+            .run(&initial, None)
+            .expect("restored dispatch run");
+        assert_eq!(restored.final_state, three_block_expected_state());
+        assert_eq!(restored.chain_stats.native_chain_entries, 0);
+
+        dispatcher
+            .set_chaining_enabled(false)
+            .expect("disable all chaining");
+        let debug_run = dispatcher.run(&initial, None).expect("debug dispatch run");
+        assert_eq!(debug_run.chain_stats, super::ChainStats::default());
+    }
+
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn dispatcher_uses_the_reached_blocks_halt_reason() {
@@ -663,6 +799,7 @@ mod tests {
         let outcome = dispatcher.run(&initial, None).expect("dispatch run");
 
         assert_eq!(outcome.exit, super::DispatchExit::MissingBlock { pc: 0x8 });
+        assert_eq!(outcome.chain_stats.software_installs, 0);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

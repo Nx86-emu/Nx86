@@ -5,6 +5,10 @@ edition.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+native-patch-chaining = []
+
 [dependencies]
 nx86-cache = { path = "../nx86-cache" }
 nx86-core = { path = "../nx86-core" }
@@ -12,6 +16,7 @@ nx86-ir = { path = "../nx86-ir" }
 nx86-jit = { path = "../nx86-jit" }
 nx86-object = { path = "../nx86-object" }
 nx86-profile = { path = "../nx86-profile" }
+nx86-x64-asm = { path = "../nx86-x64-asm" }
 nx86-x64-v4 = { path = "../nx86-x64-v4" }
 thiserror.workspace = true
 

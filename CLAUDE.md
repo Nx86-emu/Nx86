@@ -50,12 +50,12 @@ product target is **Linux `x86_64-v4`**. This shapes everything:
   Linux x86_64; Apple Silicon reports a clean unsupported-host outcome.
 - The GUI shell (`cargo run -p nx86-app`) is **Linux-only**; do not expect it to
   run on the dev host. Exercise GUI changes on the Linux target.
-- The Phase 16–23 backend crates (`nx86-x64-asm`, `nx86-jit`, `nx86-x64-v4`,
+- The Phase 16–29 backend crates (`nx86-x64-asm`, `nx86-jit`, `nx86-x64-v4`,
   `nx86-backend`, `nx86-regalloc`, `nx86-object`, `nx86-cache`) are active for
   the narrow integer path: register allocation with spills, persistent `.nxo`
   objects, a managed cache, multi-block dispatch through unconditional branches,
-  and emergency single-block JIT fallback. Runtime profile files remain a later
-  phase.
+  emergency single-block JIT fallback, guarded forward block chaining, runtime
+  profiles, profile-guided rebuilds, CFG inspection, and guard/deopt metadata.
 
 ## Architecture
 

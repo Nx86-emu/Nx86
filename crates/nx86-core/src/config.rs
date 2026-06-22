@@ -163,6 +163,9 @@ pub struct CompilerConfig {
     pub cpu_target: CpuTarget,
     pub compile_thread_cap: usize,
     pub all_core_warning_acknowledged: bool,
+    /// Experimental Linux x86_64 block-exit patching. Software chaining remains
+    /// available when this is disabled or unsupported.
+    pub native_patch_chaining: bool,
 }
 
 impl Default for CompilerConfig {
@@ -171,6 +174,7 @@ impl Default for CompilerConfig {
             cpu_target: CpuTarget::X86_64V4,
             compile_thread_cap: available_parallelism(),
             all_core_warning_acknowledged: false,
+            native_patch_chaining: false,
         }
     }
 }
@@ -462,6 +466,7 @@ mod tests {
         assert_eq!(config.prototype.graphics_backend, "vulkan");
         assert_eq!(config.prototype.gui_framework, "egui");
         assert_eq!(config.graphics.backend, GraphicsBackend::Vulkan);
+        assert!(!config.compiler.native_patch_chaining);
         assert!(config.first_run.phase3_wizard_pending);
     }
 
@@ -503,6 +508,7 @@ mod tests {
         config.ui.theme_mode = ThemeMode::Light;
         config.ui.developer_mode_visible = true;
         config.compiler.all_core_warning_acknowledged = true;
+        config.compiler.native_patch_chaining = true;
 
         let serialized = toml::to_string_pretty(&config).expect("config should serialize");
         let decoded: AppConfig = toml::from_str(&serialized).expect("config should parse");

@@ -2,7 +2,7 @@ use nx86_core::guest::{CpuState, Nzcv};
 use nx86_ir::verify::{self, VerifyError};
 use nx86_ir::{BinaryOp, Block, BlockId, Function, Inst, Op, Reg, Terminator, Type, Value};
 use nx86_regalloc::{Allocation, Location, allocate};
-use nx86_x64_asm::{AsmError, Assembler, CodeBuffer, Mem64, Reg64};
+use nx86_x64_asm::{AsmError, Assembler, CodeBuffer, Mem64, PatchKind, Reg64};
 use thiserror::Error;
 
 pub const CRATE_NAME: &str = "nx86-x64-v4";
@@ -22,6 +22,7 @@ pub const fn crate_name() -> &'static str {
 pub struct LoweredBlock {
     code: CodeBuffer,
     stack_size: i32,
+    chain_exits: Vec<ChainExit>,
 }
 
 impl LoweredBlock {
@@ -44,6 +45,39 @@ impl LoweredBlock {
     pub const fn code(&self) -> &CodeBuffer {
         &self.code
     }
+
+    /// Patchable block-chain exits in this block (one per unconditional branch).
+    #[must_use]
+    pub fn chain_exits(&self) -> &[ChainExit] {
+        &self.chain_exits
+    }
+}
+
+/// The kind of block exit a [`ChainExit`] patches. v0 only chains unconditional
+/// branches; conditional and guard exits are not yet patchable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainExitKind {
+    UnconditionalBranch,
+}
+
+/// Metadata describing a patchable block-chain exit: enough to install a direct
+/// `jmp` to the successor and to restore the original bytes on invalidation
+/// (SPEC §23.3 / §26). The block is identified by its guest entry PC.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainExit {
+    /// Guest entry PC of the block this exit belongs to.
+    pub block_entry_pc: u64,
+    pub exit_kind: ChainExitKind,
+    /// Byte offset of the patch slot within the block's code.
+    pub patch_offset: usize,
+    /// Slot size (a `jmp rel32` is [`nx86_x64_asm::CHAIN_EXIT_SIZE`] bytes).
+    pub patch_size: usize,
+    /// The unpatched bytes (`ret` + padding), restored when the chain is broken.
+    pub original_bytes: Vec<u8>,
+    /// Guest entry PC of the branch's successor block.
+    pub successor_pc: u64,
+    /// Whether this exit is currently patched to a direct jump.
+    pub patched: bool,
 }
 
 #[repr(C)]
@@ -239,22 +273,64 @@ where
         lower_inst(&mut asm, inst, &allocation)?;
     }
 
-    emit_terminator(&mut asm, block, resolve_target)?;
+    let chain_successor = emit_terminator(&mut asm, block, resolve_target)?;
 
     if stack_size > 0 {
         asm.add_reg_imm32(Reg64::Rsp, stack_size);
     }
-    asm.epilogue();
+    // An unconditional branch tears down its frame and ends in a patchable
+    // chain-exit slot (so a hot edge can later jump straight to its successor);
+    // every other terminator uses the plain `ret` epilogue. The slot must come
+    // after both `add rsp` and `pop rbp` so a chained jump stays stack-balanced.
+    match chain_successor {
+        Some(_) => asm.chain_epilogue(),
+        None => asm.epilogue(),
+    }
 
     let code = asm.finish()?;
-    Ok(LoweredBlock { code, stack_size })
+    let chain_exits = build_chain_exits(&code, block.entry_address(), chain_successor);
+    Ok(LoweredBlock {
+        code,
+        stack_size,
+        chain_exits,
+    })
 }
 
+/// Build the chain-exit metadata for a lowered block: a single entry for an
+/// unconditional branch (the `chain_successor`), none otherwise.
+fn build_chain_exits(
+    code: &CodeBuffer,
+    block_entry_pc: u64,
+    chain_successor: Option<u64>,
+) -> Vec<ChainExit> {
+    let Some(successor_pc) = chain_successor else {
+        return Vec::new();
+    };
+    code.patch_sites()
+        .iter()
+        .filter(|site| site.kind == PatchKind::ChainExit)
+        .map(|site| {
+            let original_bytes = code.bytes()[site.offset..site.offset + site.size].to_vec();
+            ChainExit {
+                block_entry_pc,
+                exit_kind: ChainExitKind::UnconditionalBranch,
+                patch_offset: site.offset,
+                patch_size: site.size,
+                original_bytes,
+                successor_pc,
+                patched: false,
+            }
+        })
+        .collect()
+}
+
+/// Emit the terminator. Returns the successor guest PC when the block ends in an
+/// unconditional branch (a chainable exit), `None` otherwise.
 fn emit_terminator<F>(
     asm: &mut Assembler,
     block: &Block,
     resolve_target: F,
-) -> Result<(), LoweringError>
+) -> Result<Option<u64>, LoweringError>
 where
     F: Fn(BlockId) -> Result<u64, LoweringError>,
 {
@@ -270,24 +346,23 @@ where
             emit_set_pc(asm, next_pc);
             asm.mov_reg_imm64(Reg64::Rax, 1);
             asm.mov_mem_reg(state_mem(HALTED_OFFSET), Reg64::Rax);
+            Ok(None)
         }
         Terminator::Branch { target } => {
+            // Keep the PC store: unpatched, the dispatcher reads it; chained, it
+            // leaves `native.pc == successor.entry_pc` on entry to the successor.
             let target_pc = resolve_target(*target)?;
             emit_set_pc(asm, target_pc);
+            Ok(Some(target_pc))
         }
-        Terminator::Return => {}
-        Terminator::CondBranch { .. } => {
-            return Err(LoweringError::UnsupportedTerminator {
-                terminator: "conditional branch",
-            });
-        }
-        Terminator::Guard { .. } => {
-            return Err(LoweringError::UnsupportedTerminator {
-                terminator: "guard",
-            });
-        }
+        Terminator::Return => Ok(None),
+        Terminator::CondBranch { .. } => Err(LoweringError::UnsupportedTerminator {
+            terminator: "conditional branch",
+        }),
+        Terminator::Guard { .. } => Err(LoweringError::UnsupportedTerminator {
+            terminator: "guard",
+        }),
     }
-    Ok(())
 }
 
 fn emit_set_pc(asm: &mut Assembler, pc: u64) {
@@ -541,6 +616,34 @@ mod tests {
         let halt_dump = blocks[1].lowered.dump();
         assert!(halt_dump.contains("mov rax, 0x1"));
         assert!(halt_dump.contains("mov [rdi+0x110], rax"));
+    }
+
+    #[test]
+    fn branch_block_exposes_a_chain_exit() {
+        let function = two_block_branch_function();
+        let blocks = lower_function(&function).expect("two-block function should lower");
+
+        // The branch block has one chain exit to block 1's entry PC.
+        let exits = blocks[0].lowered.chain_exits();
+        assert_eq!(exits.len(), 1);
+        let exit = &exits[0];
+        assert_eq!(exit.block_entry_pc, 0x0);
+        assert_eq!(exit.successor_pc, 0x8);
+        assert_eq!(exit.exit_kind, super::ChainExitKind::UnconditionalBranch);
+        assert_eq!(exit.patch_size, 5);
+        assert!(!exit.patched);
+
+        // The slot is in-bounds, starts at a `ret`, and original_bytes matches it.
+        let bytes = blocks[0].lowered.bytes();
+        assert!(exit.patch_offset + exit.patch_size <= bytes.len());
+        assert_eq!(bytes[exit.patch_offset], 0xC3);
+        assert_eq!(
+            exit.original_bytes.as_slice(),
+            &bytes[exit.patch_offset..exit.patch_offset + exit.patch_size]
+        );
+
+        // The halt block has no chain exit.
+        assert!(blocks[1].lowered.chain_exits().is_empty());
     }
 
     #[test]

@@ -11,6 +11,7 @@ pub const fn crate_name() -> &'static str {
 pub struct CodeBuffer {
     bytes: Vec<u8>,
     dump: String,
+    patch_sites: Vec<PatchSite>,
 }
 
 impl CodeBuffer {
@@ -28,6 +29,41 @@ impl CodeBuffer {
     pub fn dump(&self) -> &str {
         &self.dump
     }
+
+    /// Runtime-patchable sites recorded during assembly (e.g. block-chain exits).
+    #[must_use]
+    pub fn patch_sites(&self) -> &[PatchSite] {
+        &self.patch_sites
+    }
+}
+
+/// What a [`PatchSite`] can be overwritten with at runtime (SPEC §23.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatchKind {
+    /// A block's unconditional exit slot, sized to hold a `jmp rel32` so a hot
+    /// edge can be chained directly to its successor block.
+    ChainExit,
+}
+
+/// A location in emitted code that may be rewritten after assembly, recorded with
+/// its byte `offset` (from the start of the code buffer) and fixed `size`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PatchSite {
+    pub offset: usize,
+    pub size: usize,
+    pub kind: PatchKind,
+}
+
+/// Size of a chain-exit slot: a 5-byte region (`jmp rel32`) that holds a `ret`
+/// plus padding until it is patched to a direct jump.
+pub const CHAIN_EXIT_SIZE: usize = 5;
+
+/// Encode a near `jmp rel32` whose displacement is `rel` (target minus the
+/// address of the byte after this 5-byte instruction).
+#[must_use]
+pub const fn encode_jmp_rel32(rel: i32) -> [u8; CHAIN_EXIT_SIZE] {
+    let disp = rel.to_le_bytes();
+    [0xE9, disp[0], disp[1], disp[2], disp[3]]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +179,7 @@ pub struct Assembler {
     bytes: Vec<u8>,
     dump: Vec<String>,
     labels: Vec<LabelState>,
+    patch_sites: Vec<PatchSite>,
 }
 
 #[derive(Default)]
@@ -193,6 +230,38 @@ impl Assembler {
         self.dump.push("pop rbp".to_owned());
         self.pop_reg_raw(Reg64::Rbp);
         self.ret();
+    }
+
+    /// A `pop rbp` followed by a chain-exit slot instead of a bare `ret`. The
+    /// frame is fully torn down before the slot, so when the slot is later
+    /// patched to a direct `jmp` the successor block sets up its own frame and
+    /// the chain stays stack-balanced.
+    pub fn chain_epilogue(&mut self) {
+        self.dump.push("pop rbp".to_owned());
+        self.pop_reg_raw(Reg64::Rbp);
+        self.chain_exit();
+    }
+
+    /// Emit a [`PatchKind::ChainExit`] slot: a `ret` padded with `nop`s to
+    /// [`CHAIN_EXIT_SIZE`] bytes, and record the patch site. Unpatched, the `ret`
+    /// returns to the dispatcher; patched, the whole slot becomes a `jmp rel32`.
+    pub fn chain_exit(&mut self) {
+        let offset = self.bytes.len();
+        self.patch_sites.push(PatchSite {
+            offset,
+            size: CHAIN_EXIT_SIZE,
+            kind: PatchKind::ChainExit,
+        });
+        self.dump.push("ret ; chain-exit slot".to_owned());
+        self.bytes.push(0xC3);
+        for _ in 1..CHAIN_EXIT_SIZE {
+            self.nop();
+        }
+    }
+
+    pub fn nop(&mut self) {
+        self.dump.push("nop".to_owned());
+        self.bytes.push(0x90);
     }
 
     pub fn ret(&mut self) {
@@ -300,6 +369,7 @@ impl Assembler {
         Ok(CodeBuffer {
             bytes: self.bytes,
             dump: self.dump.join("\n"),
+            patch_sites: self.patch_sites,
         })
     }
 
@@ -427,7 +497,7 @@ fn mem_name(mem: Mem64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsmError, Assembler, Mem64, Reg64};
+    use super::{AsmError, Assembler, CHAIN_EXIT_SIZE, Mem64, PatchKind, Reg64, encode_jmp_rel32};
 
     #[test]
     fn emits_basic_integer_bytes() {
@@ -550,5 +620,35 @@ mod tests {
                 0x20, 0x00, 0x00, 0x00, 0x5D, 0xC3,
             ]
         );
+    }
+
+    #[test]
+    fn chain_epilogue_emits_pop_and_patchable_slot() {
+        let mut asm = Assembler::new();
+        asm.prologue();
+        asm.chain_epilogue();
+        let code = asm.finish().expect("assembler should finish");
+
+        // push rbp; mov rbp,rsp; pop rbp; (chain slot: ret + 4 nop)
+        assert_eq!(
+            code.bytes(),
+            &[0x55, 0x48, 0x89, 0xE5, 0x5D, 0xC3, 0x90, 0x90, 0x90, 0x90]
+        );
+
+        let sites = code.patch_sites();
+        assert_eq!(sites.len(), 1);
+        assert_eq!(sites[0].kind, PatchKind::ChainExit);
+        assert_eq!(sites[0].size, CHAIN_EXIT_SIZE);
+        // The slot begins at the `ret` byte (offset 5), right after `pop rbp`.
+        assert_eq!(sites[0].offset, 5);
+        assert_eq!(code.bytes()[sites[0].offset], 0xC3);
+    }
+
+    #[test]
+    fn jmp_rel32_encoding_is_correct() {
+        // jmp rel32 = E9 + little-endian displacement.
+        assert_eq!(encode_jmp_rel32(0), [0xE9, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(encode_jmp_rel32(5), [0xE9, 0x05, 0x00, 0x00, 0x00]);
+        assert_eq!(encode_jmp_rel32(-2), [0xE9, 0xFE, 0xFF, 0xFF, 0xFF]);
     }
 }

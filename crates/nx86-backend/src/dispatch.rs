@@ -10,17 +10,32 @@
 //! [`EmergencyJit`]; without one, or when the source function does not contain
 //! that PC, dispatch reports [`DispatchExit::MissingBlock`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use nx86_core::guest::CpuState;
+use nx86_core::{config::CompilerConfig, guest::CpuState};
 use nx86_ir::{Function, Terminator};
+#[cfg(all(
+    feature = "native-patch-chaining",
+    target_os = "linux",
+    target_arch = "x86_64"
+))]
+use nx86_jit::PatchStage;
 use nx86_jit::{EmergencyJit, ExecError, ExecutableMemory, JitError, JitEvent};
 use nx86_object::NativeObject;
 use nx86_profile::{ProfileError, ProfileEvent, ProfileSink};
-use nx86_x64_v4::{LoweringError, NativeBlockState, lower_function};
+#[cfg(any(
+    test,
+    all(
+        feature = "native-patch-chaining",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )
+))]
+use nx86_x64_v4::ChainExitKind;
+use nx86_x64_v4::{ChainExit, LoweringError, NativeBlockState, lower_function};
 use thiserror::Error;
 
-use crate::{NativeOutcome, NativeStatus, call_generated_block};
+use crate::{ChainStats, NativeOutcome, NativeStatus, call_generated_block, chain::ChainCache};
 
 /// Default cap on dispatched block calls, guarding against runaway loops.
 pub const DEFAULT_MAX_STEPS: usize = 10_000;
@@ -43,27 +58,50 @@ pub struct DispatchOutcome {
     pub final_state: CpuState,
     /// Emergency-JIT blocks compiled during this dispatch run.
     pub jit_events: Vec<JitEvent>,
+    /// Block-chaining activity during this run.
+    pub chain_stats: ChainStats,
+}
+
+#[derive(Debug)]
+struct NativeBlock {
+    executable: ExecutableMemory,
+    chain_exits: Vec<ChainExit>,
+}
+
+impl NativeBlock {
+    fn patched_successor(&self) -> Option<u64> {
+        self.chain_exits
+            .iter()
+            .find(|exit| exit.patched)
+            .map(|exit| exit.successor_pc)
+    }
 }
 
 /// A registry of native blocks keyed by guest entry PC.
 #[derive(Debug)]
 pub struct Dispatcher {
-    blocks: BTreeMap<u64, ExecutableMemory>,
+    blocks: HashMap<u64, NativeBlock>,
     halt_reasons: BTreeMap<u64, String>,
     max_steps: usize,
     emergency_jit: Option<EmergencyJit>,
     profile_sink: Option<Box<dyn ProfileSink>>,
+    chains: ChainCache,
+    native_patch_chaining: bool,
+    native_incoming: HashMap<u64, HashSet<u64>>,
 }
 
 impl Dispatcher {
     /// Lower every block of `function` and register it by its guest entry PC.
     pub fn from_function(function: &Function) -> Result<Self, DispatchError> {
         let lowered = lower_function(function)?;
-        let mut blocks = BTreeMap::new();
+        let mut blocks = HashMap::new();
         for block in &lowered {
             blocks.insert(
                 block.entry_pc,
-                ExecutableMemory::new(block.lowered.bytes())?,
+                NativeBlock {
+                    executable: ExecutableMemory::new(block.lowered.bytes())?,
+                    chain_exits: block.lowered.chain_exits().to_vec(),
+                },
             );
         }
         let mut dispatcher = Self::from_blocks(blocks)?;
@@ -93,14 +131,21 @@ impl Dispatcher {
                 });
             }
         }
-        let mut blocks = BTreeMap::new();
+        let mut blocks = HashMap::new();
         for object in objects {
-            blocks.insert(object.entry_address, ExecutableMemory::new(&object.code)?);
+            blocks.insert(
+                object.entry_address,
+                NativeBlock {
+                    executable: ExecutableMemory::new(&object.code)?,
+                    // Phase 29 does not yet persist patch metadata in `.nxo`.
+                    chain_exits: Vec::new(),
+                },
+            );
         }
         Self::from_blocks(blocks)
     }
 
-    fn from_blocks(blocks: BTreeMap<u64, ExecutableMemory>) -> Result<Self, DispatchError> {
+    fn from_blocks(blocks: HashMap<u64, NativeBlock>) -> Result<Self, DispatchError> {
         if blocks.is_empty() {
             return Err(DispatchError::Empty);
         }
@@ -110,6 +155,9 @@ impl Dispatcher {
             max_steps: DEFAULT_MAX_STEPS,
             emergency_jit: None,
             profile_sink: None,
+            chains: ChainCache::default(),
+            native_patch_chaining: false,
+            native_incoming: HashMap::new(),
         })
     }
 
@@ -134,9 +182,87 @@ impl Dispatcher {
         self
     }
 
+    /// Enable or disable dispatcher-level chaining. Chaining defaults to enabled;
+    /// pass `false` before the first run for debugger-friendly dispatch. After
+    /// execution starts, use [`Self::set_chaining_enabled`] so native exits are
+    /// restored before disabling.
+    #[must_use]
+    pub fn with_chaining(mut self, enabled: bool) -> Self {
+        self.chains.set_enabled(enabled);
+        if !enabled {
+            self.native_patch_chaining = false;
+        }
+        self
+    }
+
+    /// Opt into native exit patching. The Cargo feature and Linux x86_64 host
+    /// gates must also be active; otherwise software chaining remains in use.
+    /// After execution starts, disable through
+    /// [`Self::set_native_patch_chaining`] so installed patches are restored.
+    #[must_use]
+    pub const fn with_native_patch_chaining(mut self, enabled: bool) -> Self {
+        self.native_patch_chaining = enabled;
+        self
+    }
+
+    /// Apply the persisted experimental native-patching preference.
+    #[must_use]
+    pub const fn with_compiler_config(self, config: &CompilerConfig) -> Self {
+        self.with_native_patch_chaining(config.native_patch_chaining)
+    }
+
+    /// Change dispatcher-level chaining at runtime. Disabling first restores
+    /// every native patch; if restoration fails, chaining remains enabled and
+    /// the error is returned so the caller cannot mistake a partial disable for
+    /// a debugger-safe state.
+    pub fn set_chaining_enabled(&mut self, enabled: bool) -> Result<(), DispatchError> {
+        if !enabled {
+            self.restore_all_native_exits()?;
+            self.native_patch_chaining = false;
+        }
+        self.chains.set_enabled(enabled);
+        Ok(())
+    }
+
+    /// Change only the experimental native patch layer at runtime. Disabling
+    /// restores all native exits while leaving software chaining enabled.
+    pub fn set_native_patch_chaining(&mut self, enabled: bool) -> Result<(), DispatchError> {
+        if !enabled {
+            self.restore_all_native_exits()?;
+        }
+        self.native_patch_chaining = enabled;
+        Ok(())
+    }
+
     #[must_use]
     pub fn block_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Cumulative chaining activity for diagnostics and tests.
+    #[must_use]
+    pub const fn chain_stats(&self) -> ChainStats {
+        self.chains.stats()
+    }
+
+    /// Break all software and native chains entering or leaving `pc`. Call this
+    /// before replacing or removing a compiled block.
+    pub fn invalidate(&mut self, pc: u64) -> Result<(), DispatchError> {
+        // Clone rather than remove first: if any unpatch fails, the remaining
+        // reverse edges stay discoverable and invalidation can be retried.
+        let mut sources = self.native_incoming.get(&pc).cloned().unwrap_or_default();
+        sources.insert(pc);
+        for source_pc in sources {
+            self.restore_native_exits(source_pc, if source_pc == pc { None } else { Some(pc) })?;
+        }
+        self.native_incoming.remove(&pc);
+        for incoming in self.native_incoming.values_mut() {
+            incoming.remove(&pc);
+        }
+        self.native_incoming
+            .retain(|_, sources| !sources.is_empty());
+        self.chains.invalidate(pc);
+        Ok(())
     }
 
     /// Run from `initial`, routing between registered blocks by guest PC until a
@@ -152,12 +278,17 @@ impl Dispatcher {
         let mut native = NativeBlockState::from_cpu_state(initial);
         let mut jit_events = Vec::new();
         let mut steps = 0;
+        let chain_stats_before = self.chains.stats();
 
         while steps < self.max_steps {
             let pc = native.pc;
-            if let Some(executable) = self.blocks.get(&pc) {
-                call_generated_block(executable, &mut native)?;
+            if let Some(block) = self.blocks.get(&pc) {
+                let patched_successor = block.patched_successor();
+                call_generated_block(&block.executable, &mut native)?;
                 steps += 1;
+                if patched_successor.is_some() {
+                    self.chains.record_native_entry();
+                }
                 if native.halted != 0 {
                     let halt_reason = self
                         .halt_reasons
@@ -168,12 +299,36 @@ impl Dispatcher {
                         exit: DispatchExit::Halted,
                         final_state: native.apply_to_cpu_state(initial.clone(), halt_reason),
                         jit_events,
+                        chain_stats: self.chains.stats().difference(chain_stats_before),
                     });
+                }
+                if let Some(target_pc) = patched_successor {
+                    self.record_profile(ProfileEvent::BranchTarget {
+                        source_pc: pc,
+                        target_pc,
+                    })?;
+                    continue;
                 }
                 self.record_profile(ProfileEvent::BranchTarget {
                     source_pc: pc,
                     target_pc: native.pc,
                 })?;
+                let target_pc = native.pc;
+                if !self.blocks.contains_key(&target_pc) {
+                    // Missing successors route through emergency JIT or the
+                    // normal MissingBlock exit; never cache a dangling chain.
+                    continue;
+                }
+                if self.chains.hit(pc, target_pc) {
+                    // A previous safe patch failure, or runtime re-enabling of
+                    // native chaining, may make an established software edge
+                    // eligible for another native installation attempt.
+                    self.try_install_native_chain(pc, target_pc)?;
+                    continue;
+                }
+                if self.chains.observe(pc, target_pc) {
+                    self.try_install_native_chain(pc, target_pc)?;
+                }
                 continue;
             }
 
@@ -182,6 +337,7 @@ impl Dispatcher {
                     exit: DispatchExit::MissingBlock { pc },
                     final_state: native.apply_to_cpu_state(initial.clone(), None),
                     jit_events,
+                    chain_stats: self.chains.stats().difference(chain_stats_before),
                 });
             };
             let Some(compilation) = emergency_jit.compile(pc)? else {
@@ -189,6 +345,7 @@ impl Dispatcher {
                     exit: DispatchExit::MissingBlock { pc },
                     final_state: native.apply_to_cpu_state(initial.clone(), None),
                     jit_events,
+                    chain_stats: self.chains.stats().difference(chain_stats_before),
                 });
             };
             self.record_profile(ProfileEvent::JitBlock {
@@ -200,7 +357,14 @@ impl Dispatcher {
             if let Some(reason) = compilation.halt_reason {
                 self.halt_reasons.insert(pc, reason);
             }
-            self.blocks.insert(pc, executable);
+            self.blocks.insert(
+                pc,
+                NativeBlock {
+                    executable,
+                    // `.nxo` v0 does not carry chain-exit metadata.
+                    chain_exits: Vec::new(),
+                },
+            );
             jit_events.push(compilation.event);
         }
 
@@ -210,7 +374,162 @@ impl Dispatcher {
             },
             final_state: native.apply_to_cpu_state(initial.clone(), None),
             jit_events,
+            chain_stats: self.chains.stats().difference(chain_stats_before),
         })
+    }
+
+    #[cfg(all(
+        feature = "native-patch-chaining",
+        target_os = "linux",
+        target_arch = "x86_64"
+    ))]
+    #[allow(unsafe_code)]
+    fn try_install_native_chain(
+        &mut self,
+        source_pc: u64,
+        target_pc: u64,
+    ) -> Result<bool, DispatchError> {
+        if !self.native_patch_chaining || !self.chains.enabled() || target_pc <= source_pc {
+            return Ok(false);
+        }
+        let Some(target) = self.blocks.get(&target_pc) else {
+            return Ok(false);
+        };
+        // Chaining into a Branch block ensures native execution returns to the
+        // dispatcher before a Halt/Return reason must be classified.
+        if !target
+            .chain_exits
+            .iter()
+            .any(|exit| chain_exit_metadata_is_valid(target_pc, target.executable.len(), exit))
+        {
+            return Ok(false);
+        }
+        let target_addr = target.executable.entry_addr()?;
+        let Some(source) = self.blocks.get(&source_pc) else {
+            return Ok(false);
+        };
+        let Some(exit_index) = source.chain_exits.iter().position(|exit| {
+            !exit.patched
+                && exit.successor_pc == target_pc
+                && chain_exit_metadata_is_valid(source_pc, source.executable.len(), exit)
+        }) else {
+            return Ok(false);
+        };
+        let exit = &source.chain_exits[exit_index];
+        if exit.patch_size != nx86_x64_asm::CHAIN_EXIT_SIZE {
+            return Ok(false);
+        }
+        let source_addr = source.executable.entry_addr()?;
+        let Some(slot_end) = source_addr
+            .checked_add(exit.patch_offset)
+            .and_then(|slot| slot.checked_add(nx86_x64_asm::CHAIN_EXIT_SIZE))
+        else {
+            return Ok(false);
+        };
+        let delta = (target_addr as i128) - (slot_end as i128);
+        let Ok(displacement) = i32::try_from(delta) else {
+            return Ok(false);
+        };
+        let patch = nx86_x64_asm::encode_jmp_rel32(displacement);
+
+        let source = self
+            .blocks
+            .get_mut(&source_pc)
+            .ok_or(DispatchError::MissingRegisteredBlock { pc: source_pc })?;
+        // SAFETY: Nx86 emitted this fixed-size chain slot for a `jmp rel32`, the
+        // displacement was range-checked, and dispatch is single-threaded with
+        // no generated block executing during this call.
+        if let Err(error) = unsafe {
+            source.executable.patch(
+                source.chain_exits[exit_index].patch_offset,
+                patch.as_slice(),
+            )
+        } {
+            if matches!(
+                error,
+                ExecError::Patch {
+                    stage: PatchStage::RestoreExecutable,
+                    ..
+                }
+            ) {
+                return Err(DispatchError::Exec(error));
+            }
+            return Ok(false);
+        }
+        source.chain_exits[exit_index].patched = true;
+        self.native_incoming
+            .entry(target_pc)
+            .or_default()
+            .insert(source_pc);
+        self.chains.record_native_install();
+        Ok(true)
+    }
+
+    #[cfg(not(all(
+        feature = "native-patch-chaining",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )))]
+    fn try_install_native_chain(
+        &mut self,
+        _source_pc: u64,
+        _target_pc: u64,
+    ) -> Result<bool, DispatchError> {
+        Ok(false)
+    }
+
+    #[allow(unsafe_code)]
+    fn restore_native_exits(
+        &mut self,
+        source_pc: u64,
+        target_filter: Option<u64>,
+    ) -> Result<(), DispatchError> {
+        let Some(block) = self.blocks.get_mut(&source_pc) else {
+            return Ok(());
+        };
+        for exit in &mut block.chain_exits {
+            if !exit.patched || target_filter.is_some_and(|target| exit.successor_pc != target) {
+                continue;
+            }
+            #[cfg(all(
+                feature = "native-patch-chaining",
+                target_os = "linux",
+                target_arch = "x86_64"
+            ))]
+            {
+                // SAFETY: `original_bytes` were captured from this exact slot at
+                // lowering time, and invalidation runs between generated calls.
+                unsafe {
+                    block
+                        .executable
+                        .patch(exit.patch_offset, &exit.original_bytes)
+                }?;
+            }
+            exit.patched = false;
+            if let Some(sources) = self.native_incoming.get_mut(&exit.successor_pc) {
+                sources.remove(&source_pc);
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_all_native_exits(&mut self) -> Result<(), DispatchError> {
+        let sources = self
+            .blocks
+            .iter()
+            .filter_map(|(pc, block)| {
+                block
+                    .chain_exits
+                    .iter()
+                    .any(|exit| exit.patched)
+                    .then_some(*pc)
+            })
+            .collect::<Vec<_>>();
+        for source_pc in sources {
+            self.restore_native_exits(source_pc, None)?;
+        }
+        self.native_incoming.clear();
+        Ok(())
     }
 
     fn record_profile(&mut self, event: ProfileEvent) -> Result<(), DispatchError> {
@@ -219,6 +538,26 @@ impl Dispatcher {
         }
         Ok(())
     }
+}
+
+#[cfg(any(
+    test,
+    all(
+        feature = "native-patch-chaining",
+        target_os = "linux",
+        target_arch = "x86_64"
+    )
+))]
+fn chain_exit_metadata_is_valid(block_pc: u64, code_len: usize, exit: &ChainExit) -> bool {
+    const ORIGINAL_CHAIN_EXIT: [u8; nx86_x64_asm::CHAIN_EXIT_SIZE] = [0xC3, 0x90, 0x90, 0x90, 0x90];
+    exit.block_entry_pc == block_pc
+        && exit.exit_kind == ChainExitKind::UnconditionalBranch
+        && exit.patch_size == nx86_x64_asm::CHAIN_EXIT_SIZE
+        && exit.original_bytes.as_slice() == ORIGINAL_CHAIN_EXIT
+        && exit
+            .patch_offset
+            .checked_add(exit.patch_size)
+            .is_some_and(|end| end <= code_len)
 }
 
 /// A failure building or running the dispatcher.
@@ -236,6 +575,8 @@ pub enum DispatchError {
     DuplicateBlock { pc: u64 },
     #[error("dispatcher has no native blocks")]
     Empty,
+    #[error("dispatcher lost registered native block {pc:#x}")]
+    MissingRegisteredBlock { pc: u64 },
 }
 
 fn function_halt_reasons(function: &Function) -> BTreeMap<u64, String> {
@@ -272,11 +613,17 @@ pub fn run_dispatched_function(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let mut blocks = BTreeMap::new();
+    let mut blocks = HashMap::new();
     for block in &lowered {
         match ExecutableMemory::new(block.lowered.bytes()) {
             Ok(executable) => {
-                blocks.insert(block.entry_pc, executable);
+                blocks.insert(
+                    block.entry_pc,
+                    NativeBlock {
+                        executable,
+                        chain_exits: block.lowered.chain_exits().to_vec(),
+                    },
+                );
             }
             Err(error @ ExecError::UnsupportedHost { .. }) => {
                 return NativeOutcome::unavailable(dump, error);
@@ -290,6 +637,9 @@ pub fn run_dispatched_function(
         max_steps: DEFAULT_MAX_STEPS,
         emergency_jit: None,
         profile_sink: None,
+        chains: ChainCache::default(),
+        native_patch_chaining: false,
+        native_incoming: HashMap::new(),
     };
 
     let outcome = match dispatcher.run(initial, None) {
@@ -322,11 +672,16 @@ pub fn run_dispatched_function(
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, io, path::PathBuf};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        io,
+        path::PathBuf,
+    };
 
     use nx86_profile::{ProfileError, ProfileEvent, ProfileSink, RecordOutcome};
+    use nx86_x64_v4::{ChainExit, ChainExitKind};
 
-    use super::{DEFAULT_MAX_STEPS, DispatchError, Dispatcher};
+    use super::{DEFAULT_MAX_STEPS, DispatchError, Dispatcher, chain_exit_metadata_is_valid};
 
     #[derive(Debug)]
     struct FailingProfileSink;
@@ -343,11 +698,14 @@ mod tests {
     #[test]
     fn profile_failure_is_a_dispatch_error() {
         let mut dispatcher = Dispatcher {
-            blocks: BTreeMap::new(),
+            blocks: HashMap::new(),
             halt_reasons: BTreeMap::new(),
             max_steps: DEFAULT_MAX_STEPS,
             emergency_jit: None,
             profile_sink: Some(Box::new(FailingProfileSink)),
+            chains: crate::chain::ChainCache::default(),
+            native_patch_chaining: false,
+            native_incoming: HashMap::new(),
         };
 
         let error = dispatcher
@@ -357,5 +715,31 @@ mod tests {
             })
             .expect_err("profile failure must stop dispatch");
         assert!(matches!(error, DispatchError::Profile(_)));
+    }
+
+    #[test]
+    fn native_chain_metadata_must_match_the_emitted_slot() {
+        let valid = ChainExit {
+            block_entry_pc: 0x1000,
+            exit_kind: ChainExitKind::UnconditionalBranch,
+            patch_offset: 5,
+            patch_size: nx86_x64_asm::CHAIN_EXIT_SIZE,
+            original_bytes: vec![0xC3, 0x90, 0x90, 0x90, 0x90],
+            successor_pc: 0x1008,
+            patched: false,
+        };
+        assert!(chain_exit_metadata_is_valid(0x1000, 10, &valid));
+
+        let mut wrong_owner = valid.clone();
+        wrong_owner.block_entry_pc = 0x2000;
+        assert!(!chain_exit_metadata_is_valid(0x1000, 10, &wrong_owner));
+
+        let mut wrong_bytes = valid.clone();
+        wrong_bytes.original_bytes[0] = 0x90;
+        assert!(!chain_exit_metadata_is_valid(0x1000, 10, &wrong_bytes));
+
+        let mut out_of_bounds = valid;
+        out_of_bounds.patch_offset = 6;
+        assert!(!chain_exit_metadata_is_valid(0x1000, 10, &out_of_bounds));
     }
 }

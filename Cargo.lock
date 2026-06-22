@@ -1484,6 +1484,7 @@ dependencies = [
  "nx86-jit",
  "nx86-object",
  "nx86-profile",
+ "nx86-x64-asm",
  "nx86-x64-v4",
  "tempfile",
  "thiserror 2.0.18",

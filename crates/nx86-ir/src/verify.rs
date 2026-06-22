@@ -340,9 +340,7 @@ mod tests {
     #[test]
     fn out_of_range_branch_is_rejected() {
         let mut function = valid_function();
-        function.blocks[0].terminator = Terminator::Branch {
-            target: BlockId(5),
-        };
+        function.blocks[0].terminator = Terminator::Branch { target: BlockId(5) };
         assert!(matches!(
             verify(&function),
             Err(VerifyError::BranchTargetOutOfRange { .. })
