@@ -3313,6 +3313,572 @@ Exit criteria:
 
 ---
 
+# NDX Modloader: N Dynamic X
+
+NDX, short for **N Dynamic X**, is Nx86's built-in native mod system. NDX is not a traditional emulator runtime modloader. Its purpose is to convert, validate, resolve, and bake mods ahead of time into deterministic game builds so that minimal work happens at runtime.
+
+NDX SHOULD be treated as a core long-term feature of Nx86. Normal game compatibility comes first.
+
+## Core philosophy
+
+NDX mods are build-time inputs, not loose runtime-loaded mod folders.
+
+Normal launch flow MUST NOT scan raw mod folders, parse arbitrary external layouts, resolve conflicts, or decide cache invalidation at runtime. These operations belong in the NDX import/bake pipeline.
+
+The intended flow is:
+
+```text
+User-provided game content
++ update/DLC
++ built-in GSO/GSC compatibility behavior
++ selected .ndx source mods
+        ↓
+NDX validation and bake step
+        ↓
+effective .nci content image
++ internal .ndxb baked profile/cache artifact
++ generated runtime module
++ native code cache
+        ↓
+launch through Nx86 or standalone minimal runtime
+```
+
+Runtime SHOULD mostly load prepared artifacts and execute already-planned hooks/patches.
+
+## Terminology
+
+```text
+.ndx   = NDX source mod package users download/import/install
+.ndxb  = internal baked NDX build/profile cache artifact
+.nci   = Nx86 Content Image containing the effective game content
+GSO    = Game-Specific Optimizations
+GSC    = Game-Specific Code / compatibility modules
+```
+
+`.ndx` is the source package. Users MAY download or install `.ndx` mods.
+
+`.ndxb` is internal baked output/cache. It is not the primary user-facing package format.
+
+`.nci` contains the entire effective game content image for the selected game build. Game assets SHOULD be stored in the `.nci`. Compiled code remains in Nx86's existing compiled-code/cache system.
+
+## Normal launch model
+
+Nx86 SHOULD bake only when something relevant changed.
+
+Relevant changes include:
+
+* selected mods changed
+* mod metadata changed
+* game content changed
+* update/DLC changed
+* GSO/GSC changed
+* compiler backend changed
+* cache format changed
+* Nx86 version requires cache invalidation
+* cheat state requires rebake or cache update
+* content image is stale
+
+If nothing relevant changed, Nx86 SHOULD launch the existing baked build.
+
+Stale or unsafe baked profiles MUST always be hard-blocked. Nx86 MUST NOT allow stale native cache or stale baked mod output to launch.
+
+## User-facing build model
+
+Profiles are supported, but they are not the preferred normal-user concept.
+
+The normal UX SHOULD show one active **Game Build**.
+
+Advanced users and modders MAY access profile-like behavior under advanced settings, but the ordinary flow SHOULD be:
+
+```text
+Game → Current Build → Mods → Bake if needed → Launch
+```
+
+Profiles MAY still exist internally or for advanced use, but Nx86 SHOULD NOT force users to manage profiles for ordinary modding.
+
+## Importing external mods
+
+NDX is its own native mod system. Nx86 MUST NOT directly load Eden/Yuzu/Ryujinx/Atmosphère folders at runtime.
+
+External emulator mod layouts are import/conversion sources only.
+
+Nx86 SHOULD support importing from:
+
+```text
+Eden-style mod folders
+Yuzu-style mod folders
+Ryujinx-style mod folders
+Atmosphère-style contents folders
+.zip / .7z / .rar / .tar / .tar.gz archives
+existing .ndx packages
+```
+
+When importing a non-`.ndx` mod, Nx86 MUST convert it into an `.ndx` source package.
+
+The original downloaded archive/folder MUST remain untouched wherever the user downloaded it. Nx86 MAY process it in memory and/or temporary storage, but raw external-format leftovers MUST NOT remain inside the per-title Nx86 mod folder after conversion. Temporary processed files SHOULD be flushed from memory/temp storage after conversion.
+
+Converted mods MUST become normalized `.ndx` packages with required metadata.
+
+If an external mod cannot be cleanly converted, Nx86 SHOULD open a conversion wizard where the user can fill missing information or fix ambiguous mappings.
+
+## `.ndx` source packages
+
+`.ndx` is the native Nx86 mod package format.
+
+Every installed `.ndx` mod MUST include or produce an `nxmod.toml`.
+
+A `.ndx` package MAY contain:
+
+```text
+nxmod.toml
+romfs/
+romfs_ext/
+exefs/
+patches/
+cheats/
+assets/
+scripts/
+README.md
+LICENSE
+```
+
+Lua/Luau scripting is optional glue only. Lua/Luau is not the mod format.
+
+Ordinary mods SHOULD work without scripting. File replacement, patch declaration, cheat declaration, metadata, cache planning, and install/import behavior SHOULD be declarative through `.ndx` structure and TOML metadata.
+
+## `.ndx` and `.ndxb` relationship
+
+`.ndx` is the package users download, import, install, and keep for rebuilds/edits.
+
+`.ndxb` is internal baked cache output generated from selected `.ndx` mods, game content, GSO/GSC state, and compiler/cache state.
+
+`.ndxb` MUST NOT be treated as the user's installed mod package.
+
+`.ndx` source packages SHOULD remain installed after baking unless the user removes the mod.
+
+## Removing mods
+
+When a user removes a mod, Nx86 SHOULD remove:
+
+* installed `.ndx`
+* related `.ndxb` baked artifacts
+* generated runtime module data affected by the mod
+* affected `.nci` content image output
+* validation records
+* active build references
+* temporary generated state
+* cache entries specific to that mod, when safe
+
+Nx86 SHOULD then rebuild/recompile only affected parts when possible.
+
+If removing a mod only affects content, Nx86 SHOULD avoid recompiling unrelated code.
+
+If removing a mod affects executable/code state, Nx86 SHOULD prefer partial recompilation. If safe partial recompilation cannot be proven, Nx86 MUST fall back to full rebuild.
+
+## Development mode
+
+NDX SHOULD include a development mode.
+
+Development mode SHOULD provide:
+
+* fast rebake
+* verbose logs
+* conversion diagnostics
+* `nxmod.toml` validation
+* conflict diagnostics
+* cache impact explanation
+* content image inspection
+* patch planning output
+* hook table/debug output when relevant
+
+Development mode MAY be more dynamic than normal user mode, but normal launch SHOULD still prefer baked artifacts.
+
+## Bake pipeline
+
+The NDX bake pipeline SHOULD perform:
+
+1. read installed `.ndx` source packages
+2. validate `nxmod.toml`
+3. apply built-in GSO/GSC compatibility behavior first
+4. apply selected user mods after GSO/GSC
+5. resolve conflicts
+6. validate Title ID and Build ID
+7. classify content, patches, cheats, scripts, and assets
+8. compute file hashes
+9. compute cache impact
+10. generate the effective `.nci` content image
+11. generate internal `.ndxb` baked output/cache metadata
+12. generate one profile/build runtime module
+13. update native code cache, using partial recompilation where safe
+14. hard-block launch if output is stale or unsafe
+
+## GSO/GSC ordering
+
+Built-in GSO/GSC MUST apply before user mods.
+
+User mods MUST NOT override GSO/GSC behavior.
+
+GSO/GSC exists to ensure compatibility, performance, resolution upgrades, FPS behavior, and game-specific fixes. Because these systems protect game correctness and user experience, they always win over user mods.
+
+NDX SHOULD expose GSO/GSC interactions in advanced diagnostics where useful, but users MUST NOT be able to disable or override required compatibility behavior through mods.
+
+## Runtime module generation
+
+Every baked Game Build SHOULD produce one generated runtime module.
+
+Examples:
+
+```text
+game_build.ndx.so
+game_build.ndx.dll
+game_build.ndx.dylib
+```
+
+This generated module represents the entire baked build/profile. It is not one dynamic library per individual mod.
+
+The generated runtime module MAY contain:
+
+* hook table
+* patch table
+* cheat table
+* asset/content redirect table
+* runtime config
+* baked metadata
+* compiled bake-time script results if applicable
+* compatibility metadata
+* cache identity metadata
+
+The runtime module MUST be generated by Nx86/NDX, not downloaded directly from random mods.
+
+Nx86 MUST NOT silently load arbitrary `.dll`, `.so`, or `.dylib` files from mod folders.
+
+## Runtime loading model
+
+Nx86 SHOULD support a hybrid launch model:
+
+1. When launched from the Nx86 menu, Nx86 acts as the launcher and loads the generated runtime module for the selected Game Build.
+2. For standalone exported game bundles, a minimal Nx86 runtime SHOULD load the generated module and prepared content/code artifacts.
+
+Standalone game bundles are a later export goal, not required before baked Game Builds work.
+
+## Static linking option
+
+Statically linked output SHOULD remain an option.
+
+Nx86 MAY support:
+
+* dynamic generated runtime modules
+* mostly/static linked game runtime bundles
+* platform-specific app bundle/export formats
+
+The spec MUST NOT force all builds to use dynamic libraries forever.
+
+## Nx86 Content Image: `.nci`
+
+`.nci` means Nx86 Content Image.
+
+`.nci` SHOULD contain the entire effective game content image for the selected Game Build.
+
+This includes base game content, update content, DLC content where applicable, GSO/GSC content transformations if any, and selected user mod content.
+
+All game assets SHOULD be stored in the `.nci`.
+
+Code SHOULD remain in Nx86's compiled-code/native-cache system rather than being treated as ordinary content assets.
+
+Linux MAY use a SquashFS-like backend for `.nci`, but `.nci` SHOULD be an abstraction, not hardcoded to SquashFS forever. Windows and macOS MAY use different internal content image backends.
+
+## Partial recompilation
+
+Nx86 SHOULD prefer partial recompilation whenever safe.
+
+If a change affects only assets/content, Nx86 SHOULD avoid native code recompilation.
+
+If a change affects code, patches, executable metadata, hook tables, or compiler assumptions, Nx86 SHOULD determine affected regions and recompile only those regions when possible.
+
+If safe partial recompilation is uncertain, Nx86 MUST fall back to full rebuild.
+
+Nx86 MUST NOT use risky stale cache output.
+
+## Cheats
+
+NDX SHOULD support a full runtime cheat manager.
+
+Cheats are part of NDX, but unlike most mod content, they MAY need runtime toggling.
+
+Runtime cheat toggling SHOULD still be planned and validated ahead of time where possible. The cheat manager MUST NOT become a loophole for arbitrary unvalidated runtime patching.
+
+Cheats SHOULD validate:
+
+* Title ID
+* Build ID when applicable
+* game version/update version when applicable
+* memory/code target compatibility
+* conflict with other cheats
+* conflict with GSO/GSC or required compatibility behavior
+
+Cheats MAY be toggled at runtime through the Nx86 UI if validated.
+
+## Luau scripting
+
+Luau MAY be used as optional scripting glue, not as the core modding system.
+
+Luau scripts SHOULD run only during bake/compile time.
+
+Normal runtime MUST NOT execute Luau scripts.
+
+Use cases for Luau MAY include:
+
+* generating patch tables during bake
+* generating randomized data during bake
+* build-time mod configuration logic
+* generating derived content
+* validating or transforming mod assets
+* producing bake-time metadata
+
+Luau SHOULD NOT be required for ordinary `.ndx` mods.
+
+## Internet/repository support
+
+Nx86 MAY support user-added mod repositories and an official curated/mirrored index.
+
+Repository support SHOULD provide `.ndx` packages or metadata needed to install `.ndx` packages.
+
+External downloaded mods SHOULD still pass through the NDX import/conversion/validation pipeline.
+
+Nx86 MUST NOT distribute, fetch, generate, or assist with obtaining:
+
+* Nintendo keys
+* title keys
+* firmware
+* copyrighted game dumps
+* copyrighted Nintendo system files
+* leaked SDK content
+* suspicious payloads
+
+## Safety rules
+
+NDX MUST reject or block:
+
+* path traversal in archives
+* suspicious executables
+* unexpected native libraries
+* arbitrary scripts intended to run at runtime
+* keys/title keys
+* firmware files
+* copyrighted system blobs
+* malformed archives
+* mod payloads that try to overwrite unrelated user files
+* raw external-format leftovers inside per-title mod folders after conversion
+
+NDX MUST NOT mutate the user's original downloaded archive/folder.
+
+NDX MUST NOT mutate original imported game/update/DLC files.
+
+## UI requirements
+
+The per-game UI SHOULD present a **Current Build** view.
+
+It SHOULD show:
+
+* installed `.ndx` mods
+* active/inactive state
+* cache impact
+* build freshness
+* whether bake is needed
+* whether `.nci` is current
+* whether native cache is current
+* cheat manager
+* GSO/GSC status
+* conversion status
+* validation errors
+* rebuild/rebake button
+* remove mod button
+* development mode tools in advanced mode
+
+Primary buttons/actions:
+
+```text
+Import Mod
+Bake/Rebuild Build
+Launch
+Validate
+Remove Mod
+Open Build Folder
+Reset to Clean Build
+Open Conversion Wizard
+Open Development Diagnostics
+```
+
+## Conversion wizard
+
+If an external mod cannot be cleanly converted into `.ndx`, Nx86 SHOULD open a conversion wizard.
+
+The wizard SHOULD help the user provide:
+
+* target game / Title ID
+* game version
+* Build ID if needed
+* mod name
+* mod type
+* content mapping
+* cache impact
+* patch type
+* cheat mapping
+* conflict resolution
+* missing metadata
+* author/license/source if known
+
+The wizard SHOULD generate a valid `nxmod.toml`.
+
+## Implementation architecture
+
+Suggested Rust module layout:
+
+```text
+nx86-ndx/
+  import/
+    archive.rs
+    external_layout.rs
+    conversion_wizard.rs
+  package/
+    ndx.rs
+    manifest.rs
+    metadata.rs
+  bake/
+    planner.rs
+    resolver.rs
+    content_image.rs
+    baked_profile.rs
+    runtime_module.rs
+    cache_plan.rs
+  mods/
+    romfs.rs
+    romfs_ext.rs
+    patches.rs
+    cheats.rs
+    scripts.rs
+  safety/
+    validator.rs
+    trust.rs
+    scanner.rs
+  ui/
+    build_model.rs
+    diagnostics.rs
+    cheat_manager.rs
+```
+
+Responsibilities:
+
+* `archive.rs`: safe archive extraction/import
+* `external_layout.rs`: detect Eden/Yuzu/Ryujinx/Atmosphère-style layouts
+* `conversion_wizard.rs`: user-assisted conversion to `.ndx`
+* `ndx.rs`: read/write/install `.ndx` packages
+* `manifest.rs`: parse and validate `nxmod.toml`
+* `planner.rs`: build high-level bake plan
+* `resolver.rs`: resolve selected mods and conflicts
+* `content_image.rs`: emit `.nci`
+* `baked_profile.rs`: emit `.ndxb`
+* `runtime_module.rs`: generate one runtime module for the selected build
+* `cache_plan.rs`: decide no rebuild, partial rebuild, or full rebuild
+* `cheats.rs`: full runtime cheat manager
+* `scripts.rs`: bake-time Luau support only
+* `validator.rs`: safety and correctness validation
+* `build_model.rs`: UI model for Current Build
+* `diagnostics.rs`: dev-mode logs and explanations
+
+## Required invariants
+
+1. NDX is Nx86's native mod system.
+2. NDX is not traditional runtime mod loading.
+3. `.ndx` source packages are build-time inputs.
+4. `.ndxb` is internal baked cache output.
+5. `.nci` contains the full effective game content image.
+6. Runtime SHOULD do minimal work and mostly load prepared artifacts.
+7. External emulator mod folders are import/conversion sources only.
+8. Nx86 MUST NOT directly load raw Eden/Yuzu/Ryujinx/Atmosphère folders at runtime.
+9. Normal launch bakes only when relevant state changed.
+10. Stale or unsafe baked output is always hard-blocked.
+11. Every baked Game Build emits one generated runtime module, not one module per mod.
+12. Generated runtime modules are produced by Nx86/NDX.
+13. Nx86 MUST NOT load arbitrary native libraries from mod folders.
+14. GSO/GSC applies before user mods.
+15. User mods cannot override GSO/GSC.
+16. Partial recompilation is preferred whenever safe.
+17. If partial recompilation safety is uncertain, fall back to full rebuild.
+18. Luau scripts are bake-time only.
+19. Cheats MAY have a runtime manager, but MUST be validated ahead of time.
+20. The user's original downloaded mod files MUST remain untouched.
+21. Raw converted external-format leftovers MUST NOT remain in per-title mod folders.
+22. Removing a mod removes its `.ndx`, related baked artifacts, generated runtime output, affected `.nci`, and related traces.
+23. Normal UX SHOULD show Current Build; profiles are advanced/supporting behavior, not the preferred normal workflow.
+24. Standalone/single-executable/app-bundle export is a later feature, with Linux/AppImage-style export first and Windows/macOS later.
+25. Statically linked runtime output SHOULD remain an option.
+
+## Phased implementation
+
+### NDX Phase 1: `.ndx` packages and import conversion
+
+* `.ndx` package format
+* required `nxmod.toml`
+* drag-and-drop import
+* safe archive import
+* external layout detection
+* conversion to `.ndx`
+* conversion wizard for ambiguous mods
+* per-title installed mod storage
+
+### NDX Phase 2: Current Build and bake planning
+
+* Current Build UI
+* bake planner
+* validation pipeline
+* GSO/GSC-first ordering
+* conflict detection
+* cache impact calculation
+* hard-block stale output
+
+### NDX Phase 3: `.nci` content images
+
+* full effective content image
+* RomFS/RomFS_ext baking
+* content hashing
+* content image invalidation
+* content-only rebuilds without unnecessary code recompilation
+
+### NDX Phase 4: `.ndxb` and runtime module output
+
+* internal baked profile artifacts
+* one generated runtime module per baked build
+* hook/patch/cheat table emission
+* Nx86 launcher integration
+* minimal runtime loading path
+
+### NDX Phase 5: partial recompilation and code mods
+
+* code-affecting mod support
+* patch planning
+* affected-region analysis
+* partial native recompilation
+* full rebuild fallback when needed
+
+### NDX Phase 6: cheat manager and dev mode
+
+* full runtime cheat manager
+* Build ID validation
+* dev mode fast rebake
+* diagnostics/logs
+* bake-time Luau scripting support
+
+### NDX Phase 7: standalone/export mode
+
+* minimal Nx86 runtime for standalone bundles
+* Linux/AppImage-style export first
+* `.nci` bundled with runtime/cache
+* optional static linking
+* Windows/macOS export later
+
+---
+
 ## 43. Final Design Statement
 
 Nx86 is a game-running monster built around native recompilation.

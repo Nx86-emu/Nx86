@@ -166,6 +166,10 @@ pub struct CompilerConfig {
     /// Experimental Linux x86_64 block-exit patching. Software chaining remains
     /// available when this is disabled or unsupported.
     pub native_patch_chaining: bool,
+    /// When true, memory mirrors get independent storage instead of sharing
+    /// backing pages. Useful for debugging divergent writes. Release mode
+    /// uses false so mirrors share physical backing.
+    pub debug_memory_mirrors: bool,
 }
 
 impl Default for CompilerConfig {
@@ -175,6 +179,7 @@ impl Default for CompilerConfig {
             compile_thread_cap: available_parallelism(),
             all_core_warning_acknowledged: false,
             native_patch_chaining: false,
+            debug_memory_mirrors: false,
         }
     }
 }
@@ -467,6 +472,7 @@ mod tests {
         assert_eq!(config.prototype.gui_framework, "egui");
         assert_eq!(config.graphics.backend, GraphicsBackend::Vulkan);
         assert!(!config.compiler.native_patch_chaining);
+        assert!(!config.compiler.debug_memory_mirrors);
         assert!(config.first_run.phase3_wizard_pending);
     }
 
@@ -509,6 +515,7 @@ mod tests {
         config.ui.developer_mode_visible = true;
         config.compiler.all_core_warning_acknowledged = true;
         config.compiler.native_patch_chaining = true;
+        config.compiler.debug_memory_mirrors = true;
 
         let serialized = toml::to_string_pretty(&config).expect("config should serialize");
         let decoded: AppConfig = toml::from_str(&serialized).expect("config should parse");

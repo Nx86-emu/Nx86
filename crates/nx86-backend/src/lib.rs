@@ -1,10 +1,10 @@
-use std::{marker::PhantomData, ptr::NonNull};
+use std::{collections::BTreeMap, fmt, marker::PhantomData, ptr::NonNull};
 
 use nx86_cache::CacheManager;
 use nx86_core::guest::CpuState;
 use nx86_ir::{Function, Terminator};
 use nx86_jit::{ExecError, ExecutableMemory};
-use nx86_vmm::{GuestAddress, GuestMemory, VmmFault};
+use nx86_vmm::{GuestAddress, GuestMemory, PagePermissions, VmmFault};
 use nx86_x64_v4::{LoweredBlock, LoweringError, NativeBlockState, lower_tiny_block};
 use thiserror::Error;
 
@@ -82,6 +82,7 @@ pub struct NativeOutcome {
     pub dump: String,
     pub final_state: Option<CpuState>,
     pub error: Option<String>,
+    pub slowmem_counters: Option<SlowmemCounters>,
 }
 
 #[derive(Debug, Error)]
@@ -98,9 +99,79 @@ pub enum NativeMemoryError {
     },
 }
 
+/// Aggregate slowmem access counters (SPEC 16.3).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SlowmemCounters {
+    /// Total slowmem callback invocations.
+    pub total_calls: u64,
+    /// Calls grouped by reason code.
+    pub by_reason: BTreeMap<String, u64>,
+    /// Calls grouped by guest PC (hot source blocks).
+    pub by_guest_pc: BTreeMap<u64, u64>,
+}
+
+impl SlowmemCounters {
+    pub fn record(&mut self, guest_pc: u64, reason: &str) {
+        self.total_calls += 1;
+        *self.by_reason.entry(reason.to_owned()).or_insert(0) += 1;
+        *self.by_guest_pc.entry(guest_pc).or_insert(0) += 1;
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.total_calls == 0
+    }
+
+    /// Return the `n` hottest guest PCs sorted by count descending.
+    #[must_use]
+    pub fn top_sources(&self, n: usize) -> Vec<(u64, u64)> {
+        let mut entries: Vec<(u64, u64)> = self
+            .by_guest_pc
+            .iter()
+            .map(|(&pc, &count)| (pc, count))
+            .collect();
+        entries.sort_by_key(|b| std::cmp::Reverse(b.1));
+        entries.truncate(n);
+        entries
+    }
+}
+
+/// Structured crash report for a VMM fault (SPEC 25.4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FaultReport {
+    pub faulting_address: u64,
+    pub access_kind: MemoryAccessKind,
+    pub guest_pc: u64,
+    pub source_block_pc: u64,
+    pub page_permissions: Option<PagePermissions>,
+    pub fault_kind: &'static str,
+}
+
+impl fmt::Display for FaultReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "=== VMM FAULT ===")?;
+        writeln!(f, "  Faulting address: {:#018x}", self.faulting_address)?;
+        writeln!(f, "  Access type:      {:?}", self.access_kind)?;
+        writeln!(f, "  Guest PC:         {:#018x}", self.guest_pc)?;
+        writeln!(f, "  Source block:     {:#018x}", self.source_block_pc)?;
+        writeln!(f, "  Fault kind:       {}", self.fault_kind)?;
+        match &self.page_permissions {
+            Some(perms) => writeln!(
+                f,
+                "  Page permissions: R{} W{} X{}",
+                perms.read as u8, perms.write as u8, perms.execute as u8
+            )?,
+            None => writeln!(f, "  Page permissions: None (unmapped)")?,
+        }
+        write!(f, "=================")
+    }
+}
+
 pub(crate) struct NativeMemoryContext<'a> {
     memory: Option<NonNull<GuestMemory>>,
     failure: Option<NativeMemoryError>,
+    counters: SlowmemCounters,
+    pending_events: Vec<ProfileEvent>,
     _borrow: PhantomData<&'a mut GuestMemory>,
 }
 
@@ -116,6 +187,8 @@ impl<'a> NativeMemoryContext<'a> {
             Self {
                 memory: Some(NonNull::from(memory)),
                 failure: None,
+                counters: SlowmemCounters::default(),
+                pending_events: Vec::new(),
                 _borrow: PhantomData,
             },
             base,
@@ -127,6 +200,12 @@ impl<'a> NativeMemoryContext<'a> {
         Self {
             memory: None,
             failure: None,
+            counters: SlowmemCounters {
+                total_calls: 0,
+                by_reason: BTreeMap::new(),
+                by_guest_pc: BTreeMap::new(),
+            },
+            pending_events: Vec::new(),
             _borrow: PhantomData,
         }
     }
@@ -149,6 +228,82 @@ impl<'a> NativeMemoryContext<'a> {
     pub(crate) fn take_failure(&mut self) -> Option<NativeMemoryError> {
         self.failure.take()
     }
+
+    pub(crate) fn take_pending_events(&mut self) -> Vec<ProfileEvent> {
+        std::mem::take(&mut self.pending_events)
+    }
+
+    pub(crate) fn counters(&self) -> &SlowmemCounters {
+        &self.counters
+    }
+
+    #[allow(unsafe_code)]
+    pub(crate) fn build_fault_report(
+        &self,
+        error: &NativeMemoryError,
+        source_block_pc: u64,
+    ) -> FaultReport {
+        match error {
+            NativeMemoryError::MissingContext => FaultReport {
+                faulting_address: 0,
+                access_kind: MemoryAccessKind::Read,
+                guest_pc: 0,
+                source_block_pc,
+                page_permissions: None,
+                fault_kind: "no_context",
+            },
+            NativeMemoryError::InvalidSize { .. } => FaultReport {
+                faulting_address: 0,
+                access_kind: MemoryAccessKind::Read,
+                guest_pc: 0,
+                source_block_pc,
+                page_permissions: None,
+                fault_kind: "invalid_size",
+            },
+            NativeMemoryError::Vmm { guest_pc, source } => {
+                let (fault_kind, access_kind, faulting_address, perms) = match source {
+                    VmmFault::Unmapped { address } => {
+                        ("unmapped", MemoryAccessKind::Read, address.0, None)
+                    }
+                    VmmFault::Permission {
+                        address,
+                        access,
+                        permissions,
+                    } => {
+                        let kind = match access {
+                            nx86_vmm::MemoryAccess::Read => MemoryAccessKind::Read,
+                            nx86_vmm::MemoryAccess::Write => MemoryAccessKind::Write,
+                            nx86_vmm::MemoryAccess::Execute => MemoryAccessKind::Execute,
+                        };
+                        ("permission", kind, address.0, Some(*permissions))
+                    }
+                    VmmFault::OutOfRange { address, .. } => {
+                        ("out_of_range", MemoryAccessKind::Read, address.0, None)
+                    }
+                    VmmFault::ArenaReservation { .. } => ("arena", MemoryAccessKind::Read, 0, None),
+                    VmmFault::MirrorSourceUnmapped { address } => {
+                        ("mirror_unmapped", MemoryAccessKind::Read, address.0, None)
+                    }
+                    VmmFault::MirrorTargetMapped { address } => {
+                        ("mirror_target", MemoryAccessKind::Read, address.0, None)
+                    }
+                };
+                let page_perms = perms.or_else(|| {
+                    self.memory.and_then(|m| {
+                        unsafe { m.as_ref() }.page_permissions(GuestAddress(faulting_address))
+                    })
+                });
+                FaultReport {
+                    faulting_address,
+                    access_kind,
+                    guest_pc: *guest_pc,
+                    source_block_pc,
+                    page_permissions: page_perms,
+                    fault_kind,
+                }
+            }
+        }
+    }
 }
 
 #[allow(unsafe_code)]
@@ -164,29 +319,66 @@ extern "C" fn slowmem_read(
     // completes synchronously while their stack owners remain alive.
     let (context, state) = unsafe { (&mut *context, &mut *state) };
     let Some(memory) = context.memory else {
+        context.counters.record(guest_pc, "no_context");
         context.failure = Some(NativeMemoryError::MissingContext);
         state.pc = guest_pc;
         return 1;
     };
     let Ok(size) = usize::try_from(size) else {
+        context.counters.record(guest_pc, "invalid_size");
         context.failure = Some(NativeMemoryError::InvalidSize { size });
         state.pc = guest_pc;
         return 1;
     };
     if !matches!(size, 4 | 8) {
+        context.counters.record(guest_pc, "invalid_size");
         context.failure = Some(NativeMemoryError::InvalidSize { size: size as u64 });
         state.pc = guest_pc;
         return 1;
     }
     // SAFETY: the context owns the exclusive GuestMemory borrow for this run.
-    match unsafe { memory.as_ref() }.read(GuestAddress(address), size) {
+    let memory_ref = unsafe { memory.as_ref() };
+    let reason = if memory_ref.is_mirror(GuestAddress(address)) {
+        "mirror"
+    } else if state.fastmem_base == 0 {
+        "no_fastmem"
+    } else if state.fastmem_permissions == 0 {
+        "no_permissions"
+    } else {
+        "checked"
+    };
+    match memory_ref.read(GuestAddress(address), size) {
         Ok(bytes) => {
+            context.counters.record(guest_pc, reason);
             let mut value = [0u8; 8];
             value[..size].copy_from_slice(&bytes);
             state.slowmem_value = u64::from_le_bytes(value);
+            context.pending_events.push(ProfileEvent::Slowmem {
+                guest_pc,
+                address,
+                size_bytes: size as u32,
+                access: MemoryAccessKind::Read,
+                reason_code: reason.to_owned(),
+            });
             0
         }
         Err(source) => {
+            let fault_reason = match &source {
+                VmmFault::Unmapped { .. } => "unmapped",
+                VmmFault::Permission { .. } => "permission",
+                VmmFault::OutOfRange { .. } => "out_of_range",
+                VmmFault::ArenaReservation { .. } => "arena",
+                VmmFault::MirrorSourceUnmapped { .. } => "mirror_unmapped",
+                VmmFault::MirrorTargetMapped { .. } => "mirror_target",
+            };
+            context.counters.record(guest_pc, fault_reason);
+            context.pending_events.push(ProfileEvent::Slowmem {
+                guest_pc,
+                address,
+                size_bytes: size as u32,
+                access: MemoryAccessKind::Read,
+                reason_code: fault_reason.to_owned(),
+            });
             context.failure = Some(NativeMemoryError::Vmm { guest_pc, source });
             state.pc = guest_pc;
             1
@@ -206,25 +398,67 @@ extern "C" fn slowmem_write(
     // SAFETY: generated code receives both pointers from `configure`; the call
     // completes synchronously while their stack owners remain alive.
     let (context, state) = unsafe { (&mut *context, &mut *state) };
-    let Some(mut memory) = context.memory else {
+    let Some(memory) = context.memory else {
+        context.counters.record(guest_pc, "no_context");
         context.failure = Some(NativeMemoryError::MissingContext);
         state.pc = guest_pc;
         return 1;
     };
     let Ok(size) = usize::try_from(size) else {
+        context.counters.record(guest_pc, "invalid_size");
         context.failure = Some(NativeMemoryError::InvalidSize { size });
         state.pc = guest_pc;
         return 1;
     };
     if !matches!(size, 4 | 8) {
+        context.counters.record(guest_pc, "invalid_size");
         context.failure = Some(NativeMemoryError::InvalidSize { size: size as u64 });
         state.pc = guest_pc;
         return 1;
     }
     // SAFETY: the context owns the exclusive GuestMemory borrow for this run.
+    let memory_ref = unsafe { memory.as_ref() };
+    let reason = if memory_ref.is_mirror(GuestAddress(address)) {
+        "mirror"
+    } else if state.fastmem_base == 0 {
+        "no_fastmem"
+    } else if state.fastmem_permissions == 0 {
+        "no_permissions"
+    } else {
+        "checked"
+    };
+    // SAFETY: the context owns the exclusive GuestMemory borrow for this run.
+    // `NonNull` is `Copy` so `memory` is still valid after the `Some` guard.
+    let mut memory = memory;
     match unsafe { memory.as_mut() }.write(GuestAddress(address), &value.to_le_bytes()[..size]) {
-        Ok(()) => 0,
+        Ok(()) => {
+            context.counters.record(guest_pc, reason);
+            context.pending_events.push(ProfileEvent::Slowmem {
+                guest_pc,
+                address,
+                size_bytes: size as u32,
+                access: MemoryAccessKind::Write,
+                reason_code: reason.to_owned(),
+            });
+            0
+        }
         Err(source) => {
+            let fault_reason = match &source {
+                VmmFault::Unmapped { .. } => "unmapped",
+                VmmFault::Permission { .. } => "permission",
+                VmmFault::OutOfRange { .. } => "out_of_range",
+                VmmFault::ArenaReservation { .. } => "arena",
+                VmmFault::MirrorSourceUnmapped { .. } => "mirror_unmapped",
+                VmmFault::MirrorTargetMapped { .. } => "mirror_target",
+            };
+            context.counters.record(guest_pc, fault_reason);
+            context.pending_events.push(ProfileEvent::Slowmem {
+                guest_pc,
+                address,
+                size_bytes: size as u32,
+                access: MemoryAccessKind::Write,
+                reason_code: fault_reason.to_owned(),
+            });
             context.failure = Some(NativeMemoryError::Vmm { guest_pc, source });
             state.pc = guest_pc;
             1
@@ -244,6 +478,7 @@ impl NativeOutcome {
             dump,
             final_state: None,
             error: Some(error.to_string()),
+            slowmem_counters: None,
         }
     }
 
@@ -269,6 +504,7 @@ impl NativeOutcome {
             dump,
             final_state: None,
             error: Some(error.to_string()),
+            slowmem_counters: None,
         }
     }
 
@@ -278,6 +514,7 @@ impl NativeOutcome {
             dump,
             final_state: None,
             error: Some(error.to_string()),
+            slowmem_counters: None,
         }
     }
 }
@@ -310,6 +547,10 @@ pub struct CoverageSnapshot {
     pub unpromotable_unknown_pc: usize,
     /// Profile blocks that failed compilation (potentially transient).
     pub failed_compilation: usize,
+    /// Slowmem calls observed in the profile (SPEC 16.3).
+    pub slowmem_calls: u64,
+    /// Total memory accesses (fast + slow) if known; 0 = not tracked.
+    pub total_accesses: u64,
 }
 
 /// A failure during profile-guided rebuild.
@@ -352,6 +593,12 @@ pub fn rebuild_from_profile(
 
     let total_native_blocks = cache.scan().map_err(RebuildError::Cache)?.object_count();
 
+    let slowmem_calls = profile
+        .records
+        .iter()
+        .filter(|r| matches!(r.event, ProfileEvent::Slowmem { .. }))
+        .count() as u64;
+
     Ok(RebuildOutcome {
         total_jit_blocks,
         promoted,
@@ -363,6 +610,10 @@ pub fn rebuild_from_profile(
             total_native_blocks,
             unpromotable_unknown_pc: skipped_unknown_pc,
             failed_compilation: errors,
+            slowmem_calls,
+            // Fastmem access counting requires per-block instrumentation (future
+            // phase); only slowmem is observable from profile events today.
+            total_accesses: 0,
         },
     })
 }
@@ -436,6 +687,7 @@ fn run_tiny_native_block_with_memory(
         dump,
         final_state: Some(final_state),
         error: None,
+        slowmem_counters: Some(memory_context.counters().clone()),
     }
 }
 
@@ -1185,6 +1437,8 @@ mod tests {
                     total_native_blocks: 1,
                     unpromotable_unknown_pc: 0,
                     failed_compilation: 0,
+                    slowmem_calls: 0,
+                    total_accesses: 0,
                 },
             }
         );

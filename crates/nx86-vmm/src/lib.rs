@@ -57,6 +57,9 @@ pub struct GuestMemory {
     arena: arena::ArenaReservation,
     pages: BTreeMap<u64, Page>,
     fastmem_permissions: Vec<u8>,
+    mirrors: BTreeMap<u64, u64>,
+    mirror_sources: BTreeMap<u64, Vec<u64>>,
+    debug_mode: bool,
 }
 
 /// Borrowed native fastmem metadata. The base addresses remain valid only for
@@ -88,6 +91,10 @@ impl FastmemView<'_> {
 
 impl GuestMemory {
     pub fn new() -> Result<Self, VmmFault> {
+        Self::new_with_mode(false)
+    }
+
+    pub fn new_with_mode(debug_mode: bool) -> Result<Self, VmmFault> {
         let arena = arena::ArenaReservation::new()?;
         let fastmem_permissions = if arena.base().is_some() {
             vec![0; PAGE_COUNT]
@@ -98,6 +105,9 @@ impl GuestMemory {
             arena,
             pages: BTreeMap::new(),
             fastmem_permissions,
+            mirrors: BTreeMap::new(),
+            mirror_sources: BTreeMap::new(),
+            debug_mode,
         })
     }
 
@@ -106,6 +116,9 @@ impl GuestMemory {
             arena: arena::ArenaReservation::logical(),
             pages: BTreeMap::new(),
             fastmem_permissions: Vec::new(),
+            mirrors: BTreeMap::new(),
+            mirror_sources: BTreeMap::new(),
+            debug_mode: false,
         }
     }
 
@@ -148,9 +161,23 @@ impl GuestMemory {
         Ok(())
     }
 
+    /// Return the permissions for the page containing `address`, or `None` if
+    /// the page is not mapped.
+    #[must_use]
+    pub fn page_permissions(&self, address: GuestAddress) -> Option<PagePermissions> {
+        self.pages.get(&address.page_base()).map(|p| p.permissions)
+    }
+
     pub fn unmap_page(&mut self, address: GuestAddress) -> Result<(), VmmFault> {
         self.check_range(GuestAddress(address.page_base()), 1)?;
         let page_base = address.page_base();
+        if let Some(dependents) = self.mirror_sources.get(&page_base)
+            && !dependents.is_empty()
+        {
+            return Err(VmmFault::MirrorTargetMapped {
+                address: GuestAddress(page_base),
+            });
+        }
         self.arena.unmap_page(page_base)?;
         self.pages.remove(&page_base);
         if let Some(entry) = self.fastmem_permissions.get_mut(page_index(page_base)) {
@@ -178,22 +205,49 @@ impl GuestMemory {
             let page_base = current_address.page_base();
             let offset = current_address.page_offset();
             let chunk_len = remaining.len().min(PAGE_SIZE as usize - offset);
-            let page = self.pages.get_mut(&page_base).ok_or(VmmFault::Unmapped {
-                address: GuestAddress(page_base),
-            })?;
-            if !page.permissions.write {
-                return Err(VmmFault::Permission {
-                    address: current_address,
-                    access: MemoryAccess::Write,
-                    permissions: page.permissions,
-                });
+            let resolved = self.resolve_address(current_address);
+            let is_mirror = self.mirrors.contains_key(&page_base);
+
+            {
+                let page = self.pages.get(&page_base).ok_or(VmmFault::Unmapped {
+                    address: GuestAddress(page_base),
+                })?;
+                if !page.permissions.write {
+                    return Err(VmmFault::Permission {
+                        address: current_address,
+                        access: MemoryAccess::Write,
+                        permissions: page.permissions,
+                    });
+                }
             }
 
-            if let Some(data) = &mut page.data {
-                data[offset..offset + chunk_len].copy_from_slice(&remaining[..chunk_len]);
+            if is_mirror && self.arena.base().is_none() {
+                let canonical_page =
+                    self.pages
+                        .get_mut(&resolved.page_base())
+                        .ok_or(VmmFault::Unmapped {
+                            address: GuestAddress(resolved.page_base()),
+                        })?;
+                let canonical_data =
+                    canonical_page
+                        .data
+                        .as_mut()
+                        .ok_or(VmmFault::ArenaReservation {
+                            message: "mirror canonical has no backing data".to_owned(),
+                        })?;
+                let c_off = resolved.page_offset();
+                canonical_data[c_off..c_off + chunk_len].copy_from_slice(&remaining[..chunk_len]);
             } else {
-                self.arena.copy_in(current, &remaining[..chunk_len])?;
+                let page = self.pages.get_mut(&page_base).ok_or(VmmFault::Unmapped {
+                    address: GuestAddress(page_base),
+                })?;
+                if let Some(data) = &mut page.data {
+                    data[offset..offset + chunk_len].copy_from_slice(&remaining[..chunk_len]);
+                } else {
+                    self.arena.copy_in(resolved.0, &remaining[..chunk_len])?;
+                }
             }
+
             remaining = &remaining[chunk_len..];
             current += chunk_len as u64;
         }
@@ -228,12 +282,30 @@ impl GuestMemory {
                 });
             }
 
+            let resolved = self.resolve_address(current_address);
             if let Some(data) = &page.data {
                 output[written..written + chunk_len]
                     .copy_from_slice(&data[offset..offset + chunk_len]);
-            } else {
+            } else if self.arena.base().is_some() {
                 self.arena
-                    .copy_out(current, &mut output[written..written + chunk_len])?;
+                    .copy_out(resolved.0, &mut output[written..written + chunk_len])?;
+            } else if self.mirrors.contains_key(&page_base) {
+                let canonical_page =
+                    self.pages
+                        .get(&resolved.page_base())
+                        .ok_or(VmmFault::Unmapped {
+                            address: GuestAddress(resolved.page_base()),
+                        })?;
+                let canonical_data =
+                    canonical_page
+                        .data
+                        .as_deref()
+                        .ok_or(VmmFault::ArenaReservation {
+                            message: "mirror canonical has no backing data".to_owned(),
+                        })?;
+                output[written..written + chunk_len].copy_from_slice(
+                    &canonical_data[resolved.page_offset()..resolved.page_offset() + chunk_len],
+                );
             }
             written += chunk_len;
             current += chunk_len as u64;
@@ -300,6 +372,121 @@ impl GuestMemory {
         *entry = (u8::from(permissions.read) * FASTMEM_READ)
             | (u8::from(permissions.write) * FASTMEM_WRITE);
     }
+
+    #[must_use]
+    pub const fn is_debug_mode(&self) -> bool {
+        self.debug_mode
+    }
+
+    pub fn mirror_page(
+        &mut self,
+        mirror: GuestAddress,
+        canonical: GuestAddress,
+        permissions: PagePermissions,
+    ) -> Result<(), VmmFault> {
+        let mirror_base = mirror.page_base();
+        let canonical_base = canonical.page_base();
+        self.check_range(GuestAddress(mirror_base), PAGE_SIZE as usize)?;
+        self.check_range(GuestAddress(canonical_base), PAGE_SIZE as usize)?;
+
+        if !self.pages.contains_key(&canonical_base) {
+            return Err(VmmFault::MirrorSourceUnmapped {
+                address: GuestAddress(canonical_base),
+            });
+        }
+        if self.mirrors.contains_key(&canonical_base) {
+            return Err(VmmFault::MirrorSourceUnmapped {
+                address: GuestAddress(canonical_base),
+            });
+        }
+        let canonical_permissions = self.pages.get(&canonical_base).map(|p| p.permissions);
+        if let Some(cp) = canonical_permissions
+            && ((permissions.read && !cp.read)
+                || (permissions.write && !cp.write)
+                || (permissions.execute && !cp.execute))
+        {
+            return Err(VmmFault::Permission {
+                address: GuestAddress(canonical_base),
+                access: MemoryAccess::Read,
+                permissions: cp,
+            });
+        }
+        if self.pages.contains_key(&mirror_base) || self.mirrors.contains_key(&mirror_base) {
+            return Err(VmmFault::MirrorTargetMapped {
+                address: GuestAddress(mirror_base),
+            });
+        }
+
+        self.arena.unmap_page(mirror_base)?;
+        if let Some(entry) = self.fastmem_permissions.get_mut(page_index(mirror_base)) {
+            *entry = 0;
+        }
+
+        let data = if self.debug_mode {
+            let canonical_page = self.pages.get(&canonical_base);
+            let source = canonical_page.and_then(|p| p.data.as_deref());
+            match source {
+                Some(src) => Some(src.to_vec()),
+                None => {
+                    let mut buf = vec![0u8; PAGE_SIZE as usize];
+                    self.arena.copy_out(canonical_base, &mut buf)?;
+                    Some(buf)
+                }
+            }
+        } else {
+            None
+        };
+
+        self.pages.insert(mirror_base, Page { permissions, data });
+        if !self.debug_mode {
+            self.mirrors.insert(mirror_base, canonical_base);
+            self.mirror_sources
+                .entry(canonical_base)
+                .or_default()
+                .push(mirror_base);
+        }
+        Ok(())
+    }
+
+    pub fn unmap_mirror(&mut self, mirror: GuestAddress) -> Result<(), VmmFault> {
+        let mirror_base = mirror.page_base();
+        self.check_range(GuestAddress(mirror_base), 1)?;
+        self.arena.unmap_page(mirror_base)?;
+        self.pages.remove(&mirror_base);
+        if let Some(canonical_base) = self.mirrors.remove(&mirror_base)
+            && let Some(sources) = self.mirror_sources.get_mut(&canonical_base)
+        {
+            sources.retain(|&m| m != mirror_base);
+        }
+        if let Some(entry) = self.fastmem_permissions.get_mut(page_index(mirror_base)) {
+            *entry = 0;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn mirror_target(&self, address: GuestAddress) -> Option<GuestAddress> {
+        self.mirrors
+            .get(&address.page_base())
+            .map(|&base| GuestAddress(base | address.page_offset() as u64))
+    }
+
+    #[must_use]
+    pub fn is_mirror(&self, address: GuestAddress) -> bool {
+        self.mirrors.contains_key(&address.page_base())
+    }
+
+    fn resolve_address(&self, address: GuestAddress) -> GuestAddress {
+        let offset = address.page_offset();
+        let mut current_base = address.page_base();
+        for _ in 0..4 {
+            let Some(&canonical_base) = self.mirrors.get(&current_base) else {
+                break;
+            };
+            current_base = canonical_base;
+        }
+        GuestAddress(current_base | offset as u64)
+    }
 }
 
 #[derive(Debug)]
@@ -341,6 +528,10 @@ pub enum VmmFault {
         access: MemoryAccess,
         permissions: PagePermissions,
     },
+    #[error("mirror source {address:?} is not mapped")]
+    MirrorSourceUnmapped { address: GuestAddress },
+    #[error("mirror target {address:?} is already mapped")]
+    MirrorTargetMapped { address: GuestAddress },
 }
 
 #[cfg(target_os = "linux")]
@@ -747,5 +938,467 @@ mod tests {
             .permissions_for(GuestAddress(0x2000))
             .expect("page is in the permission table");
         assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn page_permissions_returns_mapped_page() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0), PagePermissions::READ_WRITE)
+            .expect("page should map");
+        assert_eq!(
+            memory.page_permissions(GuestAddress(0)),
+            Some(PagePermissions::READ_WRITE)
+        );
+    }
+
+    #[test]
+    fn page_permissions_returns_none_for_unmapped() {
+        let memory = GuestMemory::new_logical();
+        assert_eq!(memory.page_permissions(GuestAddress(0)), None);
+    }
+
+    #[test]
+    fn mirror_page_shares_backing() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+
+        memory
+            .write(GuestAddress(0x1004), &[0xAA, 0xBB])
+            .expect("seed should write");
+
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect("mirror should register");
+
+        let bytes = memory
+            .read(GuestAddress(0x2004), 2)
+            .expect("mirror read should succeed");
+        assert_eq!(bytes, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn mirror_write_visible_at_canonical() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect("mirror should register");
+
+        memory
+            .write(GuestAddress(0x2008), &[0xCC, 0xDD])
+            .expect("mirror write should succeed");
+
+        let bytes = memory
+            .read(GuestAddress(0x1008), 2)
+            .expect("canonical read should succeed");
+        assert_eq!(bytes, vec![0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn mirror_unmap_removes_mirror() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect("mirror should register");
+
+        memory
+            .unmap_mirror(GuestAddress(0x2000))
+            .expect("unmap should succeed");
+
+        assert!(matches!(
+            memory.read(GuestAddress(0x2000), 1),
+            Err(VmmFault::Unmapped { .. })
+        ));
+    }
+
+    #[test]
+    fn mirror_requires_mapped_canonical() {
+        let mut memory = GuestMemory::new_logical();
+        let error = memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect_err("should fail");
+
+        assert_eq!(
+            error,
+            VmmFault::MirrorSourceUnmapped {
+                address: GuestAddress(0x1000)
+            }
+        );
+    }
+
+    #[test]
+    fn mirror_rejects_already_mapped_target() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .map_page(GuestAddress(0x2000), PagePermissions::READ_WRITE)
+            .expect("target should map");
+
+        let error = memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect_err("should fail");
+
+        assert_eq!(
+            error,
+            VmmFault::MirrorTargetMapped {
+                address: GuestAddress(0x2000)
+            }
+        );
+    }
+
+    #[test]
+    fn mirror_permissions_independent() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ,
+            )
+            .expect("mirror should register");
+
+        let error = memory
+            .write(GuestAddress(0x2000), &[1])
+            .expect_err("write to read-only mirror should fault");
+
+        assert!(matches!(error, VmmFault::Permission { .. }));
+    }
+
+    #[test]
+    fn mirror_permission_violation_faults() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ,
+            )
+            .expect("mirror should register");
+
+        let error = memory
+            .write(GuestAddress(0x2000), &[1])
+            .expect_err("write should fault");
+
+        assert!(matches!(
+            error,
+            VmmFault::Permission {
+                access: MemoryAccess::Write,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn debug_mode_mirror_is_independent() {
+        let mut memory = GuestMemory::new_logical();
+        memory.debug_mode = true;
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .write(GuestAddress(0x1004), &[0x11])
+            .expect("seed should write");
+
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect("mirror should register");
+
+        memory
+            .write(GuestAddress(0x1004), &[0x22])
+            .expect("canonical write should succeed");
+
+        let mirror_val = memory
+            .read(GuestAddress(0x2004), 1)
+            .expect("mirror read should succeed");
+        assert_eq!(mirror_val, vec![0x11]);
+    }
+
+    #[test]
+    fn debug_mode_mirror_initial_copy() {
+        let mut memory = GuestMemory::new_logical();
+        memory.debug_mode = true;
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .write(GuestAddress(0x1000), &[0xAA, 0xBB, 0xCC, 0xDD])
+            .expect("seed should write");
+
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect("mirror should register");
+
+        let bytes = memory
+            .read(GuestAddress(0x2000), 4)
+            .expect("mirror read should succeed");
+        assert_eq!(bytes, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn release_mode_mirror_shares_backing() {
+        let mut memory = GuestMemory::new_logical();
+        memory.debug_mode = false;
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .write(GuestAddress(0x1004), &[0x11])
+            .expect("seed should write");
+
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect("mirror should register");
+
+        memory
+            .write(GuestAddress(0x1004), &[0x22])
+            .expect("canonical write should succeed");
+
+        let mirror_val = memory
+            .read(GuestAddress(0x2004), 1)
+            .expect("mirror read should succeed");
+        assert_eq!(mirror_val, vec![0x22]);
+    }
+
+    #[test]
+    fn mirror_fastmem_ineligible() {
+        let mut memory = GuestMemory::new_logical();
+        memory.fastmem_permissions = vec![0; super::PAGE_COUNT];
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect("mirror should register");
+
+        let idx = super::page_index(0x1000);
+        assert_eq!(
+            memory.fastmem_permissions[idx],
+            super::FASTMEM_READ | super::FASTMEM_WRITE
+        );
+        assert_eq!(memory.fastmem_permissions[super::page_index(0x2000)], 0);
+    }
+
+    #[test]
+    fn mirror_target_returns_canonical() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect("mirror should register");
+
+        assert_eq!(
+            memory.mirror_target(GuestAddress(0x2004)),
+            Some(GuestAddress(0x1004))
+        );
+    }
+
+    #[test]
+    fn mirror_target_returns_none_for_unmirrored() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("page should map");
+
+        assert_eq!(memory.mirror_target(GuestAddress(0x1000)), None);
+    }
+
+    #[test]
+    fn is_mirror_detects_mirrors() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect("mirror should register");
+
+        assert!(memory.is_mirror(GuestAddress(0x2000)));
+        assert!(!memory.is_mirror(GuestAddress(0x1000)));
+        assert!(!memory.is_mirror(GuestAddress(0x3000)));
+    }
+
+    #[test]
+    fn unmap_canonical_with_active_mirror_fails() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect("mirror should register");
+
+        let error = memory
+            .unmap_page(GuestAddress(0x1000))
+            .expect_err("should fail");
+
+        assert_eq!(
+            error,
+            VmmFault::MirrorTargetMapped {
+                address: GuestAddress(0x1000)
+            }
+        );
+    }
+
+    #[test]
+    fn unmap_mirror_allows_canonical_unmap() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect("mirror should register");
+
+        memory
+            .unmap_mirror(GuestAddress(0x2000))
+            .expect("unmap mirror should succeed");
+        memory
+            .unmap_page(GuestAddress(0x1000))
+            .expect("canonical unmap should now succeed");
+
+        assert!(matches!(
+            memory.read(GuestAddress(0x1000), 1),
+            Err(VmmFault::Unmapped { .. })
+        ));
+    }
+
+    #[test]
+    fn unmap_mirror_cleans_up_source_tracking() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect("mirror should register");
+
+        memory
+            .unmap_mirror(GuestAddress(0x2000))
+            .expect("unmap should succeed");
+
+        assert!(!memory.is_mirror(GuestAddress(0x2000)));
+        assert!(memory.mirror_sources.get(&0x1000).is_none_or(Vec::is_empty));
+    }
+
+    #[test]
+    fn mirror_of_mirror_rejected() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("canonical should map");
+        memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect("first mirror should register");
+
+        let error = memory
+            .mirror_page(
+                GuestAddress(0x3000),
+                GuestAddress(0x2000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect_err("mirror of mirror should fail");
+
+        assert_eq!(
+            error,
+            VmmFault::MirrorSourceUnmapped {
+                address: GuestAddress(0x2000)
+            }
+        );
+    }
+
+    #[test]
+    fn mirror_permissions_cannot_exceed_canonical() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ)
+            .expect("canonical should map read-only");
+
+        let error = memory
+            .mirror_page(
+                GuestAddress(0x2000),
+                GuestAddress(0x1000),
+                PagePermissions::READ_WRITE,
+            )
+            .expect_err("write mirror of read-only canonical should fail");
+
+        assert!(matches!(error, VmmFault::Permission { .. }));
     }
 }

@@ -11,6 +11,10 @@ runtime fallbacks, promote discoveries, and passively rebuild toward higher
 **Native Coverage** (the project's main progress metric — functional readiness
 toward "Pure AOT" native output, not bytes compiled).
 
+Nx86 includes **NDX (N Dynamic X)**, a built-in modloader tightly integrated
+with the AOT-first runtime. NDX is core architecture, not an optional plugin
+system. See the NDX section in `SPEC.md` for the full spec.
+
 `SPEC.md` is authoritative for direction, terminology, roadmap, platform
 strategy, and the legal boundary. When code and SPEC.md disagree, SPEC.md wins.
 Read it before making non-trivial design decisions.
@@ -59,7 +63,7 @@ product target is **Linux `x86_64-v4`**. This shapes everything:
 
 ## Architecture
 
-The repo is split into ~35 crates by emulator subsystem so compiler, runtime,
+The repo is split into ~36 crates by emulator subsystem so compiler, runtime,
 GUI, storage, and graphics boundaries stay explicit. Many are placeholders that
 compile but await later phases (see `docs/developer/crate-plan.md` for the
 active-vs-skeleton breakdown). The currently substantive pieces:
@@ -109,6 +113,20 @@ GUI launch, worker dispatch). `nx86-gui` is the egui shell (wizard, Library/
 Compile/Tests/Settings screens, framebuffer rendering, NxIR and native dump
 views).
 
+**NDX modloader:** `nx86-ndx` is the built-in modloader crate. It handles mod
+discovery (`scanner.rs`), safe archive import (`archive_import.rs`), `nxmod.toml`
+metadata (`manifest.rs`), validation and conflict detection (`validator.rs`),
+virtual RomFS overlays (`overlay.rs`), extension layers (`romfs_ext.rs`), code
+patch operations (`code_patch.rs`), runtime cheats (`cheat.rs`), TOML-backed
+per-game profiles (`profile.rs`), cache impact planning (`cache_plan.rs`),
+repository and GitHub API integration (`repository.rs`), native/Lua trust
+decisions (`trust.rs`), and GUI state exposure (`ui_model.rs`). The native mod
+format is `.ndx` with required `nxmod.toml` metadata. NDX also supports
+Eden-compatible mod imports (`romfs/`, `romfs_ext/`, `exefs/`, `cheats/`).
+Mods are stored per-game inside the compiled/cache folder by Title ID.
+Drag-and-drop is the primary import UX. NDX integrates with the AOT compiler's
+cache planning — partial recompilation is preferred, stale cache is hard-blocked.
+
 **Process model:** multi-process by design — GUI process, isolated compiler
 worker process, and isolated per-title runtime process, talking over a
 **versioned JSON-line IPC** layer. The GUI never executes guest code; only one
@@ -132,3 +150,8 @@ console keys, proprietary SDK code, shared saves, copyrighted binary blobs, or
 personal user data. The prototype does not import or run real Switch software;
 the first real software target after the synthetic native-codegen foundations is
 homebrew. Do not add code paths that import or embed any of the above.
+
+NDX repository/index features must never download, distribute, or assist with
+obtaining Nintendo keys, title keys, firmware, copyrighted game files,
+copyrighted Nintendo system files, or leaked SDK content. Users are responsible
+for using mods legally with their own legally obtained game content.

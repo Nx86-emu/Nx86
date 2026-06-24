@@ -37,8 +37,8 @@ use nx86_x64_v4::{ChainExit, LoweringError, NativeBlockState, lower_function};
 use thiserror::Error;
 
 use crate::{
-    ChainStats, NativeMemoryContext, NativeMemoryError, NativeOutcome, NativeStatus,
-    call_generated_block, chain::ChainCache,
+    ChainStats, FaultReport, NativeMemoryContext, NativeMemoryError, NativeOutcome, NativeStatus,
+    SlowmemCounters, call_generated_block, chain::ChainCache,
 };
 
 /// Default cap on dispatched block calls, guarding against runaway loops.
@@ -64,6 +64,8 @@ pub struct DispatchOutcome {
     pub jit_events: Vec<JitEvent>,
     /// Block-chaining activity during this run.
     pub chain_stats: ChainStats,
+    /// Aggregate slowmem counters from this dispatch run.
+    pub slowmem_counters: SlowmemCounters,
 }
 
 #[derive(Debug)]
@@ -315,11 +317,14 @@ impl Dispatcher {
                 let patched_successor = block.patched_successor();
                 call_generated_block(&block.executable, &mut native)?;
                 if native.memory_fault != 0 {
-                    return Err(DispatchError::Memory(
-                        memory_context
-                            .take_failure()
-                            .unwrap_or(NativeMemoryError::MissingContext),
-                    ));
+                    let error = memory_context
+                        .take_failure()
+                        .unwrap_or(NativeMemoryError::MissingContext);
+                    let report = memory_context.build_fault_report(&error, pc);
+                    return Err(DispatchError::Memory { error, report });
+                }
+                for event in memory_context.take_pending_events() {
+                    self.record_profile(event)?;
                 }
                 steps += 1;
                 if patched_successor.is_some() {
@@ -336,6 +341,7 @@ impl Dispatcher {
                         final_state: native.apply_to_cpu_state(initial.clone(), halt_reason),
                         jit_events,
                         chain_stats: self.chains.stats().difference(chain_stats_before),
+                        slowmem_counters: memory_context.counters().clone(),
                     });
                 }
                 if let Some(target_pc) = patched_successor {
@@ -374,6 +380,7 @@ impl Dispatcher {
                     final_state: native.apply_to_cpu_state(initial.clone(), None),
                     jit_events,
                     chain_stats: self.chains.stats().difference(chain_stats_before),
+                    slowmem_counters: memory_context.counters().clone(),
                 });
             };
             let Some(compilation) = emergency_jit.compile(pc)? else {
@@ -382,6 +389,7 @@ impl Dispatcher {
                     final_state: native.apply_to_cpu_state(initial.clone(), None),
                     jit_events,
                     chain_stats: self.chains.stats().difference(chain_stats_before),
+                    slowmem_counters: memory_context.counters().clone(),
                 });
             };
             self.record_profile(ProfileEvent::JitBlock {
@@ -411,6 +419,7 @@ impl Dispatcher {
             final_state: native.apply_to_cpu_state(initial.clone(), None),
             jit_events,
             chain_stats: self.chains.stats().difference(chain_stats_before),
+            slowmem_counters: memory_context.counters().clone(),
         })
     }
 
@@ -607,8 +616,11 @@ pub enum DispatchError {
     EmergencyJit(#[from] JitError),
     #[error("runtime profile recording failed: {0}")]
     Profile(#[from] ProfileError),
-    #[error("native memory execution failed: {0}")]
-    Memory(#[from] NativeMemoryError),
+    #[error("native memory execution failed: {error}")]
+    Memory {
+        error: NativeMemoryError,
+        report: FaultReport,
+    },
     #[error("multiple native blocks use guest entry pc {pc:#x}")]
     DuplicateBlock { pc: u64 },
     #[error("dispatcher has no native blocks")]
@@ -719,14 +731,23 @@ fn run_dispatched_function_with_memory(
                 dump,
                 final_state: Some(outcome.final_state),
                 error: None,
+                slowmem_counters: Some(outcome.slowmem_counters),
             }
         }
-        DispatchExit::MissingBlock { pc } => {
-            NativeOutcome::error(dump, format!("no native block for guest pc {pc:#x}"))
-        }
-        DispatchExit::StepLimit { steps } => {
-            NativeOutcome::error(dump, format!("dispatcher exceeded {steps} steps"))
-        }
+        DispatchExit::MissingBlock { pc } => NativeOutcome {
+            status: NativeStatus::Error,
+            dump,
+            final_state: None,
+            error: Some(format!("no native block for guest pc {pc:#x}")),
+            slowmem_counters: Some(outcome.slowmem_counters),
+        },
+        DispatchExit::StepLimit { steps } => NativeOutcome {
+            status: NativeStatus::Error,
+            dump,
+            final_state: None,
+            error: Some(format!("dispatcher exceeded {steps} steps")),
+            slowmem_counters: Some(outcome.slowmem_counters),
+        },
     }
 }
 

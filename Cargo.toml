@@ -39,7 +39,7 @@ resolver = "3"
 edition = "2024"
 publish = false
 rust-version = "1.95"
-version = "0.1.0"
+version = "0.0.0"
 
 [workspace.dependencies]
 # Cargo ignores semver build metadata in dependency requirements; Cargo.lock

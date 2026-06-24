@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "nx86-app"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "nx86-core",
  "nx86-debug",
@@ -1454,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "nx86-arm64-decode"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "nx86-core",
  "serde",
@@ -1463,7 +1463,7 @@ dependencies = [
 
 [[package]]
 name = "nx86-arm64-lift"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "nx86-arm64-decode",
  "nx86-ir",
@@ -1472,11 +1472,11 @@ dependencies = [
 
 [[package]]
 name = "nx86-audio"
-version = "0.1.0"
+version = "0.0.0"
 
 [[package]]
 name = "nx86-backend"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "nx86-cache",
  "nx86-core",
@@ -1493,7 +1493,7 @@ dependencies = [
 
 [[package]]
 name = "nx86-cache"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "nx86-object",
  "serde",
@@ -1504,7 +1504,7 @@ dependencies = [
 
 [[package]]
 name = "nx86-core"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "directories",
  "serde",
@@ -1516,26 +1516,26 @@ dependencies = [
 
 [[package]]
 name = "nx86-debug"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "nx86-fuzz"
-version = "0.1.0"
+version = "0.0.0"
 
 [[package]]
 name = "nx86-gpu"
-version = "0.1.0"
+version = "0.0.0"
 
 [[package]]
 name = "nx86-gso"
-version = "0.1.0"
+version = "0.0.0"
 
 [[package]]
 name = "nx86-gui"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "eframe",
  "egui",
@@ -1553,19 +1553,19 @@ dependencies = [
 
 [[package]]
 name = "nx86-hle"
-version = "0.1.0"
+version = "0.0.0"
 
 [[package]]
 name = "nx86-import"
-version = "0.1.0"
+version = "0.0.0"
 
 [[package]]
 name = "nx86-input"
-version = "0.1.0"
+version = "0.0.0"
 
 [[package]]
 name = "nx86-inspector"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "nx86-arm64-decode",
  "nx86-arm64-lift",
@@ -1575,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "nx86-ir"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "nx86-core",
  "serde",
@@ -1585,14 +1585,14 @@ dependencies = [
 
 [[package]]
 name = "nx86-ir-opt"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "nx86-ir",
 ]
 
 [[package]]
 name = "nx86-jit"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "libc",
  "nx86-cache",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "nx86-object"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.18",
@@ -1615,7 +1615,7 @@ dependencies = [
 
 [[package]]
 name = "nx86-profile"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "libc",
  "serde",
@@ -1626,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "nx86-regalloc"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "nx86-ir",
  "nx86-x64-asm",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "nx86-runtime"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "nx86-arm64-decode",
  "nx86-arm64-lift",
@@ -1649,15 +1649,15 @@ dependencies = [
 
 [[package]]
 name = "nx86-scheduler"
-version = "0.1.0"
+version = "0.0.0"
 
 [[package]]
 name = "nx86-shader"
-version = "0.1.0"
+version = "0.0.0"
 
 [[package]]
 name = "nx86-testsuite"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "nx86-core",
  "serde",
@@ -1668,7 +1668,7 @@ dependencies = [
 
 [[package]]
 name = "nx86-title-db"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "nx86-core",
  "rusqlite",
@@ -1680,11 +1680,11 @@ dependencies = [
 
 [[package]]
 name = "nx86-title-profiles"
-version = "0.1.0"
+version = "0.0.0"
 
 [[package]]
 name = "nx86-vmm"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "libc",
  "serde",
@@ -1693,21 +1693,21 @@ dependencies = [
 
 [[package]]
 name = "nx86-vulkan"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "ash",
 ]
 
 [[package]]
 name = "nx86-x64-asm"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "nx86-x64-v4"
-version = "0.1.0"
+version = "0.0.0"
 dependencies = [
  "nx86-core",
  "nx86-ir",
