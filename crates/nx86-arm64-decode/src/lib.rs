@@ -71,6 +71,7 @@ pub enum InstructionClass {
     Branch,
     Exception,
     LoadStore,
+    Atomic,
 }
 
 /// Access width of a load/store.
@@ -167,6 +168,27 @@ pub enum InstructionKind {
         offset: u64,
         size: MemSize,
     },
+    LoadExclusive {
+        rt: u8,
+        rn: u8,
+        size: MemSize,
+    },
+    StoreExclusive {
+        rs: u8,
+        rt: u8,
+        rn: u8,
+        size: MemSize,
+    },
+    LoadAcquire {
+        rt: u8,
+        rn: u8,
+        size: MemSize,
+    },
+    StoreRelease {
+        rt: u8,
+        rn: u8,
+        size: MemSize,
+    },
 }
 
 impl InstructionKind {
@@ -182,6 +204,10 @@ impl InstructionKind {
             Self::Branch { .. } | Self::CondBranch { .. } => InstructionClass::Branch,
             Self::Svc { .. } => InstructionClass::Exception,
             Self::Store { .. } | Self::Load { .. } => InstructionClass::LoadStore,
+            Self::LoadExclusive { .. }
+            | Self::StoreExclusive { .. }
+            | Self::LoadAcquire { .. }
+            | Self::StoreRelease { .. } => InstructionClass::Atomic,
         }
     }
 
@@ -253,6 +279,23 @@ impl InstructionKind {
                     reg_for_size(*rt, *size),
                     gp_or_sp(*rn)
                 )
+            }
+            Self::LoadExclusive { rt, rn, size } => {
+                format!("ldxr {}, [{}]", reg_for_size(*rt, *size), gp_or_sp(*rn))
+            }
+            Self::StoreExclusive { rs, rt, rn, size } => {
+                format!(
+                    "stxr {}, {}, [{}]",
+                    reg_for_size(*rs, MemSize::Word),
+                    reg_for_size(*rt, *size),
+                    gp_or_sp(*rn)
+                )
+            }
+            Self::LoadAcquire { rt, rn, size } => {
+                format!("ldar {}, [{}]", reg_for_size(*rt, *size), gp_or_sp(*rn))
+            }
+            Self::StoreRelease { rt, rn, size } => {
+                format!("stlr {}, [{}]", reg_for_size(*rt, *size), gp_or_sp(*rn))
             }
         }
     }
@@ -360,6 +403,54 @@ fn decode_kind(word: u32, address: u64) -> Result<InstructionKind, DecodeError> 
     }
     if (word & 0xFFC0_0000) == 0xF940_0000 {
         return Ok(load_store(true, MemSize::Double, word));
+    }
+
+    // Load/store exclusive and ordered: top byte 0xC8.
+    // LDXR:  L=1, Rs=11111, o0=0
+    // STXR:  L=0, o0=0
+    // LDAR:  L=1, Rs=11111, o0=1
+    // STLR:  L=0, o0=1
+    if (word & 0x3F00_0000) == 0x0800_0000 {
+        let size_bits = bits(word, 30, 2);
+        let mem_size = if size_bits == 0b10 {
+            MemSize::Word
+        } else {
+            MemSize::Double
+        };
+        let l = bit(word, 22);
+        let o0 = bit(word, 21);
+        let rs = bits(word, 16, 5) as u8;
+        let rt = bits(word, 0, 5) as u8;
+        let rn = bits(word, 5, 5) as u8;
+        if l && rs == 0b11111 && !o0 {
+            return Ok(InstructionKind::LoadExclusive {
+                rt,
+                rn,
+                size: mem_size,
+            });
+        }
+        if !l && !o0 {
+            return Ok(InstructionKind::StoreExclusive {
+                rs,
+                rt,
+                rn,
+                size: mem_size,
+            });
+        }
+        if l && rs == 0b11111 && o0 {
+            return Ok(InstructionKind::LoadAcquire {
+                rt,
+                rn,
+                size: mem_size,
+            });
+        }
+        if !l && o0 {
+            return Ok(InstructionKind::StoreRelease {
+                rt,
+                rn,
+                size: mem_size,
+            });
+        }
     }
 
     Err(DecodeError::UnsupportedInstruction { address, word })
@@ -711,5 +802,95 @@ mod tests {
 
         let decoded = decode_program(&[0x3F, 0x00, 0x80, 0xD2], 0).expect("mov xzr should decode");
         assert_eq!(decoded[0].disassembly, "mov xzr, #0x1");
+    }
+
+    #[test]
+    fn decodes_ldxr_stxr_ldar_stlr() {
+        let bytes: Vec<u8> = 0xC85F0020u32
+            .to_le_bytes()
+            .into_iter()
+            .chain(0xC8020020u32.to_le_bytes())
+            .chain(0xC87F0020u32.to_le_bytes())
+            .chain(0xC83F0020u32.to_le_bytes())
+            .collect();
+
+        let decoded = decode_program(&bytes, 0x1000).expect("atomic instructions should decode");
+
+        assert_eq!(
+            decoded[0].kind,
+            InstructionKind::LoadExclusive {
+                rt: 0,
+                rn: 1,
+                size: MemSize::Double
+            }
+        );
+        assert_eq!(decoded[0].class, InstructionClass::Atomic);
+        assert_eq!(decoded[0].disassembly, "ldxr x0, [x1]");
+
+        assert_eq!(
+            decoded[1].kind,
+            InstructionKind::StoreExclusive {
+                rs: 2,
+                rt: 0,
+                rn: 1,
+                size: MemSize::Double
+            }
+        );
+        assert_eq!(decoded[1].class, InstructionClass::Atomic);
+        assert_eq!(decoded[1].disassembly, "stxr w2, x0, [x1]");
+
+        assert_eq!(
+            decoded[2].kind,
+            InstructionKind::LoadAcquire {
+                rt: 0,
+                rn: 1,
+                size: MemSize::Double
+            }
+        );
+        assert_eq!(decoded[2].class, InstructionClass::Atomic);
+        assert_eq!(decoded[2].disassembly, "ldar x0, [x1]");
+
+        assert_eq!(
+            decoded[3].kind,
+            InstructionKind::StoreRelease {
+                rt: 0,
+                rn: 1,
+                size: MemSize::Double
+            }
+        );
+        assert_eq!(decoded[3].class, InstructionClass::Atomic);
+        assert_eq!(decoded[3].disassembly, "stlr x0, [x1]");
+    }
+
+    #[test]
+    fn decodes_32bit_atomic_variants() {
+        let bytes: Vec<u8> = 0x885F0020u32
+            .to_le_bytes()
+            .into_iter()
+            .chain(0x88020020u32.to_le_bytes())
+            .collect();
+
+        let decoded = decode_program(&bytes, 0x1000).expect("32-bit atomics should decode");
+
+        assert_eq!(
+            decoded[0].kind,
+            InstructionKind::LoadExclusive {
+                rt: 0,
+                rn: 1,
+                size: MemSize::Word
+            }
+        );
+        assert_eq!(decoded[0].disassembly, "ldxr w0, [x1]");
+
+        assert_eq!(
+            decoded[1].kind,
+            InstructionKind::StoreExclusive {
+                rs: 2,
+                rt: 0,
+                rn: 1,
+                size: MemSize::Word
+            }
+        );
+        assert_eq!(decoded[1].disassembly, "stxr w2, w0, [x1]");
     }
 }

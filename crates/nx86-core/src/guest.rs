@@ -3,6 +3,16 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Local exclusive monitor for LDXR/STXR (Phase 34).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct ExclusiveMonitor {
+    /// Monitored guest address (`None` = monitor clear).
+    pub address: Option<u64>,
+    /// Size of the exclusive region in bytes (4 or 8).
+    pub size: u8,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub struct CpuState {
@@ -14,6 +24,7 @@ pub struct CpuState {
     fpcr: u32,
     fpsr: u32,
     thread: ThreadState,
+    monitor: ExclusiveMonitor,
     halted: bool,
     halt_reason: Option<String>,
 }
@@ -128,6 +139,21 @@ impl CpuState {
 
     pub fn set_thread(&mut self, thread: ThreadState) {
         self.thread = thread;
+    }
+
+    #[must_use]
+    pub const fn monitor(&self) -> &ExclusiveMonitor {
+        &self.monitor
+    }
+
+    pub fn set_monitor(&mut self, address: u64, size: u8) {
+        self.monitor.address = Some(address);
+        self.monitor.size = size;
+    }
+
+    pub fn clear_monitor(&mut self) {
+        self.monitor.address = None;
+        self.monitor.size = 0;
     }
 
     #[must_use]

@@ -526,6 +526,12 @@ fn lower_inst(
         Op::SetFlags { .. } => {
             return Err(LoweringError::UnsupportedOp { op: "lazy flags" });
         }
+        Op::LoadExclusive { .. } | Op::LoadAcquire { .. } => {
+            return Err(LoweringError::UnsupportedOp { op: "atomic load" });
+        }
+        Op::StoreExclusive { .. } | Op::StoreRelease { .. } => {
+            return Err(LoweringError::UnsupportedOp { op: "atomic store" });
+        }
     }
 
     Ok(())

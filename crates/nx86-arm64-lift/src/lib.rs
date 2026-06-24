@@ -359,6 +359,176 @@ fn lift_data(kind: &InstructionKind, address: u64, out: &mut Vec<Inst>, counter:
                 }
             }
         }
+        InstructionKind::LoadExclusive { rt, rn, size } => {
+            let addr = alloc(counter);
+            push(out, Some(addr), Op::GetReg { reg: reg_sp(*rn) }, address);
+            let (ty, loaded) = match size {
+                MemSize::Word => {
+                    let v = alloc(counter);
+                    push(
+                        out,
+                        Some(v),
+                        Op::LoadExclusive {
+                            ty: Type::I32,
+                            address: addr,
+                        },
+                        address,
+                    );
+                    let ext = alloc(counter);
+                    push(out, Some(ext), Op::ZeroExtend { value: v }, address);
+                    (Type::I32, ext)
+                }
+                MemSize::Double => {
+                    let v = alloc(counter);
+                    push(
+                        out,
+                        Some(v),
+                        Op::LoadExclusive {
+                            ty: Type::I64,
+                            address: addr,
+                        },
+                        address,
+                    );
+                    (Type::I64, v)
+                }
+            };
+            let _ = ty;
+            push(
+                out,
+                None,
+                Op::SetReg {
+                    reg: reg_zr(*rt),
+                    value: loaded,
+                },
+                address,
+            );
+        }
+        InstructionKind::StoreExclusive { rs, rt, rn, size } => {
+            let addr = alloc(counter);
+            push(out, Some(addr), Op::GetReg { reg: reg_sp(*rn) }, address);
+            let data = alloc(counter);
+            push(out, Some(data), Op::GetReg { reg: reg_zr(*rt) }, address);
+            let status = match size {
+                MemSize::Word => {
+                    let trunc = alloc(counter);
+                    push(out, Some(trunc), Op::Trunc { value: data }, address);
+                    let s = alloc(counter);
+                    push(
+                        out,
+                        Some(s),
+                        Op::StoreExclusive {
+                            ty: Type::I32,
+                            address: addr,
+                            value: trunc,
+                        },
+                        address,
+                    );
+                    s
+                }
+                MemSize::Double => {
+                    let s = alloc(counter);
+                    push(
+                        out,
+                        Some(s),
+                        Op::StoreExclusive {
+                            ty: Type::I64,
+                            address: addr,
+                            value: data,
+                        },
+                        address,
+                    );
+                    s
+                }
+            };
+            let ext = alloc(counter);
+            push(out, Some(ext), Op::ZeroExtend { value: status }, address);
+            push(
+                out,
+                None,
+                Op::SetReg {
+                    reg: reg_zr(*rs),
+                    value: ext,
+                },
+                address,
+            );
+        }
+        InstructionKind::LoadAcquire { rt, rn, size } => {
+            let addr = alloc(counter);
+            push(out, Some(addr), Op::GetReg { reg: reg_sp(*rn) }, address);
+            let loaded = match size {
+                MemSize::Word => {
+                    let v = alloc(counter);
+                    push(
+                        out,
+                        Some(v),
+                        Op::LoadAcquire {
+                            ty: Type::I32,
+                            address: addr,
+                        },
+                        address,
+                    );
+                    let ext = alloc(counter);
+                    push(out, Some(ext), Op::ZeroExtend { value: v }, address);
+                    ext
+                }
+                MemSize::Double => {
+                    let v = alloc(counter);
+                    push(
+                        out,
+                        Some(v),
+                        Op::LoadAcquire {
+                            ty: Type::I64,
+                            address: addr,
+                        },
+                        address,
+                    );
+                    v
+                }
+            };
+            push(
+                out,
+                None,
+                Op::SetReg {
+                    reg: reg_zr(*rt),
+                    value: loaded,
+                },
+                address,
+            );
+        }
+        InstructionKind::StoreRelease { rt, rn, size } => {
+            let addr = alloc(counter);
+            push(out, Some(addr), Op::GetReg { reg: reg_sp(*rn) }, address);
+            let data = alloc(counter);
+            push(out, Some(data), Op::GetReg { reg: reg_zr(*rt) }, address);
+            match size {
+                MemSize::Word => {
+                    let trunc = alloc(counter);
+                    push(out, Some(trunc), Op::Trunc { value: data }, address);
+                    push(
+                        out,
+                        None,
+                        Op::StoreRelease {
+                            ty: Type::I32,
+                            address: addr,
+                            value: trunc,
+                        },
+                        address,
+                    );
+                }
+                MemSize::Double => {
+                    push(
+                        out,
+                        None,
+                        Op::StoreRelease {
+                            ty: Type::I64,
+                            address: addr,
+                            value: data,
+                        },
+                        address,
+                    );
+                }
+            }
+        }
         // Terminators are handled by the caller.
         InstructionKind::Branch { .. }
         | InstructionKind::CondBranch { .. }

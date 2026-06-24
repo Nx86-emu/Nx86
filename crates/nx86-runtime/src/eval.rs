@@ -203,6 +203,44 @@ fn execute_op(
             *pending_flags = Some((*op, a, b));
             None
         }
+        Op::LoadExclusive { ty, address } => {
+            let resolved = value_at(values, *address)?;
+            let size = match ty {
+                Type::I32 => 4u8,
+                Type::I64 => 8u8,
+                _ => return Err(EvalError::UnsupportedMemoryType { ty: *ty }),
+            };
+            cpu.set_monitor(resolved, size);
+            Some(load_mem(memory, *ty, resolved)?)
+        }
+        Op::StoreExclusive { ty, address, value } => {
+            let resolved_address = value_at(values, *address)?;
+            let resolved_value = value_at(values, *value)?;
+            let size = match ty {
+                Type::I32 => 4u8,
+                Type::I64 => 8u8,
+                _ => return Err(EvalError::UnsupportedMemoryType { ty: *ty }),
+            };
+            let monitor = cpu.monitor().clone();
+            if monitor.address == Some(resolved_address) && monitor.size == size {
+                store_mem(memory, *ty, resolved_address, resolved_value)?;
+                cpu.clear_monitor();
+                Some(0u64)
+            } else {
+                cpu.clear_monitor();
+                Some(1u64)
+            }
+        }
+        Op::LoadAcquire { ty, address } => {
+            let resolved = value_at(values, *address)?;
+            Some(load_mem(memory, *ty, resolved)?)
+        }
+        Op::StoreRelease { ty, address, value } => {
+            let resolved_address = value_at(values, *address)?;
+            let resolved_value = value_at(values, *value)?;
+            store_mem(memory, *ty, resolved_address, resolved_value)?;
+            None
+        }
     };
 
     if let (Some(value), Some(result)) = (inst.result, computed) {
@@ -301,10 +339,10 @@ fn store_mem(
 #[cfg(test)]
 mod tests {
     use nx86_ir::{
-        Block, BlockId, Cond, DeoptId, DeoptPoint, FlagOp, Function, Inst, Op, Terminator, Type,
-        Value,
+        Block, BlockId, Cond, DeoptId, DeoptPoint, FlagOp, Function, Inst, Op, Reg, Terminator,
+        Type, Value,
     };
-    use nx86_vmm::GuestMemory;
+    use nx86_vmm::{GuestAddress, GuestMemory};
 
     use super::{EvalError, EvalOutcome, evaluate};
 
@@ -428,5 +466,301 @@ mod tests {
             error,
             EvalError::DeoptFailure { deopt: DeoptId(0) }
         ));
+    }
+
+    fn atomic_test_function(ops: Vec<(Option<Value>, Op)>) -> Function {
+        use nx86_ir::{Block, Terminator};
+        let mut instructions = Vec::new();
+        for (i, (result, op)) in ops.into_iter().enumerate() {
+            instructions.push(Inst {
+                result,
+                op,
+                guest_address: (i as u64) * 4,
+            });
+        }
+        instructions.push(Inst {
+            result: None,
+            op: Op::SetReg {
+                reg: Reg::X(0),
+                value: Value(0),
+            },
+            guest_address: (instructions.len() as u64) * 4,
+        });
+        Function {
+            name: "atomic_test".to_owned(),
+            entry_address: 0,
+            value_count: 8,
+            deopt_points: Vec::new(),
+            blocks: vec![Block {
+                instructions,
+                terminator: Terminator::Halt {
+                    reason: "svc #0x0".to_owned(),
+                },
+                terminator_address: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn eval_exclusive_load_sets_monitor() {
+        let function = atomic_test_function(vec![
+            (
+                Some(Value(0)),
+                Op::Const {
+                    ty: Type::I64,
+                    value: 0x1000,
+                },
+            ),
+            (
+                Some(Value(1)),
+                Op::LoadExclusive {
+                    ty: Type::I64,
+                    address: Value(0),
+                },
+            ),
+        ]);
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), nx86_vmm::PagePermissions::READ_WRITE)
+            .expect("page should map");
+        memory
+            .write(GuestAddress(0x1000), &0x42u64.to_le_bytes())
+            .expect("write should succeed");
+
+        let outcome = evaluate(&function, &mut memory).expect("eval should succeed");
+        assert_eq!(outcome.state().monitor().address, Some(0x1000));
+        assert_eq!(outcome.state().monitor().size, 8);
+    }
+
+    #[test]
+    fn eval_exclusive_store_succeeds_when_monitored() {
+        let function = atomic_test_function(vec![
+            (
+                Some(Value(0)),
+                Op::Const {
+                    ty: Type::I64,
+                    value: 0x1000,
+                },
+            ),
+            (
+                Some(Value(1)),
+                Op::LoadExclusive {
+                    ty: Type::I64,
+                    address: Value(0),
+                },
+            ),
+            (
+                Some(Value(2)),
+                Op::Const {
+                    ty: Type::I64,
+                    value: 0xAB,
+                },
+            ),
+            (
+                Some(Value(3)),
+                Op::StoreExclusive {
+                    ty: Type::I64,
+                    address: Value(0),
+                    value: Value(2),
+                },
+            ),
+        ]);
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), nx86_vmm::PagePermissions::READ_WRITE)
+            .expect("page should map");
+
+        let _outcome = evaluate(&function, &mut memory).expect("eval should succeed");
+        let bytes = memory
+            .read(GuestAddress(0x1000), 8)
+            .expect("read should succeed");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes);
+        assert_eq!(u64::from_le_bytes(buf), 0xAB);
+    }
+
+    #[test]
+    fn eval_exclusive_store_fails_when_not_monitored() {
+        let function = atomic_test_function(vec![
+            (
+                Some(Value(0)),
+                Op::Const {
+                    ty: Type::I64,
+                    value: 0x1000,
+                },
+            ),
+            (
+                Some(Value(2)),
+                Op::Const {
+                    ty: Type::I64,
+                    value: 0xAB,
+                },
+            ),
+            (
+                Some(Value(3)),
+                Op::StoreExclusive {
+                    ty: Type::I64,
+                    address: Value(0),
+                    value: Value(2),
+                },
+            ),
+        ]);
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), nx86_vmm::PagePermissions::READ_WRITE)
+            .expect("page should map");
+
+        let _outcome = evaluate(&function, &mut memory).expect("eval should succeed");
+        let bytes = memory
+            .read(GuestAddress(0x1000), 8)
+            .expect("read should succeed");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes);
+        assert_eq!(u64::from_le_bytes(buf), 0);
+    }
+
+    #[test]
+    fn eval_exclusive_store_fails_on_address_mismatch() {
+        let function = atomic_test_function(vec![
+            (
+                Some(Value(0)),
+                Op::Const {
+                    ty: Type::I64,
+                    value: 0x1000,
+                },
+            ),
+            (
+                Some(Value(1)),
+                Op::LoadExclusive {
+                    ty: Type::I64,
+                    address: Value(0),
+                },
+            ),
+            (
+                Some(Value(4)),
+                Op::Const {
+                    ty: Type::I64,
+                    value: 0x2000,
+                },
+            ),
+            (
+                Some(Value(2)),
+                Op::Const {
+                    ty: Type::I64,
+                    value: 0xAB,
+                },
+            ),
+            (
+                Some(Value(3)),
+                Op::StoreExclusive {
+                    ty: Type::I64,
+                    address: Value(4),
+                    value: Value(2),
+                },
+            ),
+        ]);
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), nx86_vmm::PagePermissions::READ_WRITE)
+            .expect("page 1 should map");
+        memory
+            .map_page(GuestAddress(0x2000), nx86_vmm::PagePermissions::READ_WRITE)
+            .expect("page 2 should map");
+
+        let outcome = evaluate(&function, &mut memory).expect("eval should succeed");
+        assert_eq!(outcome.state().monitor().address, None);
+    }
+
+    #[test]
+    fn eval_acquire_load_reads_value() {
+        use nx86_ir::{Block, Terminator};
+        let function = Function {
+            name: "acquire_test".to_owned(),
+            entry_address: 0,
+            value_count: 4,
+            deopt_points: Vec::new(),
+            blocks: vec![Block {
+                instructions: vec![
+                    Inst {
+                        result: Some(Value(0)),
+                        op: Op::Const {
+                            ty: Type::I64,
+                            value: 0x1000,
+                        },
+                        guest_address: 0,
+                    },
+                    Inst {
+                        result: Some(Value(1)),
+                        op: Op::LoadAcquire {
+                            ty: Type::I64,
+                            address: Value(0),
+                        },
+                        guest_address: 4,
+                    },
+                    Inst {
+                        result: None,
+                        op: Op::SetReg {
+                            reg: Reg::X(0),
+                            value: Value(1),
+                        },
+                        guest_address: 8,
+                    },
+                ],
+                terminator: Terminator::Halt {
+                    reason: "svc #0x0".to_owned(),
+                },
+                terminator_address: 12,
+            }],
+        };
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), nx86_vmm::PagePermissions::READ_WRITE)
+            .expect("page should map");
+        memory
+            .write(GuestAddress(0x1000), &0xDEADu64.to_le_bytes())
+            .expect("write should succeed");
+
+        let outcome = evaluate(&function, &mut memory).expect("eval should succeed");
+        assert_eq!(outcome.state().x(0), 0xDEAD);
+    }
+
+    #[test]
+    fn eval_release_store_writes_value() {
+        let function = atomic_test_function(vec![
+            (
+                Some(Value(0)),
+                Op::Const {
+                    ty: Type::I64,
+                    value: 0x1000,
+                },
+            ),
+            (
+                Some(Value(2)),
+                Op::Const {
+                    ty: Type::I64,
+                    value: 0xBEEF,
+                },
+            ),
+            (
+                None,
+                Op::StoreRelease {
+                    ty: Type::I64,
+                    address: Value(0),
+                    value: Value(2),
+                },
+            ),
+        ]);
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), nx86_vmm::PagePermissions::READ_WRITE)
+            .expect("page should map");
+
+        let _outcome = evaluate(&function, &mut memory).expect("eval should succeed");
+        let bytes = memory
+            .read(GuestAddress(0x1000), 8)
+            .expect("read should succeed");
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes);
+        assert_eq!(u64::from_le_bytes(buf), 0xBEEF);
     }
 }

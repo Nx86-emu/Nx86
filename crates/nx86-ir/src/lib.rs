@@ -105,6 +105,26 @@ pub enum Op {
     /// Lazily record the NZCV flag source for `lhs <op> rhs` (Phase 15). NZCV is
     /// not computed here; a later flag consumer materializes it. Side effect.
     SetFlags { op: FlagOp, lhs: Value, rhs: Value },
+    /// Load exclusive: read memory and set the exclusive monitor. Defines a
+    /// value of `ty`. Side effect (sets monitor).
+    LoadExclusive { ty: Type, address: Value },
+    /// Store exclusive: check monitor, write if valid. Defines an `I32` status
+    /// (0 = success, 1 = failure). Side effect (clears monitor, may write).
+    StoreExclusive {
+        ty: Type,
+        address: Value,
+        value: Value,
+    },
+    /// Load-acquire: read memory with acquire ordering (v0: plain read).
+    /// Defines a value of `ty`. Side effect.
+    LoadAcquire { ty: Type, address: Value },
+    /// Store-release: write memory with release ordering (v0: plain write).
+    /// Side effect.
+    StoreRelease {
+        ty: Type,
+        address: Value,
+        value: Value,
+    },
 }
 
 impl Op {
@@ -112,10 +132,17 @@ impl Op {
     #[must_use]
     pub const fn result_type(&self) -> Option<Type> {
         match self {
-            Self::Const { ty, .. } | Self::Binary { ty, .. } | Self::Load { ty, .. } => Some(*ty),
+            Self::Const { ty, .. }
+            | Self::Binary { ty, .. }
+            | Self::Load { ty, .. }
+            | Self::LoadExclusive { ty, .. }
+            | Self::LoadAcquire { ty, .. } => Some(*ty),
             Self::GetReg { .. } | Self::ZeroExtend { .. } => Some(Type::I64),
-            Self::Trunc { .. } => Some(Type::I32),
-            Self::SetReg { .. } | Self::Store { .. } | Self::SetFlags { .. } => None,
+            Self::Trunc { .. } | Self::StoreExclusive { .. } => Some(Type::I32),
+            Self::SetReg { .. }
+            | Self::Store { .. }
+            | Self::SetFlags { .. }
+            | Self::StoreRelease { .. } => None,
         }
     }
 
@@ -124,7 +151,13 @@ impl Op {
     pub const fn is_side_effect(&self) -> bool {
         matches!(
             self,
-            Self::SetReg { .. } | Self::Store { .. } | Self::SetFlags { .. }
+            Self::SetReg { .. }
+                | Self::Store { .. }
+                | Self::SetFlags { .. }
+                | Self::LoadExclusive { .. }
+                | Self::StoreExclusive { .. }
+                | Self::LoadAcquire { .. }
+                | Self::StoreRelease { .. }
         )
     }
 
@@ -140,6 +173,15 @@ impl Op {
             Self::Load { address, .. } => vec![(*address, Type::I64)],
             Self::Store { ty, address, value } => vec![(*address, Type::I64), (*value, *ty)],
             Self::SetFlags { lhs, rhs, .. } => vec![(*lhs, Type::I64), (*rhs, Type::I64)],
+            Self::LoadExclusive { address, .. } | Self::LoadAcquire { address, .. } => {
+                vec![(*address, Type::I64)]
+            }
+            Self::StoreExclusive { ty, address, value } => {
+                vec![(*address, Type::I64), (*value, *ty)]
+            }
+            Self::StoreRelease { ty, address, value } => {
+                vec![(*address, Type::I64), (*value, *ty)]
+            }
         }
     }
 
@@ -367,6 +409,14 @@ fn format_op(op: &Op) -> String {
                 FlagOp::Sub => "subs",
             };
             format!("setflags.{mnemonic} {lhs}, {rhs}")
+        }
+        Op::LoadExclusive { ty, address } => format!("ldxr.{ty} [{address}]"),
+        Op::StoreExclusive { ty, address, value } => {
+            format!("stxr.{ty} [{address}], {value}")
+        }
+        Op::LoadAcquire { ty, address } => format!("ldar.{ty} [{address}]"),
+        Op::StoreRelease { ty, address, value } => {
+            format!("stlr.{ty} [{address}], {value}")
         }
     }
 }

@@ -206,6 +206,81 @@ impl TinyInterpreter {
                 state.set_x(rt, value);
                 state.set_pc(next_pc);
             }
+            InstructionKind::LoadExclusive { rt, rn, size } => {
+                let address = state.read_gp_or_sp(rn);
+                let bytes = size.bytes() as usize;
+                let value = match size {
+                    MemSize::Word => {
+                        let b = memory.read(GuestAddress(address), bytes)?;
+                        let mut w = [0u8; 4];
+                        w.copy_from_slice(&b);
+                        u64::from(u32::from_le_bytes(w))
+                    }
+                    MemSize::Double => {
+                        let b = memory.read(GuestAddress(address), bytes)?;
+                        let mut w = [0u8; 8];
+                        w.copy_from_slice(&b);
+                        u64::from_le_bytes(w)
+                    }
+                };
+                state.set_monitor(address, bytes as u8);
+                state.set_x(rt, value);
+                state.set_pc(next_pc);
+            }
+            InstructionKind::StoreExclusive { rs, rt, rn, size } => {
+                let address = state.read_gp_or_sp(rn);
+                let value = state.x(rt);
+                let bytes = size.bytes() as u8;
+                let monitor = state.monitor().clone();
+                if monitor.address == Some(address) && monitor.size == bytes {
+                    match size {
+                        MemSize::Word => {
+                            memory.write(GuestAddress(address), &(value as u32).to_le_bytes())?;
+                        }
+                        MemSize::Double => {
+                            memory.write(GuestAddress(address), &value.to_le_bytes())?;
+                        }
+                    }
+                    state.set_x(rs, 0);
+                } else {
+                    state.set_x(rs, 1);
+                }
+                state.clear_monitor();
+                state.set_pc(next_pc);
+            }
+            InstructionKind::LoadAcquire { rt, rn, size } => {
+                let address = state.read_gp_or_sp(rn);
+                let bytes = size.bytes() as usize;
+                let value = match size {
+                    MemSize::Word => {
+                        let b = memory.read(GuestAddress(address), bytes)?;
+                        let mut w = [0u8; 4];
+                        w.copy_from_slice(&b);
+                        u64::from(u32::from_le_bytes(w))
+                    }
+                    MemSize::Double => {
+                        let b = memory.read(GuestAddress(address), bytes)?;
+                        let mut w = [0u8; 8];
+                        w.copy_from_slice(&b);
+                        u64::from_le_bytes(w)
+                    }
+                };
+                state.set_x(rt, value);
+                state.set_pc(next_pc);
+            }
+            InstructionKind::StoreRelease { rt, rn, size } => {
+                let address = state.read_gp_or_sp(rn);
+                let value = state.x(rt);
+                match size {
+                    MemSize::Word => {
+                        memory.write(GuestAddress(address), &(value as u32).to_le_bytes())?;
+                    }
+                    MemSize::Double => {
+                        memory.write(GuestAddress(address), &value.to_le_bytes())?;
+                    }
+                }
+                state.set_pc(next_pc);
+            }
         }
         Ok(())
     }
