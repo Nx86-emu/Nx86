@@ -271,6 +271,15 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// Invalidate chains and remove the compiled block at `pc`. The next
+    /// dispatch through this address will trigger recompilation.
+    pub fn evict(&mut self, pc: u64) -> Result<(), DispatchError> {
+        self.invalidate(pc)?;
+        self.blocks.remove(&pc);
+        self.halt_reasons.remove(&pc);
+        Ok(())
+    }
+
     /// Run from `initial`, routing between registered blocks by guest PC until a
     /// block halts, a guest PC is missing, or the step budget is exhausted.
     /// An attached emergency JIT compiles, caches, and installs known missing
@@ -324,8 +333,42 @@ impl Dispatcher {
                     return Err(DispatchError::Memory { error, report });
                 }
                 for event in memory_context.take_pending_events() {
+                    if let ProfileEvent::SmcInvalidate { page_base, .. } = &event {
+                        let stale_pcs: Vec<u64> = self
+                            .blocks
+                            .keys()
+                            .filter(|pc| (**pc & !(nx86_vmm::PAGE_SIZE - 1)) == *page_base)
+                            .copied()
+                            .collect();
+                        for stale_pc in stale_pcs {
+                            self.evict(stale_pc)?;
+                        }
+                    }
                     self.record_profile(event)?;
                 }
+                // Drain SMC events from the signal handler (fastmem writes to
+                // executable pages caught via mprotect + SIGSEGV).
+                for write_address in nx86_vmm::smc_signal::drain_smc_events() {
+                    let page_base = write_address & !(nx86_vmm::PAGE_SIZE - 1);
+                    let stale_pcs: Vec<u64> = self
+                        .blocks
+                        .keys()
+                        .filter(|pc| (**pc & !(nx86_vmm::PAGE_SIZE - 1)) == page_base)
+                        .copied()
+                        .collect();
+                    for stale_pc in stale_pcs {
+                        self.evict(stale_pc)?;
+                    }
+                    self.record_profile(ProfileEvent::SmcInvalidate {
+                        guest_pc: 0,
+                        write_address,
+                        page_base,
+                        generation: 0,
+                    })?;
+                }
+                // Re-protect pages that were temporarily upgraded to RWX by the
+                // signal handler back to RX so future writes trigger SMC again.
+                nx86_vmm::smc_signal::reprotect_pages();
                 steps += 1;
                 if patched_successor.is_some() {
                     self.chains.record_native_entry();
@@ -822,5 +865,62 @@ mod tests {
         let mut out_of_bounds = valid;
         out_of_bounds.patch_offset = 6;
         assert!(!chain_exit_metadata_is_valid(0x1000, 10, &out_of_bounds));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn evict_removes_block_from_dispatcher() {
+        use nx86_ir::{Block, BlockId, Function, Inst, Op, Reg, Terminator, Type, Value};
+
+        let function = Function {
+            name: "evict_test".to_owned(),
+            entry_address: 0,
+            value_count: 2,
+            deopt_points: Vec::new(),
+            blocks: vec![
+                Block {
+                    instructions: vec![
+                        Inst {
+                            result: Some(Value(0)),
+                            op: Op::Const {
+                                ty: Type::I64,
+                                value: 42,
+                            },
+                            guest_address: 0,
+                        },
+                        Inst {
+                            result: None,
+                            op: Op::SetReg {
+                                reg: Reg::X(0),
+                                value: Value(0),
+                            },
+                            guest_address: 0,
+                        },
+                    ],
+                    terminator: Terminator::Branch { target: BlockId(1) },
+                    terminator_address: 4,
+                },
+                Block {
+                    instructions: vec![Inst {
+                        result: Some(Value(1)),
+                        op: Op::GetReg { reg: Reg::X(0) },
+                        guest_address: 8,
+                    }],
+                    terminator: Terminator::Halt {
+                        reason: "svc #0x0".to_owned(),
+                    },
+                    terminator_address: 8,
+                },
+            ],
+        };
+        let mut dispatcher = Dispatcher::from_function(&function).expect("build dispatcher");
+        assert_eq!(dispatcher.block_count(), 2);
+
+        dispatcher.evict(0).expect("evict should succeed");
+        assert_eq!(dispatcher.block_count(), 1);
+        assert!(!dispatcher.blocks.contains_key(&0));
+
+        // The remaining block should still be present.
+        assert!(dispatcher.blocks.contains_key(&8));
     }
 }

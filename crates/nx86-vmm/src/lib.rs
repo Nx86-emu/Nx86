@@ -3,6 +3,8 @@ use std::{collections::BTreeMap, ptr::NonNull};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod smc_signal;
+
 const GIB: u64 = 1024 * 1024 * 1024;
 pub const ARENA_SIZE_BYTES: u64 = 64 * GIB;
 pub const PAGE_SIZE: u64 = 4096;
@@ -60,6 +62,7 @@ pub struct GuestMemory {
     mirrors: BTreeMap<u64, u64>,
     mirror_sources: BTreeMap<u64, Vec<u64>>,
     debug_mode: bool,
+    page_generations: BTreeMap<u64, u64>,
 }
 
 /// Borrowed native fastmem metadata. The base addresses remain valid only for
@@ -108,6 +111,7 @@ impl GuestMemory {
             mirrors: BTreeMap::new(),
             mirror_sources: BTreeMap::new(),
             debug_mode,
+            page_generations: BTreeMap::new(),
         })
     }
 
@@ -119,6 +123,7 @@ impl GuestMemory {
             mirrors: BTreeMap::new(),
             mirror_sources: BTreeMap::new(),
             debug_mode: false,
+            page_generations: BTreeMap::new(),
         }
     }
 
@@ -158,6 +163,10 @@ impl GuestMemory {
         };
         self.pages.insert(page_base.0, Page { permissions, data });
         self.set_fastmem_permissions(page_base.0, permissions);
+        self.page_generations.insert(page_base.0, 0);
+        if permissions.execute {
+            smc_signal::register_executable_page(page_base.0);
+        }
         Ok(())
     }
 
@@ -166,6 +175,18 @@ impl GuestMemory {
     #[must_use]
     pub fn page_permissions(&self, address: GuestAddress) -> Option<PagePermissions> {
         self.pages.get(&address.page_base()).map(|p| p.permissions)
+    }
+
+    #[must_use]
+    pub fn page_generation(&self, address: GuestAddress) -> Option<u64> {
+        self.page_generations.get(&address.page_base()).copied()
+    }
+
+    #[must_use]
+    pub fn is_executable_page(&self, address: GuestAddress) -> bool {
+        self.pages
+            .get(&address.page_base())
+            .is_some_and(|p| p.permissions.execute)
     }
 
     pub fn unmap_page(&mut self, address: GuestAddress) -> Result<(), VmmFault> {
@@ -178,8 +199,14 @@ impl GuestMemory {
                 address: GuestAddress(page_base),
             });
         }
+        if let Some(page) = self.pages.get(&page_base)
+            && page.permissions.execute
+        {
+            smc_signal::unregister_executable_page(page_base);
+        }
         self.arena.unmap_page(page_base)?;
         self.pages.remove(&page_base);
+        self.page_generations.remove(&page_base);
         if let Some(entry) = self.fastmem_permissions.get_mut(page_index(page_base)) {
             *entry = 0;
         }
@@ -208,6 +235,7 @@ impl GuestMemory {
             let resolved = self.resolve_address(current_address);
             let is_mirror = self.mirrors.contains_key(&page_base);
 
+            let is_exec;
             {
                 let page = self.pages.get(&page_base).ok_or(VmmFault::Unmapped {
                     address: GuestAddress(page_base),
@@ -219,6 +247,7 @@ impl GuestMemory {
                         permissions: page.permissions,
                     });
                 }
+                is_exec = page.permissions.execute;
             }
 
             if is_mirror && self.arena.base().is_none() {
@@ -246,6 +275,10 @@ impl GuestMemory {
                 } else {
                     self.arena.copy_in(resolved.0, &remaining[..chunk_len])?;
                 }
+            }
+
+            if is_exec && let Some(generation) = self.page_generations.get_mut(&page_base) {
+                *generation += 1;
             }
 
             remaining = &remaining[chunk_len..];
@@ -748,7 +781,7 @@ mod arena {
 mod tests {
     use super::{
         ARENA_SIZE_BYTES, GuestAddress, GuestMemory, MemoryAccess, PAGE_SIZE, PagePermissions,
-        VmmFault,
+        VmmFault, smc_signal,
     };
 
     #[test]
@@ -1400,5 +1433,92 @@ mod tests {
             .expect_err("write mirror of read-only canonical should fail");
 
         assert!(matches!(error, VmmFault::Permission { .. }));
+    }
+
+    #[test]
+    fn page_generation_starts_at_zero() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_EXECUTE)
+            .expect("page should map");
+
+        assert_eq!(memory.page_generation(GuestAddress(0x1000)), Some(0));
+    }
+
+    #[test]
+    fn page_generation_increments_on_write_to_executable_page() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(
+                GuestAddress(0x1000),
+                PagePermissions {
+                    read: true,
+                    write: true,
+                    execute: true,
+                },
+            )
+            .expect("page should map");
+
+        memory
+            .write(GuestAddress(0x1000), &[0xAA; 4])
+            .expect("write should succeed");
+        assert_eq!(memory.page_generation(GuestAddress(0x1000)), Some(1));
+
+        memory
+            .write(GuestAddress(0x1004), &[0xBB; 4])
+            .expect("write should succeed");
+        assert_eq!(memory.page_generation(GuestAddress(0x1000)), Some(2));
+    }
+
+    #[test]
+    fn page_generation_does_not_increment_on_non_executable_page() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("page should map");
+
+        memory
+            .write(GuestAddress(0x1000), &[0xAA; 4])
+            .expect("write should succeed");
+        assert_eq!(memory.page_generation(GuestAddress(0x1000)), Some(0));
+    }
+
+    #[test]
+    fn is_executable_page_returns_correct_values() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_EXECUTE)
+            .expect("rx page should map");
+        memory
+            .map_page(GuestAddress(0x2000), PagePermissions::READ_WRITE)
+            .expect("rw page should map");
+
+        assert!(memory.is_executable_page(GuestAddress(0x1000)));
+        assert!(!memory.is_executable_page(GuestAddress(0x2000)));
+        assert!(!memory.is_executable_page(GuestAddress(0x3000)));
+    }
+
+    #[test]
+    fn page_generation_removed_on_unmap() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_EXECUTE)
+            .expect("page should map");
+        assert_eq!(memory.page_generation(GuestAddress(0x1000)), Some(0));
+
+        memory
+            .unmap_page(GuestAddress(0x1000))
+            .expect("unmap should succeed");
+        assert_eq!(memory.page_generation(GuestAddress(0x1000)), None);
+    }
+
+    #[test]
+    fn smc_signal_register_unregister_roundtrip() {
+        smc_signal::register_executable_page(0x1000);
+        smc_signal::register_executable_page(0x2000);
+        smc_signal::unregister_executable_page(0x1000);
+        // After unregister, drain should still work (no crash).
+        let events = smc_signal::drain_smc_events();
+        assert!(events.is_empty());
     }
 }

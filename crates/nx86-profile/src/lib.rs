@@ -68,6 +68,12 @@ pub enum ProfileEvent {
         access: MemoryAccessKind,
         reason_code: String,
     },
+    SmcInvalidate {
+        guest_pc: u64,
+        write_address: u64,
+        page_base: u64,
+        generation: u64,
+    },
 }
 
 /// Kind of guest-memory access that required a slow path.
@@ -168,7 +174,8 @@ impl ProfileWriter {
                 } => Some((*source_pc, *target_pc)),
                 ProfileEvent::JitBlock { .. }
                 | ProfileEvent::HelperCall { .. }
-                | ProfileEvent::Slowmem { .. } => None,
+                | ProfileEvent::Slowmem { .. }
+                | ProfileEvent::SmcInvalidate { .. } => None,
             })
             .collect();
 
@@ -196,7 +203,8 @@ impl ProfileSink for ProfileWriter {
             } => Some((*source_pc, *target_pc)),
             ProfileEvent::JitBlock { .. }
             | ProfileEvent::HelperCall { .. }
-            | ProfileEvent::Slowmem { .. } => None,
+            | ProfileEvent::Slowmem { .. }
+            | ProfileEvent::SmcInvalidate { .. } => None,
         };
         if branch_target.is_some_and(|target| self.branch_targets.contains(&target)) {
             return Ok(RecordOutcome::Duplicate);
@@ -261,7 +269,8 @@ impl ProfileLog {
                 }
                 ProfileEvent::BranchTarget { .. }
                 | ProfileEvent::HelperCall { .. }
-                | ProfileEvent::Slowmem { .. } => None,
+                | ProfileEvent::Slowmem { .. }
+                | ProfileEvent::SmcInvalidate { .. } => None,
             })
             .collect()
     }
@@ -440,6 +449,14 @@ fn validate_record_shape(
             "access",
             "reason_code",
         ],
+        ProfileEvent::SmcInvalidate { .. } => &[
+            "format_version",
+            "kind",
+            "guest_pc",
+            "write_address",
+            "page_base",
+            "generation",
+        ],
     };
     if object.len() != expected.len()
         || object
@@ -479,7 +496,8 @@ fn validate_event(event: &ProfileEvent) -> Result<(), ProfileError> {
         ProfileEvent::JitBlock { .. }
         | ProfileEvent::BranchTarget { .. }
         | ProfileEvent::HelperCall { .. }
-        | ProfileEvent::Slowmem { .. } => Ok(()),
+        | ProfileEvent::Slowmem { .. }
+        | ProfileEvent::SmcInvalidate { .. } => Ok(()),
     }
 }
 
@@ -630,6 +648,12 @@ mod tests {
                 access: MemoryAccessKind::Read,
                 reason_code: "page-not-fastmem".to_owned(),
             },
+            ProfileEvent::SmcInvalidate {
+                guest_pc: 0x2004,
+                write_address: 0x8000,
+                page_base: 0x8000,
+                generation: 3,
+            },
         ]
     }
 
@@ -658,6 +682,7 @@ mod tests {
         let text = fs::read_to_string(path).expect("read text");
         assert!(text.contains("\"kind\":\"jit_block\""));
         assert!(text.contains("\"kind\":\"slowmem\""));
+        assert!(text.contains("\"kind\":\"smc_invalidate\""));
     }
 
     #[test]

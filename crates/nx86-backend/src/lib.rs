@@ -440,6 +440,19 @@ extern "C" fn slowmem_write(
                 access: MemoryAccessKind::Write,
                 reason_code: reason.to_owned(),
             });
+            // SMC detection: if the written page is executable, record an
+            // invalidation event so the dispatch loop can evict stale blocks.
+            // SAFETY: the context owns the exclusive GuestMemory borrow.
+            let mem = unsafe { memory.as_ref() };
+            if mem.is_executable_page(GuestAddress(address)) {
+                let generation = mem.page_generation(GuestAddress(address)).unwrap_or(0);
+                context.pending_events.push(ProfileEvent::SmcInvalidate {
+                    guest_pc,
+                    write_address: address,
+                    page_base: address & !(nx86_vmm::PAGE_SIZE - 1),
+                    generation,
+                });
+            }
             0
         }
         Err(source) => {
