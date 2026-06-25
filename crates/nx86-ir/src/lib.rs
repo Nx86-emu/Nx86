@@ -81,6 +81,34 @@ pub enum BarrierKind {
     Isb,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FpPrecision {
+    F64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FpBinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VectorArrangement {
+    TwoD,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VectorBinaryOp {
+    AddI64,
+    AddF64,
+}
+
 /// An NxIR operation. Operations either define a value (e.g. [`Op::Binary`]) or
 /// produce a side effect (e.g. [`Op::SetReg`]).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,6 +166,34 @@ pub enum Op {
     /// side effect; runtime execution is a no-op until threading/MMIO/native
     /// semantics arrive.
     Barrier { kind: BarrierKind, option: u8 },
+    /// Scalar floating-point immediate move into a SIMD/FP register.
+    FpMoveImmediate {
+        precision: FpPrecision,
+        rd: u8,
+        bits: u64,
+    },
+    /// Scalar floating-point binary op over SIMD/FP register low lanes.
+    FpScalarBinary {
+        op: FpBinaryOp,
+        precision: FpPrecision,
+        rd: u8,
+        rn: u8,
+        rm: u8,
+    },
+    /// Scalar floating-point compare. Side effect: materializes NZCV.
+    FpCompare {
+        precision: FpPrecision,
+        rn: u8,
+        rm: u8,
+    },
+    /// Basic vector operation over SIMD/FP registers.
+    VectorBinary {
+        op: VectorBinaryOp,
+        arrangement: VectorArrangement,
+        rd: u8,
+        rn: u8,
+        rm: u8,
+    },
 }
 
 impl Op {
@@ -156,7 +212,11 @@ impl Op {
             | Self::Store { .. }
             | Self::SetFlags { .. }
             | Self::StoreRelease { .. }
-            | Self::Barrier { .. } => None,
+            | Self::Barrier { .. }
+            | Self::FpMoveImmediate { .. }
+            | Self::FpScalarBinary { .. }
+            | Self::FpCompare { .. }
+            | Self::VectorBinary { .. } => None,
         }
     }
 
@@ -173,6 +233,10 @@ impl Op {
                 | Self::LoadAcquire { .. }
                 | Self::StoreRelease { .. }
                 | Self::Barrier { .. }
+                | Self::FpMoveImmediate { .. }
+                | Self::FpScalarBinary { .. }
+                | Self::FpCompare { .. }
+                | Self::VectorBinary { .. }
         )
     }
 
@@ -180,7 +244,13 @@ impl Op {
     #[must_use]
     pub fn operand_constraints(&self) -> Vec<(Value, Type)> {
         match self {
-            Self::Const { .. } | Self::GetReg { .. } | Self::Barrier { .. } => Vec::new(),
+            Self::Const { .. }
+            | Self::GetReg { .. }
+            | Self::Barrier { .. }
+            | Self::FpMoveImmediate { .. }
+            | Self::FpScalarBinary { .. }
+            | Self::FpCompare { .. }
+            | Self::VectorBinary { .. } => Vec::new(),
             Self::SetReg { value, .. } => vec![(*value, Type::I64)],
             Self::Binary { ty, lhs, rhs, .. } => vec![(*lhs, *ty), (*rhs, *ty)],
             Self::Trunc { value } => vec![(*value, Type::I64)],
@@ -411,6 +481,44 @@ impl fmt::Display for BarrierKind {
     }
 }
 
+impl fmt::Display for FpPrecision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::F64 => formatter.write_str("f64"),
+        }
+    }
+}
+
+impl fmt::Display for FpBinaryOp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::Add => "fadd",
+            Self::Sub => "fsub",
+            Self::Mul => "fmul",
+            Self::Div => "fdiv",
+        };
+        formatter.write_str(text)
+    }
+}
+
+impl fmt::Display for VectorArrangement {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TwoD => formatter.write_str("2d"),
+        }
+    }
+}
+
+impl fmt::Display for VectorBinaryOp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::AddI64 => "add.i64",
+            Self::AddF64 => "fadd.f64",
+        };
+        formatter.write_str(text)
+    }
+}
+
 #[must_use]
 pub const fn barrier_option_name(option: u8) -> Option<&'static str> {
     match option & 0x0F {
@@ -472,6 +580,32 @@ fn format_op(op: &Op) -> String {
         Op::Barrier { kind, option } => {
             format!("barrier.{kind} {}", format_barrier_option(*option))
         }
+        Op::FpMoveImmediate {
+            precision,
+            rd,
+            bits,
+        } => {
+            format!("fmov.{precision} v{rd}, bits {bits:#x}")
+        }
+        Op::FpScalarBinary {
+            op,
+            precision,
+            rd,
+            rn,
+            rm,
+        } => {
+            format!("{op}.{precision} v{rd}, v{rn}, v{rm}")
+        }
+        Op::FpCompare { precision, rn, rm } => format!("fcmp.{precision} v{rn}, v{rm}"),
+        Op::VectorBinary {
+            op,
+            arrangement,
+            rd,
+            rn,
+            rm,
+        } => {
+            format!("vec.{op}.{arrangement} v{rd}, v{rn}, v{rm}")
+        }
     }
 }
 
@@ -506,8 +640,8 @@ fn format_terminator(terminator: &Terminator) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BarrierKind, BinaryOp, Block, Function, Inst, Module, Op, Reg, Terminator, Type, Value,
-        barrier_option_name,
+        BarrierKind, BinaryOp, Block, FpBinaryOp, FpPrecision, Function, Inst, Module, Op, Reg,
+        Terminator, Type, Value, VectorArrangement, VectorBinaryOp, barrier_option_name,
     };
 
     fn add_function() -> Function {
@@ -691,6 +825,55 @@ mod tests {
         let json = serde_json::to_string(&op).expect("barrier op should serialize");
         let decoded: Op = serde_json::from_str(&json).expect("barrier op should deserialize");
         assert_eq!(decoded, op);
+    }
+
+    #[test]
+    fn fp_and_vector_ops_are_side_effecting_and_serializable() {
+        let ops = [
+            Op::FpMoveImmediate {
+                precision: FpPrecision::F64,
+                rd: 0,
+                bits: 1.0f64.to_bits(),
+            },
+            Op::FpScalarBinary {
+                op: FpBinaryOp::Add,
+                precision: FpPrecision::F64,
+                rd: 2,
+                rn: 0,
+                rm: 1,
+            },
+            Op::FpCompare {
+                precision: FpPrecision::F64,
+                rn: 0,
+                rm: 1,
+            },
+            Op::VectorBinary {
+                op: VectorBinaryOp::AddF64,
+                arrangement: VectorArrangement::TwoD,
+                rd: 3,
+                rn: 0,
+                rm: 1,
+            },
+        ];
+
+        for op in ops {
+            assert_eq!(op.result_type(), None);
+            assert!(op.is_side_effect());
+            assert!(op.operand_constraints().is_empty());
+            let json = serde_json::to_string(&op).expect("op should serialize");
+            let decoded: Op = serde_json::from_str(&json).expect("op should deserialize");
+            assert_eq!(decoded, op);
+        }
+        assert_eq!(
+            super::format_op(&Op::VectorBinary {
+                op: VectorBinaryOp::AddI64,
+                arrangement: VectorArrangement::TwoD,
+                rd: 2,
+                rn: 0,
+                rm: 1,
+            }),
+            "vec.add.i64.2d v2, v0, v1"
+        );
     }
 
     #[test]

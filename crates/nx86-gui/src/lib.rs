@@ -90,6 +90,7 @@ pub struct Nx86App {
     library_ui: screens::LibraryUiState,
     compile_ui: screens::CompileUiState,
     test_ui: screens::TestUiState,
+    scheduler_ui: screens::SchedulerUiState,
     inspector_ui: screens::InspectorUiState,
     worker_process: Option<WorkerProcess>,
 }
@@ -115,6 +116,7 @@ impl Nx86App {
             library_ui: screens::LibraryUiState::default(),
             compile_ui: screens::CompileUiState::default(),
             test_ui: screens::TestUiState::default(),
+            scheduler_ui: screens::SchedulerUiState::default(),
             inspector_ui: screens::InspectorUiState::default(),
             worker_process: None,
         };
@@ -137,6 +139,7 @@ impl Nx86App {
             library_ui: screens::LibraryUiState::default(),
             compile_ui: screens::CompileUiState::default(),
             test_ui: screens::TestUiState::default(),
+            scheduler_ui: screens::SchedulerUiState::default(),
             inspector_ui: screens::InspectorUiState::default(),
             worker_process: None,
         }
@@ -524,6 +527,10 @@ impl Nx86App {
                 screens::TestAction::None => {}
                 screens::TestAction::PickFile => self.pick_synthetic_test_file(),
                 screens::TestAction::LoadPath => self.load_synthetic_test_from_state(),
+            },
+            AppScreen::Scheduler => match screens::scheduler(ui, &mut self.scheduler_ui) {
+                screens::SchedulerAction::None => {}
+                screens::SchedulerAction::Refresh => self.scheduler_ui.refresh(),
             },
             AppScreen::Inspector => {
                 match screens::inspector(ui, &self.titles, &mut self.inspector_ui) {

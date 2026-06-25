@@ -13,11 +13,14 @@
 use std::collections::{BTreeSet, HashMap};
 
 use nx86_arm64_decode::{
-    BarrierKind as DecodedBarrierKind, DecodedInstruction, InstructionKind, LogicalOp, MemSize,
+    BarrierKind as DecodedBarrierKind, DecodedInstruction, FpBinaryOp as DecodedFpBinaryOp,
+    FpPrecision as DecodedFpPrecision, InstructionKind, LogicalOp, MemSize,
+    VectorArrangement as DecodedVectorArrangement, VectorBinaryOp as DecodedVectorBinaryOp,
 };
 use nx86_ir::verify::{self, VerifyError};
 use nx86_ir::{
-    BarrierKind, BinaryOp, Block, BlockId, FlagOp, Function, Inst, Op, Reg, Terminator, Type, Value,
+    BarrierKind, BinaryOp, Block, BlockId, FlagOp, FpBinaryOp, FpPrecision, Function, Inst, Op,
+    Reg, Terminator, Type, Value, VectorArrangement, VectorBinaryOp,
 };
 use thiserror::Error;
 
@@ -544,6 +547,74 @@ fn lift_data(kind: &InstructionKind, address: u64, out: &mut Vec<Inst>, counter:
                 address,
             );
         }
+        InstructionKind::FpMoveImmediate {
+            precision,
+            rd,
+            bits,
+        } => {
+            push(
+                out,
+                None,
+                Op::FpMoveImmediate {
+                    precision: fp_precision(*precision),
+                    rd: *rd,
+                    bits: *bits,
+                },
+                address,
+            );
+        }
+        InstructionKind::FpScalarBinary {
+            op,
+            precision,
+            rd,
+            rn,
+            rm,
+        } => {
+            push(
+                out,
+                None,
+                Op::FpScalarBinary {
+                    op: fp_binary_op(*op),
+                    precision: fp_precision(*precision),
+                    rd: *rd,
+                    rn: *rn,
+                    rm: *rm,
+                },
+                address,
+            );
+        }
+        InstructionKind::FpCompare { precision, rn, rm } => {
+            push(
+                out,
+                None,
+                Op::FpCompare {
+                    precision: fp_precision(*precision),
+                    rn: *rn,
+                    rm: *rm,
+                },
+                address,
+            );
+        }
+        InstructionKind::VectorBinary {
+            op,
+            arrangement,
+            rd,
+            rn,
+            rm,
+        } => {
+            push(
+                out,
+                None,
+                Op::VectorBinary {
+                    op: vector_binary_op(*op),
+                    arrangement: vector_arrangement(*arrangement),
+                    rd: *rd,
+                    rn: *rn,
+                    rm: *rm,
+                },
+                address,
+            );
+        }
         // Terminators are handled by the caller.
         InstructionKind::Branch { .. }
         | InstructionKind::CondBranch { .. }
@@ -728,10 +799,38 @@ const fn barrier_kind(kind: DecodedBarrierKind) -> BarrierKind {
     }
 }
 
+const fn fp_precision(precision: DecodedFpPrecision) -> FpPrecision {
+    match precision {
+        DecodedFpPrecision::Double => FpPrecision::F64,
+    }
+}
+
+const fn fp_binary_op(op: DecodedFpBinaryOp) -> FpBinaryOp {
+    match op {
+        DecodedFpBinaryOp::Add => FpBinaryOp::Add,
+        DecodedFpBinaryOp::Sub => FpBinaryOp::Sub,
+        DecodedFpBinaryOp::Mul => FpBinaryOp::Mul,
+        DecodedFpBinaryOp::Div => FpBinaryOp::Div,
+    }
+}
+
+const fn vector_arrangement(arrangement: DecodedVectorArrangement) -> VectorArrangement {
+    match arrangement {
+        DecodedVectorArrangement::TwoD => VectorArrangement::TwoD,
+    }
+}
+
+const fn vector_binary_op(op: DecodedVectorBinaryOp) -> VectorBinaryOp {
+    match op {
+        DecodedVectorBinaryOp::AddI64 => VectorBinaryOp::AddI64,
+        DecodedVectorBinaryOp::AddF64 => VectorBinaryOp::AddF64,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nx86_arm64_decode::decode_program;
-    use nx86_ir::{BarrierKind, Op};
+    use nx86_ir::{BarrierKind, FpBinaryOp, FpPrecision, Op, VectorArrangement, VectorBinaryOp};
 
     use super::lift_program;
 
@@ -817,5 +916,58 @@ mod tests {
         assert!(dump.contains("barrier.dmb sy"), "{dump}");
         assert!(dump.contains("barrier.dsb ld"), "{dump}");
         assert!(dump.contains("barrier.isb nsh"), "{dump}");
+    }
+
+    #[test]
+    fn lifts_scalar_fp_and_neon_ops() {
+        let bytes: Vec<u8> = 0x1E6E1000u32
+            .to_le_bytes()
+            .into_iter()
+            .chain(0x1E601001u32.to_le_bytes())
+            .chain(0x1E612802u32.to_le_bytes())
+            .chain(0x1E612000u32.to_le_bytes())
+            .chain(0x4EE18402u32.to_le_bytes())
+            .chain(0x4E61D403u32.to_le_bytes())
+            .chain(0xD4000001u32.to_le_bytes())
+            .collect();
+        let instructions = decode_program(&bytes, 0x3000).expect("program should decode");
+
+        let function = lift_program("fp_neon", &instructions, 0x3000).expect("program should lift");
+        let ops: Vec<_> = function.blocks[0]
+            .instructions
+            .iter()
+            .map(|inst| &inst.op)
+            .collect();
+
+        assert!(matches!(
+            ops[0],
+            Op::FpMoveImmediate {
+                precision: FpPrecision::F64,
+                rd: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ops[2],
+            Op::FpScalarBinary {
+                op: FpBinaryOp::Add,
+                precision: FpPrecision::F64,
+                rd: 2,
+                rn: 0,
+                rm: 1,
+            }
+        ));
+        assert!(matches!(ops[3], Op::FpCompare { rn: 0, rm: 1, .. }));
+        assert!(matches!(
+            ops[4],
+            Op::VectorBinary {
+                op: VectorBinaryOp::AddI64,
+                arrangement: VectorArrangement::TwoD,
+                rd: 2,
+                rn: 0,
+                rm: 1,
+            }
+        ));
+        assert!(function.dump().contains("vec.fadd.f64.2d v3, v0, v1"));
     }
 }

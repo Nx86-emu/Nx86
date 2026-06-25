@@ -1,5 +1,6 @@
 use nx86_arm64_decode::{
-    DecodeError, DecodedInstruction, InstructionKind, LogicalOp, MemSize, decode_program,
+    DecodeError, DecodedInstruction, FpBinaryOp, InstructionKind, LogicalOp, MemSize,
+    VectorBinaryOp, decode_program,
 };
 use nx86_arm64_lift::lift_program;
 use nx86_backend::{run_dispatched_function_in, run_tiny_native_block_in};
@@ -284,8 +285,81 @@ impl TinyInterpreter {
             InstructionKind::Barrier { .. } => {
                 state.set_pc(next_pc);
             }
+            InstructionKind::FpMoveImmediate { rd, bits, .. } => {
+                state.set_vector(rd, u128::from(bits));
+                state.set_pc(next_pc);
+            }
+            InstructionKind::FpScalarBinary { op, rd, rn, rm, .. } => {
+                let lhs = state.scalar_f64(rn);
+                let rhs = state.scalar_f64(rm);
+                let value = match op {
+                    FpBinaryOp::Add => lhs + rhs,
+                    FpBinaryOp::Sub => lhs - rhs,
+                    FpBinaryOp::Mul => lhs * rhs,
+                    FpBinaryOp::Div => lhs / rhs,
+                };
+                state.set_scalar_f64(rd, value);
+                state.set_pc(next_pc);
+            }
+            InstructionKind::FpCompare { rn, rm, .. } => {
+                state.set_nzcv(float_compare(state.scalar_f64(rn), state.scalar_f64(rm)));
+                state.set_pc(next_pc);
+            }
+            InstructionKind::VectorBinary { op, rd, rn, rm, .. } => {
+                match op {
+                    VectorBinaryOp::AddI64 => {
+                        for lane in 0..2 {
+                            let value = state
+                                .vector_lane64(rn, lane)
+                                .wrapping_add(state.vector_lane64(rm, lane));
+                            state.set_vector_lane64(rd, lane, value);
+                        }
+                    }
+                    VectorBinaryOp::AddF64 => {
+                        for lane in 0..2 {
+                            let lhs = f64::from_bits(state.vector_lane64(rn, lane));
+                            let rhs = f64::from_bits(state.vector_lane64(rm, lane));
+                            state.set_vector_lane64(rd, lane, (lhs + rhs).to_bits());
+                        }
+                    }
+                }
+                state.set_pc(next_pc);
+            }
         }
         Ok(())
+    }
+}
+
+fn float_compare(lhs: f64, rhs: f64) -> Nzcv {
+    if lhs.is_nan() || rhs.is_nan() {
+        return Nzcv {
+            negative: false,
+            zero: false,
+            carry: true,
+            overflow: true,
+        };
+    }
+    if lhs == rhs {
+        return Nzcv {
+            negative: false,
+            zero: true,
+            carry: true,
+            overflow: false,
+        };
+    }
+    if lhs < rhs {
+        return Nzcv {
+            negative: true,
+            zero: false,
+            carry: false,
+            overflow: false,
+        };
+    }
+    Nzcv {
+        negative: false,
+        zero: false,
+        carry: true,
+        overflow: false,
     }
 }
 
@@ -877,6 +951,76 @@ mod tests {
         assert!(result.nxir.dump.contains("barrier.isb nsh"));
         assert_eq!(result.native.status, NativeStatus::Unsupported);
         assert_eq!(result.dispatched.status, NativeStatus::Unsupported);
+    }
+
+    #[test]
+    fn scalar_fp_synthetic_test_passes() {
+        // fmov d0,#1.0 ; fmov d1,#2.0 ; fadd/fsub/fmul/fdiv ; fcmp d0,d1 ; svc
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "scalar-fp"
+            entry-point = "0x0"
+
+            [program]
+            arm64-hex = "00 10 6E 1E 01 10 60 1E 02 28 61 1E 23 38 60 1E 24 08 61 1E 85 18 61 1E 00 20 61 1E 01 00 00 D4"
+
+            [expected.registers]
+            v0 = "0x3ff0000000000000"
+            v1 = "0x4000000000000000"
+            v2 = "0x4008000000000000"
+            v3 = "0x3ff0000000000000"
+            v4 = "0x4010000000000000"
+            v5 = "0x4000000000000000"
+            nzcv = "0x80000000"
+            halted = "true"
+            "#,
+        )
+        .expect("test should parse");
+
+        let result = run_synthetic_test(&test).expect("test should run");
+
+        assert!(result.register_diffs.is_empty());
+        assert!(result.nxir.error.is_none(), "{:?}", result.nxir.error);
+        assert!(result.nxir.agrees);
+        assert!(result.nxir.dump.contains("fadd.f64 v2, v0, v1"));
+        assert_eq!(result.native.status, NativeStatus::Unsupported);
+    }
+
+    #[test]
+    fn neon_synthetic_test_passes() {
+        // fmov d0,#1.0 ; fmov d1,#2.0 ; add v2.2d,v0.2d,v1.2d ;
+        // fadd v3.2d,v0.2d,v1.2d ; svc
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "neon-basic"
+            entry-point = "0x0"
+
+            [program]
+            arm64-hex = "00 10 6E 1E 01 10 60 1E 02 84 E1 4E 03 D4 61 4E 01 00 00 D4"
+
+            [expected.registers]
+            v0 = "0x3ff0000000000000"
+            v1 = "0x4000000000000000"
+            v2 = "0x7ff0000000000000"
+            v3 = "0x4008000000000000"
+            halted = "true"
+            "#,
+        )
+        .expect("test should parse");
+
+        let result = run_synthetic_test(&test).expect("test should run");
+
+        assert!(result.register_diffs.is_empty());
+        assert!(result.nxir.error.is_none(), "{:?}", result.nxir.error);
+        assert!(result.nxir.agrees);
+        assert!(result.nxir.dump.contains("vec.add.i64.2d v2, v0, v1"));
+        assert!(result.nxir.dump.contains("vec.fadd.f64.2d v3, v0, v1"));
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(result.native.status, NativeStatus::MatchesInterpreter);
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        assert_eq!(result.native.status, NativeStatus::Unavailable);
     }
 
     #[test]

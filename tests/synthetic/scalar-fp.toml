@@ -1,0 +1,17 @@
+[metadata]
+name = "scalar-fp"
+description = "Phase 39 scalar FP immediate, arithmetic, divide, and compare"
+entry-point = "0x0"
+
+[program]
+arm64-hex = "00 10 6E 1E 01 10 60 1E 02 28 61 1E 23 38 60 1E 24 08 61 1E 85 18 61 1E 00 20 61 1E 01 00 00 D4"
+
+[expected.registers]
+v0 = "0x3ff0000000000000"
+v1 = "0x4000000000000000"
+v2 = "0x4008000000000000"
+v3 = "0x3ff0000000000000"
+v4 = "0x4010000000000000"
+v5 = "0x4000000000000000"
+nzcv = "0x80000000"
+halted = "true"

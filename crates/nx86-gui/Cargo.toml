@@ -13,6 +13,7 @@ nx86-cache = { path = "../nx86-cache" }
 nx86-core = { path = "../nx86-core" }
 nx86-inspector = { path = "../nx86-inspector" }
 nx86-runtime = { path = "../nx86-runtime" }
+nx86-scheduler = { path = "../nx86-scheduler" }
 nx86-testsuite = { path = "../nx86-testsuite" }
 nx86-title-db = { path = "../nx86-title-db" }
 nx86-vmm = { path = "../nx86-vmm" }

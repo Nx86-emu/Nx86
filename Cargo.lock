@@ -1544,6 +1544,7 @@ dependencies = [
  "nx86-core",
  "nx86-inspector",
  "nx86-runtime",
+ "nx86-scheduler",
  "nx86-testsuite",
  "nx86-title-db",
  "nx86-vmm",
@@ -1650,6 +1651,11 @@ dependencies = [
 [[package]]
 name = "nx86-scheduler"
 version = "0.0.0"
+dependencies = [
+ "nx86-core",
+ "serde",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "nx86-shader"

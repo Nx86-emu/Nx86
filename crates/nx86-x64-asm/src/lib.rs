@@ -150,6 +150,79 @@ impl Reg64 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegXmm {
+    Xmm0,
+    Xmm1,
+    Xmm2,
+    Xmm3,
+    Xmm4,
+    Xmm5,
+    Xmm6,
+    Xmm7,
+    Xmm8,
+    Xmm9,
+    Xmm10,
+    Xmm11,
+    Xmm12,
+    Xmm13,
+    Xmm14,
+    Xmm15,
+}
+
+impl RegXmm {
+    const fn number(self) -> u8 {
+        match self {
+            Self::Xmm0 => 0,
+            Self::Xmm1 => 1,
+            Self::Xmm2 => 2,
+            Self::Xmm3 => 3,
+            Self::Xmm4 => 4,
+            Self::Xmm5 => 5,
+            Self::Xmm6 => 6,
+            Self::Xmm7 => 7,
+            Self::Xmm8 => 8,
+            Self::Xmm9 => 9,
+            Self::Xmm10 => 10,
+            Self::Xmm11 => 11,
+            Self::Xmm12 => 12,
+            Self::Xmm13 => 13,
+            Self::Xmm14 => 14,
+            Self::Xmm15 => 15,
+        }
+    }
+
+    const fn low3(self) -> u8 {
+        self.number() & 0b111
+    }
+
+    const fn rex_bit(self) -> bool {
+        self.number() & 0b1000 != 0
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Xmm0 => "xmm0",
+            Self::Xmm1 => "xmm1",
+            Self::Xmm2 => "xmm2",
+            Self::Xmm3 => "xmm3",
+            Self::Xmm4 => "xmm4",
+            Self::Xmm5 => "xmm5",
+            Self::Xmm6 => "xmm6",
+            Self::Xmm7 => "xmm7",
+            Self::Xmm8 => "xmm8",
+            Self::Xmm9 => "xmm9",
+            Self::Xmm10 => "xmm10",
+            Self::Xmm11 => "xmm11",
+            Self::Xmm12 => "xmm12",
+            Self::Xmm13 => "xmm13",
+            Self::Xmm14 => "xmm14",
+            Self::Xmm15 => "xmm15",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mem64 {
     pub base: Reg64,
     pub index: Option<Reg64>,
@@ -336,6 +409,42 @@ impl Assembler {
         self.emit_mem_reg_width(0x89, dst, src, false);
     }
 
+    pub fn movsd_xmm_mem(&mut self, dst: RegXmm, src: Mem64) {
+        self.dump
+            .push(format!("movsd {}, qword {}", dst.name(), mem_name(src)));
+        self.emit_xmm_mem(&[0xF2], 0x10, dst, src);
+    }
+
+    pub fn movsd_mem_xmm(&mut self, dst: Mem64, src: RegXmm) {
+        self.dump
+            .push(format!("movsd qword {}, {}", mem_name(dst), src.name()));
+        self.emit_mem_xmm(&[0xF2], 0x11, dst, src);
+    }
+
+    pub fn addsd_xmm_mem(&mut self, dst: RegXmm, src: Mem64) {
+        self.dump
+            .push(format!("addsd {}, qword {}", dst.name(), mem_name(src)));
+        self.emit_xmm_mem(&[0xF2], 0x58, dst, src);
+    }
+
+    pub fn subsd_xmm_mem(&mut self, dst: RegXmm, src: Mem64) {
+        self.dump
+            .push(format!("subsd {}, qword {}", dst.name(), mem_name(src)));
+        self.emit_xmm_mem(&[0xF2], 0x5C, dst, src);
+    }
+
+    pub fn mulsd_xmm_mem(&mut self, dst: RegXmm, src: Mem64) {
+        self.dump
+            .push(format!("mulsd {}, qword {}", dst.name(), mem_name(src)));
+        self.emit_xmm_mem(&[0xF2], 0x59, dst, src);
+    }
+
+    pub fn divsd_xmm_mem(&mut self, dst: RegXmm, src: Mem64) {
+        self.dump
+            .push(format!("divsd {}, qword {}", dst.name(), mem_name(src)));
+        self.emit_xmm_mem(&[0xF2], 0x5E, dst, src);
+    }
+
     pub fn add_reg_reg(&mut self, dst: Reg64, src: Reg64) {
         self.dump
             .push(format!("add {}, {}", dst.name(), src.name()));
@@ -508,6 +617,22 @@ impl Assembler {
         emit_mem_modrm(&mut self.bytes, src.low3(), dst);
     }
 
+    fn emit_xmm_mem(&mut self, prefix: &[u8], opcode: u8, dst: RegXmm, src: Mem64) {
+        self.bytes.extend_from_slice(prefix);
+        emit_rex_xmm(&mut self.bytes, false, Some(dst), src.index, Some(src.base));
+        self.bytes.push(0x0F);
+        self.bytes.push(opcode);
+        emit_mem_modrm(&mut self.bytes, dst.low3(), src);
+    }
+
+    fn emit_mem_xmm(&mut self, prefix: &[u8], opcode: u8, dst: Mem64, src: RegXmm) {
+        self.bytes.extend_from_slice(prefix);
+        emit_rex_xmm(&mut self.bytes, false, Some(src), dst.index, Some(dst.base));
+        self.bytes.push(0x0F);
+        self.bytes.push(opcode);
+        emit_mem_modrm(&mut self.bytes, src.low3(), dst);
+    }
+
     fn emit_reg_imm32(&mut self, opcode_extension: u8, dst: Reg64, value: i32) {
         emit_rex(&mut self.bytes, true, None, None, Some(dst));
         self.bytes.push(0x81);
@@ -545,6 +670,23 @@ fn emit_rex(
     let rex = 0x40
         | (u8::from(w) << 3)
         | (u8::from(reg.is_some_and(Reg64::rex_bit)) << 2)
+        | (u8::from(index.is_some_and(Reg64::rex_bit)) << 1)
+        | u8::from(rm.is_some_and(Reg64::rex_bit));
+    if rex != 0x40 {
+        bytes.push(rex);
+    }
+}
+
+fn emit_rex_xmm(
+    bytes: &mut Vec<u8>,
+    w: bool,
+    reg: Option<RegXmm>,
+    index: Option<Reg64>,
+    rm: Option<Reg64>,
+) {
+    let rex = 0x40
+        | (u8::from(w) << 3)
+        | (u8::from(reg.is_some_and(RegXmm::rex_bit)) << 2)
         | (u8::from(index.is_some_and(Reg64::rex_bit)) << 1)
         | u8::from(rm.is_some_and(Reg64::rex_bit));
     if rex != 0x40 {
@@ -620,7 +762,9 @@ fn mem_name(mem: Mem64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AsmError, Assembler, CHAIN_EXIT_SIZE, Mem64, PatchKind, Reg64, encode_jmp_rel32};
+    use super::{
+        AsmError, Assembler, CHAIN_EXIT_SIZE, Mem64, PatchKind, Reg64, RegXmm, encode_jmp_rel32,
+    };
 
     #[test]
     fn emits_basic_integer_bytes() {
@@ -716,6 +860,26 @@ mod tests {
                 0x49, 0x8B, 0x04, 0x0E, 0x49, 0x89, 0x0C, 0x06, 0x41, 0x8B, 0x04, 0x0E, 0x49, 0x0F,
                 0xB6, 0x4C, 0x0D, 0x00,
             ]
+        );
+    }
+
+    #[test]
+    fn emits_scalar_double_sse_memory_ops() {
+        let mut asm = Assembler::new();
+
+        asm.movsd_xmm_mem(RegXmm::Xmm0, Mem64::new(Reg64::R15, 336));
+        asm.addsd_xmm_mem(RegXmm::Xmm0, Mem64::new(Reg64::R15, 352));
+        asm.subsd_xmm_mem(RegXmm::Xmm0, Mem64::new(Reg64::R15, 352));
+        asm.mulsd_xmm_mem(RegXmm::Xmm0, Mem64::new(Reg64::R15, 352));
+        asm.divsd_xmm_mem(RegXmm::Xmm0, Mem64::new(Reg64::R15, 352));
+        asm.movsd_mem_xmm(Mem64::new(Reg64::R15, 368), RegXmm::Xmm0);
+
+        let code = asm.finish().expect("assembler should finish");
+        assert!(code.dump().contains("addsd xmm0"));
+        assert!(code.dump().contains("movsd qword [r15+0x170], xmm0"));
+        assert_eq!(
+            &code.bytes()[0..8],
+            &[0xF2, 0x41, 0x0F, 0x10, 0x87, 0x50, 0x01, 0x00]
         );
     }
 

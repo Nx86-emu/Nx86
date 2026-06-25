@@ -215,15 +215,17 @@ pub enum AppScreen {
     Library,
     Compile,
     Tests,
+    Scheduler,
     Inspector,
     Settings,
 }
 
 impl AppScreen {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Library,
         Self::Compile,
         Self::Tests,
+        Self::Scheduler,
         Self::Inspector,
         Self::Settings,
     ];
@@ -234,6 +236,7 @@ impl AppScreen {
             Self::Library => "Library",
             Self::Compile => "Compile",
             Self::Tests => "Tests",
+            Self::Scheduler => "Scheduler",
             Self::Inspector => "Inspector",
             Self::Settings => "Settings",
         }

@@ -6,7 +6,10 @@
 //! memory for every synthetic program.
 
 use nx86_core::guest::{CpuState, Nzcv};
-use nx86_ir::{BinaryOp, DeoptId, FlagOp, Function, Inst, Op, Reg, Terminator, Type, Value};
+use nx86_ir::{
+    BinaryOp, DeoptId, FlagOp, FpBinaryOp, Function, Inst, Op, Reg, Terminator, Type, Value,
+    VectorBinaryOp,
+};
 use nx86_vmm::{GuestAddress, GuestMemory, VmmFault};
 use thiserror::Error;
 
@@ -98,7 +101,7 @@ pub fn evaluate(function: &Function, memory: &mut GuestMemory) -> Result<EvalOut
             } => {
                 // Materialize NZCV from the lazy source only when a branch reads
                 // it, then record it so the architectural flags stay observable.
-                let nzcv = materialize(pending_flags);
+                let nzcv = pending_flags.map_or_else(|| cpu.nzcv(), materialize);
                 cpu.set_nzcv(nzcv);
                 let taken = if nzcv.satisfies(*cond) {
                     *if_true
@@ -115,7 +118,7 @@ pub fn evaluate(function: &Function, memory: &mut GuestMemory) -> Result<EvalOut
                 // Same lazy-flag materialization as a conditional branch. If the
                 // guard holds, fall through to `if_pass`; otherwise it failed and
                 // control side-exits to the deopt handler.
-                let nzcv = materialize(pending_flags);
+                let nzcv = pending_flags.map_or_else(|| cpu.nzcv(), materialize);
                 cpu.set_nzcv(nzcv);
                 if nzcv.satisfies(*cond) {
                     block_index = if_pass.0 as usize;
@@ -138,13 +141,17 @@ pub fn evaluate(function: &Function, memory: &mut GuestMemory) -> Result<EvalOut
                 }
             }
             Terminator::Halt { reason } => {
-                cpu.set_nzcv(materialize(pending_flags));
+                if let Some(flags) = pending_flags {
+                    cpu.set_nzcv(materialize(flags));
+                }
                 cpu.set_pc(block.terminator_address + 4);
                 cpu.halt(reason.clone());
                 return Ok(EvalOutcome::Exit(cpu));
             }
             Terminator::Return => {
-                cpu.set_nzcv(materialize(pending_flags));
+                if let Some(flags) = pending_flags {
+                    cpu.set_nzcv(materialize(flags));
+                }
                 return Ok(EvalOutcome::Exit(cpu));
             }
         }
@@ -156,11 +163,10 @@ pub fn evaluate(function: &Function, memory: &mut GuestMemory) -> Result<EvalOut
 }
 
 /// Materialize NZCV from a lazily-recorded flag source.
-fn materialize(pending: Option<FlagSource>) -> Nzcv {
+fn materialize(pending: FlagSource) -> Nzcv {
     match pending {
-        Some((FlagOp::Add, lhs, rhs)) => Nzcv::from_add(lhs, rhs),
-        Some((FlagOp::Sub, lhs, rhs)) => Nzcv::from_sub(lhs, rhs),
-        None => Nzcv::default(),
+        (FlagOp::Add, lhs, rhs) => Nzcv::from_add(lhs, rhs),
+        (FlagOp::Sub, lhs, rhs) => Nzcv::from_sub(lhs, rhs),
     }
 }
 
@@ -242,6 +248,47 @@ fn execute_op(
             None
         }
         Op::Barrier { .. } => None,
+        Op::FpMoveImmediate { rd, bits, .. } => {
+            cpu.set_vector(*rd, u128::from(*bits));
+            None
+        }
+        Op::FpScalarBinary { op, rd, rn, rm, .. } => {
+            let lhs = cpu.scalar_f64(*rn);
+            let rhs = cpu.scalar_f64(*rm);
+            let value = match op {
+                FpBinaryOp::Add => lhs + rhs,
+                FpBinaryOp::Sub => lhs - rhs,
+                FpBinaryOp::Mul => lhs * rhs,
+                FpBinaryOp::Div => lhs / rhs,
+            };
+            cpu.set_scalar_f64(*rd, value);
+            None
+        }
+        Op::FpCompare { rn, rm, .. } => {
+            cpu.set_nzcv(float_compare(cpu.scalar_f64(*rn), cpu.scalar_f64(*rm)));
+            *pending_flags = None;
+            None
+        }
+        Op::VectorBinary { op, rd, rn, rm, .. } => {
+            match op {
+                VectorBinaryOp::AddI64 => {
+                    for lane in 0..2 {
+                        let value = cpu
+                            .vector_lane64(*rn, lane)
+                            .wrapping_add(cpu.vector_lane64(*rm, lane));
+                        cpu.set_vector_lane64(*rd, lane, value);
+                    }
+                }
+                VectorBinaryOp::AddF64 => {
+                    for lane in 0..2 {
+                        let lhs = f64::from_bits(cpu.vector_lane64(*rn, lane));
+                        let rhs = f64::from_bits(cpu.vector_lane64(*rm, lane));
+                        cpu.set_vector_lane64(*rd, lane, (lhs + rhs).to_bits());
+                    }
+                }
+            }
+            None
+        }
     };
 
     if let (Some(value), Some(result)) = (inst.result, computed) {
@@ -335,6 +382,39 @@ fn store_mem(
         other => return Err(EvalError::UnsupportedMemoryType { ty: other }),
     }
     Ok(())
+}
+
+fn float_compare(lhs: f64, rhs: f64) -> Nzcv {
+    if lhs.is_nan() || rhs.is_nan() {
+        return Nzcv {
+            negative: false,
+            zero: false,
+            carry: true,
+            overflow: true,
+        };
+    }
+    if lhs == rhs {
+        return Nzcv {
+            negative: false,
+            zero: true,
+            carry: true,
+            overflow: false,
+        };
+    }
+    if lhs < rhs {
+        return Nzcv {
+            negative: true,
+            zero: false,
+            carry: false,
+            overflow: false,
+        };
+    }
+    Nzcv {
+        negative: false,
+        zero: false,
+        carry: true,
+        overflow: false,
+    }
 }
 
 #[cfg(test)]

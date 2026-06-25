@@ -1,8 +1,11 @@
 use nx86_core::guest::{CpuState, Nzcv};
 use nx86_ir::verify::{self, VerifyError};
-use nx86_ir::{BinaryOp, Block, BlockId, Function, Inst, Op, Reg, Terminator, Type, Value};
+use nx86_ir::{
+    BinaryOp, Block, BlockId, FpBinaryOp, Function, Inst, Op, Reg, Terminator, Type, Value,
+    VectorBinaryOp,
+};
 use nx86_regalloc::{Allocation, Location, allocate};
-use nx86_x64_asm::{AsmError, Assembler, CodeBuffer, Label, Mem64, PatchKind, Reg64};
+use nx86_x64_asm::{AsmError, Assembler, CodeBuffer, Label, Mem64, PatchKind, Reg64, RegXmm};
 use thiserror::Error;
 
 pub const CRATE_NAME: &str = "nx86-x64-v4";
@@ -19,6 +22,7 @@ const SLOWMEM_READ_OFFSET: i32 = SLOWMEM_CONTEXT_OFFSET + 8;
 const SLOWMEM_WRITE_OFFSET: i32 = SLOWMEM_READ_OFFSET + 8;
 const SLOWMEM_VALUE_OFFSET: i32 = SLOWMEM_WRITE_OFFSET + 8;
 const MEMORY_FAULT_OFFSET: i32 = SLOWMEM_VALUE_OFFSET + 8;
+const V0_OFFSET: i32 = MEMORY_FAULT_OFFSET + 8;
 const SAVED_REGISTER_BYTES: u32 = 32;
 const FASTMEM_READ: i32 = 1;
 const FASTMEM_WRITE: i32 = 2;
@@ -115,6 +119,10 @@ pub struct NativeBlockState {
     pub slowmem_value: u64,
     /// Nonzero callback status asks the native block to side-exit.
     pub memory_fault: u64,
+    /// FP/SIMD register file as low/high 64-bit lanes for v0..v31.
+    pub v: [u64; 64],
+    pub fpcr: u64,
+    pub fpsr: u64,
 }
 
 impl NativeBlockState {
@@ -133,6 +141,9 @@ impl NativeBlockState {
             slowmem_write: 0,
             slowmem_value: 0,
             memory_fault: 0,
+            v: vector_lanes_from_cpu(cpu),
+            fpcr: u64::from(cpu.fpcr()),
+            fpsr: u64::from(cpu.fpsr()),
         }
     }
 
@@ -149,6 +160,13 @@ impl NativeBlockState {
         cpu.set_sp(self.sp);
         cpu.set_pc(self.pc);
         cpu.set_nzcv(Nzcv::from_bits(self.nzcv_bits as u32));
+        for index in 0..32 {
+            let low = self.v[index * 2];
+            let high = self.v[index * 2 + 1];
+            cpu.set_vector(index as u8, u128::from(low) | (u128::from(high) << 64));
+        }
+        cpu.set_fpcr(self.fpcr as u32);
+        cpu.set_fpsr(self.fpsr as u32);
         if self.halted != 0 {
             cpu.halt(halt_reason.unwrap_or("native block halted"));
         } else {
@@ -156,6 +174,15 @@ impl NativeBlockState {
         }
         cpu
     }
+}
+
+fn vector_lanes_from_cpu(cpu: &CpuState) -> [u64; 64] {
+    let mut lanes = [0u64; 64];
+    for index in 0..32 {
+        lanes[index * 2] = cpu.vector_lane64(index as u8, 0);
+        lanes[index * 2 + 1] = cpu.vector_lane64(index as u8, 1);
+    }
+    lanes
 }
 
 #[derive(Debug, Error)]
@@ -535,8 +562,79 @@ fn lower_inst(
         Op::Barrier { .. } => {
             return Err(LoweringError::UnsupportedOp { op: "barrier" });
         }
+        Op::FpMoveImmediate { rd, bits, .. } => {
+            emit_store_vector_lane_imm(asm, *rd, 0, *bits)?;
+            emit_store_vector_lane_imm(asm, *rd, 1, 0)?;
+        }
+        Op::FpScalarBinary { op, rd, rn, rm, .. } => {
+            emit_scalar_fp_binary(asm, *op, *rd, *rn, *rm)?;
+        }
+        Op::FpCompare { .. } => {
+            return Err(LoweringError::UnsupportedOp { op: "fp compare" });
+        }
+        Op::VectorBinary { op, rd, rn, rm, .. } => {
+            emit_vector_binary(asm, *op, *rd, *rn, *rm)?;
+        }
     }
 
+    Ok(())
+}
+
+fn emit_store_vector_lane_imm(
+    asm: &mut Assembler,
+    register: u8,
+    lane: u8,
+    value: u64,
+) -> Result<(), LoweringError> {
+    asm.mov_reg_imm64(Reg64::Rax, value);
+    asm.mov_mem_reg(vector_lane_mem(register, lane)?, Reg64::Rax);
+    Ok(())
+}
+
+fn emit_scalar_fp_binary(
+    asm: &mut Assembler,
+    op: FpBinaryOp,
+    rd: u8,
+    rn: u8,
+    rm: u8,
+) -> Result<(), LoweringError> {
+    asm.movsd_xmm_mem(RegXmm::Xmm0, vector_lane_mem(rn, 0)?);
+    match op {
+        FpBinaryOp::Add => asm.addsd_xmm_mem(RegXmm::Xmm0, vector_lane_mem(rm, 0)?),
+        FpBinaryOp::Sub => asm.subsd_xmm_mem(RegXmm::Xmm0, vector_lane_mem(rm, 0)?),
+        FpBinaryOp::Mul => asm.mulsd_xmm_mem(RegXmm::Xmm0, vector_lane_mem(rm, 0)?),
+        FpBinaryOp::Div => asm.divsd_xmm_mem(RegXmm::Xmm0, vector_lane_mem(rm, 0)?),
+    }
+    asm.movsd_mem_xmm(vector_lane_mem(rd, 0)?, RegXmm::Xmm0);
+    asm.mov_reg_imm64(Reg64::Rax, 0);
+    asm.mov_mem_reg(vector_lane_mem(rd, 1)?, Reg64::Rax);
+    Ok(())
+}
+
+fn emit_vector_binary(
+    asm: &mut Assembler,
+    op: VectorBinaryOp,
+    rd: u8,
+    rn: u8,
+    rm: u8,
+) -> Result<(), LoweringError> {
+    match op {
+        VectorBinaryOp::AddI64 => {
+            for lane in 0..2 {
+                asm.mov_reg_mem(Reg64::Rax, vector_lane_mem(rn, lane)?);
+                asm.mov_reg_mem(Reg64::Rcx, vector_lane_mem(rm, lane)?);
+                asm.add_reg_reg(Reg64::Rax, Reg64::Rcx);
+                asm.mov_mem_reg(vector_lane_mem(rd, lane)?, Reg64::Rax);
+            }
+        }
+        VectorBinaryOp::AddF64 => {
+            for lane in 0..2 {
+                asm.movsd_xmm_mem(RegXmm::Xmm0, vector_lane_mem(rn, lane)?);
+                asm.addsd_xmm_mem(RegXmm::Xmm0, vector_lane_mem(rm, lane)?);
+                asm.movsd_mem_xmm(vector_lane_mem(rd, lane)?, RegXmm::Xmm0);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -828,6 +926,16 @@ const fn x_offset(index: u8) -> i32 {
     X0_OFFSET + (index as i32 * 8)
 }
 
+fn vector_lane_mem(register: u8, lane: u8) -> Result<Mem64, LoweringError> {
+    if register >= 32 {
+        return Err(LoweringError::RegisterOutOfRange { register });
+    }
+    let lane_offset = if lane == 0 { 0 } else { 8 };
+    Ok(state_mem(
+        V0_OFFSET + (i32::from(register) * 16) + lane_offset,
+    ))
+}
+
 const fn state_mem(offset: i32) -> Mem64 {
     Mem64::new(Reg64::R15, offset)
 }
@@ -880,6 +988,30 @@ mod tests {
         assert!(dump.contains("mov rax, [r14+rax]"));
         assert!(dump.contains("movzx rcx, byte [r13+rcx]"));
         assert!(dump.contains("call rax"));
+    }
+
+    #[test]
+    fn lowers_scalar_fp_and_vector_ops() {
+        let function = fp_vector_function(false);
+
+        let lowered = lower_tiny_block(&function).expect("fp/vector ops should lower");
+        let dump = lowered.dump();
+
+        assert!(dump.contains("movsd xmm0"));
+        assert!(dump.contains("addsd xmm0"));
+        assert!(dump.contains("mov [r15+0x"));
+    }
+
+    #[test]
+    fn lowering_rejects_fp_compare_for_now() {
+        let function = fp_vector_function(true);
+
+        let error = lower_tiny_block(&function).expect_err("fp compare is deferred");
+
+        assert!(matches!(
+            error,
+            super::LoweringError::UnsupportedOp { op: "fp compare" }
+        ));
     }
 
     #[test]
@@ -1049,7 +1181,10 @@ mod tests {
         assert_eq!(std::mem::offset_of!(NativeBlockState, slowmem_write), 312);
         assert_eq!(std::mem::offset_of!(NativeBlockState, slowmem_value), 320);
         assert_eq!(std::mem::offset_of!(NativeBlockState, memory_fault), 328);
-        assert_eq!(size_of::<NativeBlockState>(), 336);
+        assert_eq!(std::mem::offset_of!(NativeBlockState, v), 336);
+        assert_eq!(std::mem::offset_of!(NativeBlockState, fpcr), 848);
+        assert_eq!(std::mem::offset_of!(NativeBlockState, fpsr), 856);
+        assert_eq!(size_of::<NativeBlockState>(), 864);
     }
 
     #[test]
@@ -1157,6 +1292,86 @@ mod tests {
                     reason: "svc #0x0".to_owned(),
                 },
                 terminator_address: 0,
+            }],
+        }
+    }
+
+    fn fp_vector_function(include_compare: bool) -> Function {
+        let mut instructions = vec![
+            Inst {
+                result: None,
+                op: Op::FpMoveImmediate {
+                    precision: nx86_ir::FpPrecision::F64,
+                    rd: 0,
+                    bits: 1.0f64.to_bits(),
+                },
+                guest_address: 0,
+            },
+            Inst {
+                result: None,
+                op: Op::FpMoveImmediate {
+                    precision: nx86_ir::FpPrecision::F64,
+                    rd: 1,
+                    bits: 2.0f64.to_bits(),
+                },
+                guest_address: 4,
+            },
+            Inst {
+                result: None,
+                op: Op::FpScalarBinary {
+                    op: nx86_ir::FpBinaryOp::Add,
+                    precision: nx86_ir::FpPrecision::F64,
+                    rd: 2,
+                    rn: 0,
+                    rm: 1,
+                },
+                guest_address: 8,
+            },
+            Inst {
+                result: None,
+                op: Op::VectorBinary {
+                    op: nx86_ir::VectorBinaryOp::AddF64,
+                    arrangement: nx86_ir::VectorArrangement::TwoD,
+                    rd: 3,
+                    rn: 0,
+                    rm: 1,
+                },
+                guest_address: 12,
+            },
+            Inst {
+                result: None,
+                op: Op::VectorBinary {
+                    op: nx86_ir::VectorBinaryOp::AddI64,
+                    arrangement: nx86_ir::VectorArrangement::TwoD,
+                    rd: 4,
+                    rn: 0,
+                    rm: 1,
+                },
+                guest_address: 16,
+            },
+        ];
+        if include_compare {
+            instructions.push(Inst {
+                result: None,
+                op: Op::FpCompare {
+                    precision: nx86_ir::FpPrecision::F64,
+                    rn: 0,
+                    rm: 1,
+                },
+                guest_address: 20,
+            });
+        }
+        Function {
+            name: "fp_vector".to_owned(),
+            entry_address: 0,
+            value_count: 0,
+            deopt_points: Vec::new(),
+            blocks: vec![Block {
+                instructions,
+                terminator: Terminator::Halt {
+                    reason: "svc #0x0".to_owned(),
+                },
+                terminator_address: 24,
             }],
         }
     }

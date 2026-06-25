@@ -6,6 +6,10 @@ use nx86_core::{
     ipc::{CompileProgress, IpcEvent, LogLevel},
     storage::StorageLayout,
 };
+use nx86_scheduler::{
+    ReplayMetadata, Scheduler, SchedulerComparison, SchedulerMode, SyntheticThreadProgram,
+    ThreadGuiRow, compare_host_threads_and_fibers,
+};
 use nx86_testsuite::SyntheticArm64Test;
 use nx86_title_db::TitleEntry;
 
@@ -105,6 +109,52 @@ pub enum TestAction {
     None,
     PickFile,
     LoadPath,
+}
+
+pub struct SchedulerUiState {
+    pub rows: Vec<ThreadGuiRow>,
+    pub replay: Option<ReplayMetadata>,
+    pub comparison: Option<SchedulerComparison>,
+    pub message: Option<String>,
+}
+
+impl Default for SchedulerUiState {
+    fn default() -> Self {
+        let mut state = Self {
+            rows: Vec::new(),
+            replay: None,
+            comparison: None,
+            message: None,
+        };
+        state.refresh();
+        state
+    }
+}
+
+impl SchedulerUiState {
+    pub fn refresh(&mut self) {
+        let program = SyntheticThreadProgram::two_thread_counter();
+        let mut scheduler = Scheduler::new(SchedulerMode::HostThreads);
+        match scheduler.run_synthetic(&program) {
+            Ok(report) => {
+                self.rows = report.rows;
+                self.replay = Some(report.replay_metadata);
+                self.message = Some(format!("{} dispatch(es)", report.dispatch_count));
+            }
+            Err(error) => {
+                self.rows.clear();
+                self.replay = None;
+                self.message = Some(error.to_string());
+            }
+        }
+        self.comparison = compare_host_threads_and_fibers(&program).ok();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchedulerAction {
+    None,
+    Refresh,
 }
 
 /// Pre-rendered Inspector views for one inspected title. The GUI layer builds
@@ -508,6 +558,94 @@ pub fn tests(ui: &mut egui::Ui, state: &mut TestUiState) -> TestAction {
                     ui.end_row();
                 }
             });
+    }
+
+    action
+}
+
+pub fn scheduler(ui: &mut egui::Ui, state: &mut SchedulerUiState) -> SchedulerAction {
+    screen_header(ui, "Scheduler", "Phases 36-38");
+    let mut action = SchedulerAction::None;
+
+    ui.horizontal(|ui| {
+        if ui.button("Refresh Synthetic Run").clicked() {
+            action = SchedulerAction::Refresh;
+        }
+        if let Some(message) = &state.message {
+            ui.monospace(message);
+        }
+    });
+
+    ui.add_space(12.0);
+    ui.strong("Guest threads");
+    egui::Grid::new("scheduler-threads")
+        .num_columns(7)
+        .min_col_width(90.0)
+        .spacing([16.0, 8.0])
+        .striped(true)
+        .show(ui, |ui| {
+            ui.strong("ID");
+            ui.strong("Name");
+            ui.strong("State");
+            ui.strong("PC");
+            ui.strong("Host");
+            ui.strong("Fiber");
+            ui.strong("CPU ticks");
+            ui.end_row();
+
+            for row in &state.rows {
+                ui.monospace(row.thread_id.to_string());
+                ui.label(&row.name);
+                ui.monospace(format!("{:?}", row.status).to_ascii_lowercase());
+                ui.monospace(format!("{:#x}", row.pc));
+                ui.monospace(row.host_thread_index.to_string());
+                ui.monospace(
+                    row.fiber_slot
+                        .map_or_else(|| "-".to_owned(), |slot| slot.to_string()),
+                );
+                ui.monospace(row.cpu_ticks.to_string());
+                ui.end_row();
+            }
+        });
+
+    if let Some(replay) = &state.replay {
+        ui.add_space(14.0);
+        ui.strong("Replay window");
+        egui::Grid::new("scheduler-replay")
+            .num_columns(2)
+            .spacing([16.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Retained events");
+                ui.monospace(replay.retained_events.to_string());
+                ui.end_row();
+                ui.label("Dropped events");
+                ui.monospace(replay.dropped_events.to_string());
+                ui.end_row();
+                ui.label("Sequence range");
+                ui.monospace(format!(
+                    "{}..{}",
+                    replay
+                        .first_sequence
+                        .map_or_else(|| "-".to_owned(), |value| value.to_string()),
+                    replay
+                        .last_sequence
+                        .map_or_else(|| "-".to_owned(), |value| value.to_string())
+                ));
+                ui.end_row();
+            });
+    }
+
+    if let Some(comparison) = &state.comparison {
+        ui.add_space(14.0);
+        ui.strong("Host threads vs fibers");
+        ui.monospace(format!(
+            "deterministic trace: {}",
+            if comparison.deterministic_trace_equal {
+                "match"
+            } else {
+                "diff"
+            }
+        ));
     }
 
     action

@@ -1,0 +1,14 @@
+[metadata]
+name = "neon-basic"
+description = "Phase 40 basic NEON integer and FP vector add over v.2d registers"
+entry-point = "0x0"
+
+[program]
+arm64-hex = "00 10 6E 1E 01 10 60 1E 02 84 E1 4E 03 D4 61 4E 01 00 00 D4"
+
+[expected.registers]
+v0 = "0x3ff0000000000000"
+v1 = "0x4000000000000000"
+v2 = "0x7ff0000000000000"
+v3 = "0x4008000000000000"
+halted = "true"

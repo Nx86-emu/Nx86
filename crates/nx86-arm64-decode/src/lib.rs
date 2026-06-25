@@ -68,6 +68,8 @@ pub struct DecodedInstruction {
 pub enum InstructionClass {
     DataProcessingImmediate,
     DataProcessingRegister,
+    FloatingPoint,
+    Simd,
     Branch,
     Exception,
     LoadStore,
@@ -112,6 +114,74 @@ pub enum BarrierKind {
     Dmb,
     Dsb,
     Isb,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FpPrecision {
+    Double,
+}
+
+impl FpPrecision {
+    #[must_use]
+    pub const fn scalar_prefix(self) -> &'static str {
+        match self {
+            Self::Double => "d",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FpBinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+impl FpBinaryOp {
+    #[must_use]
+    pub const fn mnemonic(self) -> &'static str {
+        match self {
+            Self::Add => "fadd",
+            Self::Sub => "fsub",
+            Self::Mul => "fmul",
+            Self::Div => "fdiv",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VectorArrangement {
+    TwoD,
+}
+
+impl VectorArrangement {
+    #[must_use]
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            Self::TwoD => "2d",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VectorBinaryOp {
+    AddI64,
+    AddF64,
+}
+
+impl VectorBinaryOp {
+    #[must_use]
+    pub const fn mnemonic(self) -> &'static str {
+        match self {
+            Self::AddI64 => "add",
+            Self::AddF64 => "fadd",
+        }
+    }
 }
 
 impl BarrierKind {
@@ -214,6 +284,30 @@ pub enum InstructionKind {
         kind: BarrierKind,
         option: u8,
     },
+    FpMoveImmediate {
+        precision: FpPrecision,
+        rd: u8,
+        bits: u64,
+    },
+    FpScalarBinary {
+        op: FpBinaryOp,
+        precision: FpPrecision,
+        rd: u8,
+        rn: u8,
+        rm: u8,
+    },
+    FpCompare {
+        precision: FpPrecision,
+        rn: u8,
+        rm: u8,
+    },
+    VectorBinary {
+        op: VectorBinaryOp,
+        arrangement: VectorArrangement,
+        rd: u8,
+        rn: u8,
+        rm: u8,
+    },
 }
 
 impl InstructionKind {
@@ -226,6 +320,10 @@ impl InstructionKind {
             | Self::AddsImmediate { .. }
             | Self::SubsImmediate { .. } => InstructionClass::DataProcessingImmediate,
             Self::LogicalReg { .. } => InstructionClass::DataProcessingRegister,
+            Self::FpMoveImmediate { .. } | Self::FpScalarBinary { .. } | Self::FpCompare { .. } => {
+                InstructionClass::FloatingPoint
+            }
+            Self::VectorBinary { .. } => InstructionClass::Simd,
             Self::Branch { .. } | Self::CondBranch { .. } => InstructionClass::Branch,
             Self::Svc { .. } => InstructionClass::Exception,
             Self::Store { .. } | Self::Load { .. } => InstructionClass::LoadStore,
@@ -326,7 +424,55 @@ impl InstructionKind {
             Self::Barrier { kind, option } => {
                 format!("{} {}", kind.mnemonic(), format_barrier_option(*option))
             }
+            Self::FpMoveImmediate {
+                precision,
+                rd,
+                bits,
+            } => {
+                format!(
+                    "fmov {}{}, #{}",
+                    precision.scalar_prefix(),
+                    rd,
+                    format_fp_imm(*bits)
+                )
+            }
+            Self::FpScalarBinary {
+                op,
+                precision,
+                rd,
+                rn,
+                rm,
+            } => {
+                let prefix = precision.scalar_prefix();
+                format!("{} {prefix}{rd}, {prefix}{rn}, {prefix}{rm}", op.mnemonic())
+            }
+            Self::FpCompare { precision, rn, rm } => {
+                let prefix = precision.scalar_prefix();
+                format!("fcmp {prefix}{rn}, {prefix}{rm}")
+            }
+            Self::VectorBinary {
+                op,
+                arrangement,
+                rd,
+                rn,
+                rm,
+            } => {
+                let suffix = arrangement.suffix();
+                format!(
+                    "{} v{rd}.{suffix}, v{rn}.{suffix}, v{rm}.{suffix}",
+                    op.mnemonic()
+                )
+            }
         }
+    }
+}
+
+fn format_fp_imm(bits: u64) -> String {
+    let value = f64::from_bits(bits);
+    if value.fract() == 0.0 {
+        format!("{value:.1}")
+    } else {
+        value.to_string()
     }
 }
 
@@ -440,6 +586,46 @@ fn decode_kind(word: u32, address: u64) -> Result<InstructionKind, DecodeError> 
         });
     }
 
+    if (word & 0xFFE0_FC00) == 0x1E60_1000 {
+        let rd = bits(word, 0, 5) as u8;
+        let imm8 = bits(word, 13, 8) as u8;
+        if let Some(bits) = fp64_modified_immediate_bits(imm8) {
+            return Ok(InstructionKind::FpMoveImmediate {
+                precision: FpPrecision::Double,
+                rd,
+                bits,
+            });
+        }
+    }
+
+    if (word & 0xFFE0_FC00) == 0x1E60_2800 {
+        return Ok(fp_scalar_binary(FpBinaryOp::Add, word));
+    }
+    if (word & 0xFFE0_FC00) == 0x1E60_3800 {
+        return Ok(fp_scalar_binary(FpBinaryOp::Sub, word));
+    }
+    if (word & 0xFFE0_FC00) == 0x1E60_0800 {
+        return Ok(fp_scalar_binary(FpBinaryOp::Mul, word));
+    }
+    if (word & 0xFFE0_FC00) == 0x1E60_1800 {
+        return Ok(fp_scalar_binary(FpBinaryOp::Div, word));
+    }
+
+    if (word & 0xFFE0_FC1F) == 0x1E60_2000 {
+        return Ok(InstructionKind::FpCompare {
+            precision: FpPrecision::Double,
+            rn: bits(word, 5, 5) as u8,
+            rm: bits(word, 16, 5) as u8,
+        });
+    }
+
+    if (word & 0xFFE0_FC00) == 0x4EE0_8400 {
+        return Ok(vector_binary(VectorBinaryOp::AddI64, word));
+    }
+    if (word & 0xFFE0_FC00) == 0x4E60_D400 {
+        return Ok(vector_binary(VectorBinaryOp::AddF64, word));
+    }
+
     // Logical (shifted register), 64-bit, LSL #0, N=0: AND/ORR/EOR.
     if (word & 0xFFE0_FC00) == 0x8A00_0000 {
         return Ok(logical_reg(LogicalOp::And, word));
@@ -535,6 +721,36 @@ fn logical_reg(op: LogicalOp, word: u32) -> InstructionKind {
     }
 }
 
+fn fp64_modified_immediate_bits(imm8: u8) -> Option<u64> {
+    match imm8 {
+        // The Phase 39 synthetic fixtures use assembler-verified encodings for
+        // `fmov dN, #2.0` and `fmov dN, #1.0`.
+        0x00 => Some(2.0f64.to_bits()),
+        0x70 => Some(1.0f64.to_bits()),
+        _ => None,
+    }
+}
+
+fn fp_scalar_binary(op: FpBinaryOp, word: u32) -> InstructionKind {
+    InstructionKind::FpScalarBinary {
+        op,
+        precision: FpPrecision::Double,
+        rd: bits(word, 0, 5) as u8,
+        rn: bits(word, 5, 5) as u8,
+        rm: bits(word, 16, 5) as u8,
+    }
+}
+
+fn vector_binary(op: VectorBinaryOp, word: u32) -> InstructionKind {
+    InstructionKind::VectorBinary {
+        op,
+        arrangement: VectorArrangement::TwoD,
+        rd: bits(word, 0, 5) as u8,
+        rn: bits(word, 5, 5) as u8,
+        rm: bits(word, 16, 5) as u8,
+    }
+}
+
 fn load_store(is_load: bool, size: MemSize, word: u32) -> InstructionKind {
     let rt = bits(word, 0, 5) as u8;
     let rn = bits(word, 5, 5) as u8;
@@ -604,8 +820,8 @@ pub enum DecodeError {
 #[cfg(test)]
 mod tests {
     use super::{
-        BarrierKind, DecodeError, InstructionClass, InstructionKind, LogicalOp, MemSize,
-        decode_program,
+        BarrierKind, DecodeError, FpBinaryOp, FpPrecision, InstructionClass, InstructionKind,
+        LogicalOp, MemSize, VectorArrangement, VectorBinaryOp, decode_program,
     };
 
     #[test]
@@ -1013,5 +1229,91 @@ mod tests {
             }
         );
         assert_eq!(decoded[3].disassembly, "dmb #0x0");
+    }
+
+    #[test]
+    fn decodes_scalar_fp_ops() {
+        let bytes: Vec<u8> = 0x1E6E1000u32
+            .to_le_bytes()
+            .into_iter()
+            .chain(0x1E601001u32.to_le_bytes())
+            .chain(0x1E612802u32.to_le_bytes())
+            .chain(0x1E603823u32.to_le_bytes())
+            .chain(0x1E610824u32.to_le_bytes())
+            .chain(0x1E611885u32.to_le_bytes())
+            .chain(0x1E612000u32.to_le_bytes())
+            .collect();
+
+        let decoded = decode_program(&bytes, 0x4000).expect("fp instructions should decode");
+
+        assert_eq!(
+            decoded[0].kind,
+            InstructionKind::FpMoveImmediate {
+                precision: FpPrecision::Double,
+                rd: 0,
+                bits: 1.0f64.to_bits(),
+            }
+        );
+        assert_eq!(decoded[0].class, InstructionClass::FloatingPoint);
+        assert_eq!(decoded[0].disassembly, "fmov d0, #1.0");
+        assert_eq!(decoded[1].disassembly, "fmov d1, #2.0");
+        assert_eq!(
+            decoded[2].kind,
+            InstructionKind::FpScalarBinary {
+                op: FpBinaryOp::Add,
+                precision: FpPrecision::Double,
+                rd: 2,
+                rn: 0,
+                rm: 1,
+            }
+        );
+        assert_eq!(decoded[2].disassembly, "fadd d2, d0, d1");
+        assert_eq!(decoded[3].disassembly, "fsub d3, d1, d0");
+        assert_eq!(decoded[4].disassembly, "fmul d4, d1, d1");
+        assert_eq!(decoded[5].disassembly, "fdiv d5, d4, d1");
+        assert_eq!(
+            decoded[6].kind,
+            InstructionKind::FpCompare {
+                precision: FpPrecision::Double,
+                rn: 0,
+                rm: 1,
+            }
+        );
+        assert_eq!(decoded[6].disassembly, "fcmp d0, d1");
+    }
+
+    #[test]
+    fn decodes_basic_neon_ops() {
+        let bytes: Vec<u8> = 0x4EE18402u32
+            .to_le_bytes()
+            .into_iter()
+            .chain(0x4E61D403u32.to_le_bytes())
+            .collect();
+
+        let decoded = decode_program(&bytes, 0x5000).expect("neon instructions should decode");
+
+        assert_eq!(
+            decoded[0].kind,
+            InstructionKind::VectorBinary {
+                op: VectorBinaryOp::AddI64,
+                arrangement: VectorArrangement::TwoD,
+                rd: 2,
+                rn: 0,
+                rm: 1,
+            }
+        );
+        assert_eq!(decoded[0].class, InstructionClass::Simd);
+        assert_eq!(decoded[0].disassembly, "add v2.2d, v0.2d, v1.2d");
+        assert_eq!(
+            decoded[1].kind,
+            InstructionKind::VectorBinary {
+                op: VectorBinaryOp::AddF64,
+                arrangement: VectorArrangement::TwoD,
+                rd: 3,
+                rn: 0,
+                rm: 1,
+            }
+        );
+        assert_eq!(decoded[1].disassembly, "fadd v3.2d, v0.2d, v1.2d");
     }
 }

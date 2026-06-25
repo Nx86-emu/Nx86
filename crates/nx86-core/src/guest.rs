@@ -133,6 +133,42 @@ impl CpuState {
     }
 
     #[must_use]
+    pub const fn vector_lane64(&self, register: u8, lane: u8) -> u64 {
+        if register >= 32 || lane >= 2 {
+            return 0;
+        }
+        let value = self.fp_simd[register as usize];
+        if lane == 0 {
+            value as u64
+        } else {
+            (value >> 64) as u64
+        }
+    }
+
+    pub const fn set_vector_lane64(&mut self, register: u8, lane: u8, value: u64) {
+        if register >= 32 || lane >= 2 {
+            return;
+        }
+        let slot = &mut self.fp_simd[register as usize];
+        if lane == 0 {
+            *slot = (*slot & (!0u128 << 64)) | value as u128;
+        } else {
+            *slot = (*slot & (u64::MAX as u128)) | ((value as u128) << 64);
+        }
+    }
+
+    #[must_use]
+    pub fn scalar_f64(&self, register: u8) -> f64 {
+        f64::from_bits(self.vector_lane64(register, 0))
+    }
+
+    pub fn set_scalar_f64(&mut self, register: u8, value: f64) {
+        if register < 32 {
+            self.fp_simd[register as usize] = u128::from(value.to_bits());
+        }
+    }
+
+    #[must_use]
     pub const fn thread(&self) -> &ThreadState {
         &self.thread
     }
@@ -671,5 +707,24 @@ mod tests {
         state.set_vector(255, 1);
 
         assert_eq!(state.vector(255), 0);
+    }
+
+    #[test]
+    fn vector_lane_helpers_preserve_other_lane() {
+        let mut state = CpuState::new();
+
+        state.set_vector_lane64(0, 0, 0x1111);
+        state.set_vector_lane64(0, 1, 0x2222);
+
+        assert_eq!(state.vector_lane64(0, 0), 0x1111);
+        assert_eq!(state.vector_lane64(0, 1), 0x2222);
+        assert_eq!(
+            state.vector(0),
+            (u128::from(0x2222u64) << 64) | u128::from(0x1111u64)
+        );
+
+        state.set_scalar_f64(1, 1.5);
+        assert_eq!(state.scalar_f64(1), 1.5);
+        assert_eq!(state.vector_lane64(1, 1), 0);
     }
 }
