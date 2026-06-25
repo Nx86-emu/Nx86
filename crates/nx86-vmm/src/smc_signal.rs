@@ -131,8 +131,8 @@ mod platform {
             return;
         }
         // Check for duplicates before inserting.
-        for i in 0..count {
-            if EXEC_PAGE_BASES[i].load(Ordering::Acquire) == page_base {
+        for slot in EXEC_PAGE_BASES.iter().take(count) {
+            if slot.load(Ordering::Acquire) == page_base {
                 return;
             }
         }
@@ -142,8 +142,8 @@ mod platform {
 
     pub(super) fn unregister_executable_page_impl(page_base: u64) {
         let count = EXEC_PAGE_COUNT.load(Ordering::Acquire);
-        for i in 0..count {
-            if EXEC_PAGE_BASES[i].load(Ordering::Acquire) == page_base {
+        for (i, slot) in EXEC_PAGE_BASES.iter().enumerate().take(count) {
+            if slot.load(Ordering::Acquire) == page_base {
                 // Swap with last and shrink.
                 if i < count - 1 {
                     let last = EXEC_PAGE_BASES[count - 1].load(Ordering::Acquire);
@@ -207,7 +207,6 @@ mod platform {
         arena_size: u64,
     ) -> Result<(), crate::VmmFault> {
         use crate::VmmFault;
-        use std::sync::atomic::AtomicUsize;
 
         if HANDLER_INSTALLED
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
@@ -228,7 +227,7 @@ mod platform {
         // `mprotect` (both are AS-safe by POSIX).
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = smc_sigsegv_handler as usize;
+            sa.sa_sigaction = smc_sigsegv_handler as *const () as usize;
             sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
             libc::sigemptyset(&mut sa.sa_mask);
             if libc::sigaction(libc::SIGSEGV, &sa, std::ptr::null_mut()) != 0 {
@@ -266,7 +265,7 @@ mod platform {
         _ucontext: *mut libc::c_void,
     ) {
         // SAFETY: the kernel guarantees `info` is valid for SA_SIGINFO handlers.
-        let fault_addr = unsafe { (*info).si_addr } as usize;
+        let fault_addr = unsafe { (*info).si_addr() } as usize;
 
         // SAFETY: reading static muts that are set once during init.
         let arena_base = unsafe { ARENA_BASE };
