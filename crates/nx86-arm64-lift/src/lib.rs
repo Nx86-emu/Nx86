@@ -12,9 +12,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use nx86_arm64_decode::{DecodedInstruction, InstructionKind, LogicalOp, MemSize};
+use nx86_arm64_decode::{
+    BarrierKind as DecodedBarrierKind, DecodedInstruction, InstructionKind, LogicalOp, MemSize,
+};
 use nx86_ir::verify::{self, VerifyError};
-use nx86_ir::{BinaryOp, Block, BlockId, FlagOp, Function, Inst, Op, Reg, Terminator, Type, Value};
+use nx86_ir::{
+    BarrierKind, BinaryOp, Block, BlockId, FlagOp, Function, Inst, Op, Reg, Terminator, Type, Value,
+};
 use thiserror::Error;
 
 pub mod recover;
@@ -529,6 +533,17 @@ fn lift_data(kind: &InstructionKind, address: u64, out: &mut Vec<Inst>, counter:
                 }
             }
         }
+        InstructionKind::Barrier { kind, option } => {
+            push(
+                out,
+                None,
+                Op::Barrier {
+                    kind: barrier_kind(*kind),
+                    option: option & 0x0F,
+                },
+                address,
+            );
+        }
         // Terminators are handled by the caller.
         InstructionKind::Branch { .. }
         | InstructionKind::CondBranch { .. }
@@ -705,9 +720,18 @@ const fn logical_to_binary(op: LogicalOp) -> BinaryOp {
     }
 }
 
+const fn barrier_kind(kind: DecodedBarrierKind) -> BarrierKind {
+    match kind {
+        DecodedBarrierKind::Dmb => BarrierKind::Dmb,
+        DecodedBarrierKind::Dsb => BarrierKind::Dsb,
+        DecodedBarrierKind::Isb => BarrierKind::Isb,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nx86_arm64_decode::decode_program;
+    use nx86_ir::{BarrierKind, Op};
 
     use super::lift_program;
 
@@ -757,5 +781,41 @@ mod tests {
             error,
             super::LiftError::UnknownBranchTarget { .. }
         ));
+    }
+
+    #[test]
+    fn lifts_barriers_as_side_effecting_ir_ops() {
+        let bytes: Vec<u8> = 0xD5033FBFu32
+            .to_le_bytes()
+            .into_iter()
+            .chain(0xD5033D9Fu32.to_le_bytes())
+            .chain(0xD50337DFu32.to_le_bytes())
+            .chain(0xD4000001u32.to_le_bytes())
+            .collect();
+        let instructions = decode_program(&bytes, 0x1000).expect("program should decode");
+
+        let function =
+            lift_program("barriers", &instructions, 0x1000).expect("program should lift");
+
+        let barriers: Vec<_> = function.blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|inst| match inst.op {
+                Op::Barrier { kind, option } => Some((kind, option, inst.guest_address)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            barriers,
+            vec![
+                (BarrierKind::Dmb, 0xF, 0x1000),
+                (BarrierKind::Dsb, 0xD, 0x1004),
+                (BarrierKind::Isb, 0x7, 0x1008),
+            ]
+        );
+        let dump = function.dump();
+        assert!(dump.contains("barrier.dmb sy"), "{dump}");
+        assert!(dump.contains("barrier.dsb ld"), "{dump}");
+        assert!(dump.contains("barrier.isb nsh"), "{dump}");
     }
 }

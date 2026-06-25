@@ -72,6 +72,7 @@ pub enum InstructionClass {
     Exception,
     LoadStore,
     Atomic,
+    Barrier,
 }
 
 /// Access width of a load/store.
@@ -102,6 +103,26 @@ pub enum LogicalOp {
     And,
     Or,
     Xor,
+}
+
+/// AArch64 barrier instruction kind.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BarrierKind {
+    Dmb,
+    Dsb,
+    Isb,
+}
+
+impl BarrierKind {
+    #[must_use]
+    pub const fn mnemonic(self) -> &'static str {
+        match self {
+            Self::Dmb => "dmb",
+            Self::Dsb => "dsb",
+            Self::Isb => "isb",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,6 +210,10 @@ pub enum InstructionKind {
         rn: u8,
         size: MemSize,
     },
+    Barrier {
+        kind: BarrierKind,
+        option: u8,
+    },
 }
 
 impl InstructionKind {
@@ -208,6 +233,7 @@ impl InstructionKind {
             | Self::StoreExclusive { .. }
             | Self::LoadAcquire { .. }
             | Self::StoreRelease { .. } => InstructionClass::Atomic,
+            Self::Barrier { .. } => InstructionClass::Barrier,
         }
     }
 
@@ -297,8 +323,36 @@ impl InstructionKind {
             Self::StoreRelease { rt, rn, size } => {
                 format!("stlr {}, [{}]", reg_for_size(*rt, *size), gp_or_sp(*rn))
             }
+            Self::Barrier { kind, option } => {
+                format!("{} {}", kind.mnemonic(), format_barrier_option(*option))
+            }
         }
     }
+}
+
+#[must_use]
+pub const fn barrier_option_name(option: u8) -> Option<&'static str> {
+    match option & 0x0F {
+        0x1 => Some("oshld"),
+        0x2 => Some("oshst"),
+        0x3 => Some("osh"),
+        0x5 => Some("nshld"),
+        0x6 => Some("nshst"),
+        0x7 => Some("nsh"),
+        0x9 => Some("ishld"),
+        0xA => Some("ishst"),
+        0xB => Some("ish"),
+        0xD => Some("ld"),
+        0xE => Some("st"),
+        0xF => Some("sy"),
+        _ => None,
+    }
+}
+
+fn format_barrier_option(option: u8) -> String {
+    barrier_option_name(option)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("#0x{:x}", option & 0x0F))
 }
 
 fn reg_for_size(register: u8, size: MemSize) -> String {
@@ -379,6 +433,13 @@ fn decode_kind(word: u32, address: u64) -> Result<InstructionKind, DecodeError> 
         });
     }
 
+    if let Some(kind) = barrier_kind(word) {
+        return Ok(InstructionKind::Barrier {
+            kind,
+            option: bits(word, 8, 4) as u8,
+        });
+    }
+
     // Logical (shifted register), 64-bit, LSL #0, N=0: AND/ORR/EOR.
     if (word & 0xFFE0_FC00) == 0x8A00_0000 {
         return Ok(logical_reg(LogicalOp::And, word));
@@ -454,6 +515,15 @@ fn decode_kind(word: u32, address: u64) -> Result<InstructionKind, DecodeError> 
     }
 
     Err(DecodeError::UnsupportedInstruction { address, word })
+}
+
+fn barrier_kind(word: u32) -> Option<BarrierKind> {
+    match word & 0xFFFF_F0FF {
+        0xD503_309F => Some(BarrierKind::Dsb),
+        0xD503_30BF => Some(BarrierKind::Dmb),
+        0xD503_30DF => Some(BarrierKind::Isb),
+        _ => None,
+    }
 }
 
 fn logical_reg(op: LogicalOp, word: u32) -> InstructionKind {
@@ -534,7 +604,8 @@ pub enum DecodeError {
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodeError, InstructionClass, InstructionKind, LogicalOp, MemSize, decode_program,
+        BarrierKind, DecodeError, InstructionClass, InstructionKind, LogicalOp, MemSize,
+        decode_program,
     };
 
     #[test]
@@ -892,5 +963,55 @@ mod tests {
             }
         );
         assert_eq!(decoded[1].disassembly, "stxr w2, w0, [x1]");
+    }
+
+    #[test]
+    fn decodes_barriers_and_preserves_options() {
+        let bytes: Vec<u8> = 0xD5033FBFu32
+            .to_le_bytes()
+            .into_iter()
+            .chain(0xD5033D9Fu32.to_le_bytes())
+            .chain(0xD50337DFu32.to_le_bytes())
+            .chain(0xD50330BFu32.to_le_bytes())
+            .collect();
+
+        let decoded = decode_program(&bytes, 0x2000).expect("barriers should decode");
+
+        assert_eq!(
+            decoded[0].kind,
+            InstructionKind::Barrier {
+                kind: BarrierKind::Dmb,
+                option: 0xF
+            }
+        );
+        assert_eq!(decoded[0].class, InstructionClass::Barrier);
+        assert_eq!(decoded[0].disassembly, "dmb sy");
+
+        assert_eq!(
+            decoded[1].kind,
+            InstructionKind::Barrier {
+                kind: BarrierKind::Dsb,
+                option: 0xD
+            }
+        );
+        assert_eq!(decoded[1].disassembly, "dsb ld");
+
+        assert_eq!(
+            decoded[2].kind,
+            InstructionKind::Barrier {
+                kind: BarrierKind::Isb,
+                option: 0x7
+            }
+        );
+        assert_eq!(decoded[2].disassembly, "isb nsh");
+
+        assert_eq!(
+            decoded[3].kind,
+            InstructionKind::Barrier {
+                kind: BarrierKind::Dmb,
+                option: 0x0
+            }
+        );
+        assert_eq!(decoded[3].disassembly, "dmb #0x0");
     }
 }

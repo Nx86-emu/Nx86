@@ -281,6 +281,9 @@ impl TinyInterpreter {
                 }
                 state.set_pc(next_pc);
             }
+            InstructionKind::Barrier { .. } => {
+                state.set_pc(next_pc);
+            }
         }
         Ok(())
     }
@@ -840,6 +843,40 @@ mod tests {
         assert!(result.memory_diffs.is_empty());
         assert!(result.nxir.error.is_none(), "{:?}", result.nxir.error);
         assert!(result.nxir.agrees);
+    }
+
+    #[test]
+    fn barriers_execute_as_noop_side_effects_in_interpreter_and_nxir() {
+        // mov x0,#1 ; dmb sy ; dsb ld ; isb #7 ; add x1,x0,#2 ; svc #0.
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "barriers"
+            entry-point = "0x0"
+
+            [program]
+            arm64-hex = "20 00 80 D2 BF 3F 03 D5 9F 3D 03 D5 DF 37 03 D5 01 08 00 91 01 00 00 D4"
+
+            [expected.registers]
+            x0 = "0x1"
+            x1 = "0x3"
+            pc = "0x18"
+            halted = "true"
+            "#,
+        )
+        .expect("test should parse");
+
+        let result = run_synthetic_test(&test).expect("test should run");
+
+        assert!(result.register_diffs.is_empty());
+        assert!(result.nxir.error.is_none(), "{:?}", result.nxir.error);
+        assert!(result.nxir.agrees);
+        assert_eq!(result.interpreter.trace.len(), 6);
+        assert!(result.nxir.dump.contains("barrier.dmb sy"));
+        assert!(result.nxir.dump.contains("barrier.dsb ld"));
+        assert!(result.nxir.dump.contains("barrier.isb nsh"));
+        assert_eq!(result.native.status, NativeStatus::Unsupported);
+        assert_eq!(result.dispatched.status, NativeStatus::Unsupported);
     }
 
     #[test]

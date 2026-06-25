@@ -241,6 +241,7 @@ fn execute_op(
             store_mem(memory, *ty, resolved_address, resolved_value)?;
             None
         }
+        Op::Barrier { .. } => None,
     };
 
     if let (Some(value), Some(result)) = (inst.result, computed) {

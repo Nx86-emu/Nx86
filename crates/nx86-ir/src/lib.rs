@@ -72,6 +72,15 @@ pub enum FlagOp {
     Sub,
 }
 
+/// AArch64 barrier instruction kind preserved in NxIR.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BarrierKind {
+    Dmb,
+    Dsb,
+    Isb,
+}
+
 /// An NxIR operation. Operations either define a value (e.g. [`Op::Binary`]) or
 /// produce a side effect (e.g. [`Op::SetReg`]).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,6 +134,10 @@ pub enum Op {
         address: Value,
         value: Value,
     },
+    /// Barrier ordering marker. Phase 35 preserves kind+option as an explicit
+    /// side effect; runtime execution is a no-op until threading/MMIO/native
+    /// semantics arrive.
+    Barrier { kind: BarrierKind, option: u8 },
 }
 
 impl Op {
@@ -142,7 +155,8 @@ impl Op {
             Self::SetReg { .. }
             | Self::Store { .. }
             | Self::SetFlags { .. }
-            | Self::StoreRelease { .. } => None,
+            | Self::StoreRelease { .. }
+            | Self::Barrier { .. } => None,
         }
     }
 
@@ -158,6 +172,7 @@ impl Op {
                 | Self::StoreExclusive { .. }
                 | Self::LoadAcquire { .. }
                 | Self::StoreRelease { .. }
+                | Self::Barrier { .. }
         )
     }
 
@@ -165,7 +180,7 @@ impl Op {
     #[must_use]
     pub fn operand_constraints(&self) -> Vec<(Value, Type)> {
         match self {
-            Self::Const { .. } | Self::GetReg { .. } => Vec::new(),
+            Self::Const { .. } | Self::GetReg { .. } | Self::Barrier { .. } => Vec::new(),
             Self::SetReg { value, .. } => vec![(*value, Type::I64)],
             Self::Binary { ty, lhs, rhs, .. } => vec![(*lhs, *ty), (*rhs, *ty)],
             Self::Trunc { value } => vec![(*value, Type::I64)],
@@ -385,6 +400,42 @@ impl fmt::Display for BinaryOp {
     }
 }
 
+impl fmt::Display for BarrierKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::Dmb => "dmb",
+            Self::Dsb => "dsb",
+            Self::Isb => "isb",
+        };
+        formatter.write_str(text)
+    }
+}
+
+#[must_use]
+pub const fn barrier_option_name(option: u8) -> Option<&'static str> {
+    match option & 0x0F {
+        0x1 => Some("oshld"),
+        0x2 => Some("oshst"),
+        0x3 => Some("osh"),
+        0x5 => Some("nshld"),
+        0x6 => Some("nshst"),
+        0x7 => Some("nsh"),
+        0x9 => Some("ishld"),
+        0xA => Some("ishst"),
+        0xB => Some("ish"),
+        0xD => Some("ld"),
+        0xE => Some("st"),
+        0xF => Some("sy"),
+        _ => None,
+    }
+}
+
+fn format_barrier_option(option: u8) -> String {
+    barrier_option_name(option)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("#0x{:x}", option & 0x0F))
+}
+
 fn format_inst(inst: &Inst) -> String {
     let body = format_op(&inst.op);
     match inst.result {
@@ -417,6 +468,9 @@ fn format_op(op: &Op) -> String {
         Op::LoadAcquire { ty, address } => format!("ldar.{ty} [{address}]"),
         Op::StoreRelease { ty, address, value } => {
             format!("stlr.{ty} [{address}], {value}")
+        }
+        Op::Barrier { kind, option } => {
+            format!("barrier.{kind} {}", format_barrier_option(*option))
         }
     }
 }
@@ -451,7 +505,10 @@ fn format_terminator(terminator: &Terminator) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BinaryOp, Block, Function, Inst, Module, Op, Reg, Terminator, Type, Value};
+    use super::{
+        BarrierKind, BinaryOp, Block, Function, Inst, Module, Op, Reg, Terminator, Type, Value,
+        barrier_option_name,
+    };
 
     fn add_function() -> Function {
         // v0 = const.i64 1 ; setreg x0, v0
@@ -610,6 +667,30 @@ mod tests {
             store.operand_constraints(),
             vec![(Value(5), Type::I64), (Value(6), Type::I32)]
         );
+    }
+
+    #[test]
+    fn barrier_op_is_side_effecting_resultless_and_serializable() {
+        let op = Op::Barrier {
+            kind: BarrierKind::Dmb,
+            option: 0xA,
+        };
+
+        assert_eq!(op.result_type(), None);
+        assert!(op.is_side_effect());
+        assert!(op.operand_constraints().is_empty());
+        assert_eq!(barrier_option_name(0xA), Some("ishst"));
+
+        let inst = Inst {
+            result: None,
+            op: op.clone(),
+            guest_address: 0x40,
+        };
+        assert_eq!(super::format_inst(&inst), "barrier.dmb ishst");
+
+        let json = serde_json::to_string(&op).expect("barrier op should serialize");
+        let decoded: Op = serde_json::from_str(&json).expect("barrier op should deserialize");
+        assert_eq!(decoded, op);
     }
 
     #[test]

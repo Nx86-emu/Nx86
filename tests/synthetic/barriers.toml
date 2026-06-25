@@ -1,0 +1,31 @@
+# Phase 35 barrier semantics demo.
+#
+# The barriers are semantic no-op side effects in v0: they must decode, lift,
+# execute, and remain visible in NxIR, while preserving guest CPU state.
+
+[metadata]
+name = "barriers"
+description = "Runs DMB/DSB/ISB before a simple integer add."
+entry-point = "0x0"
+
+[program]
+# mov x0, #1
+# dmb sy
+# dsb ld
+# isb #7
+# add x1, x0, #2
+# svc #0
+arm64-hex = """
+20 00 80 D2
+BF 3F 03 D5
+9F 3D 03 D5
+DF 37 03 D5
+01 08 00 91
+01 00 00 D4
+"""
+
+[expected.registers]
+x0 = "0x1"
+x1 = "0x3"
+pc = "0x18"
+halted = "true"

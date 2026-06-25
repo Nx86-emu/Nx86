@@ -7,6 +7,7 @@
 *.log
 .mcp.json
 .mimocode/
+references/
 
 # Local Nx86 runtime data should not be committed.
 /Nx86/

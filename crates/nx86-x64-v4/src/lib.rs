@@ -532,6 +532,9 @@ fn lower_inst(
         Op::StoreExclusive { .. } | Op::StoreRelease { .. } => {
             return Err(LoweringError::UnsupportedOp { op: "atomic store" });
         }
+        Op::Barrier { .. } => {
+            return Err(LoweringError::UnsupportedOp { op: "barrier" });
+        }
     }
 
     Ok(())

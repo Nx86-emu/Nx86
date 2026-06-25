@@ -2732,6 +2732,28 @@ Exit criteria:
 
 1. barriers behave correctly in synthetic tests
 
+Deferred barrier work after Phase 35:
+
+- Native backend lowering:
+  Map preserved NxIR BarrierOp values to correct host fence/compiler ordering behavior.
+
+- Threading semantics:
+  Define how DMB/DSB/ISB interact with Nx86 guest thread scheduling, atomics, shared memory, and synchronization.
+
+- MMIO/services ordering:
+  Define barrier effects around guest-visible device/service/MMIO operations.
+
+- Executable memory / SMC:
+  Define how ISB/DSB/DMB interact with code cache invalidation, self-modifying code, and generated native blocks.
+
+- Optimizer rules:
+  Define which memory/code operations may or may not move across each barrier kind/domain.
+
+- Debug/replay:
+  Preserve barrier events in traces/replay logs so deterministic replay and validation can reason about ordering.
+
+Phase 35 is complete only when it preserves enough NxIR information for all of the above future work.
+
 ---
 
 ### Phase 36: Guest Threading v0
