@@ -1718,6 +1718,7 @@ dependencies = [
  "nx86-core",
  "nx86-ir",
  "nx86-jit",
+ "nx86-profile",
  "nx86-regalloc",
  "nx86-x64-asm",
  "thiserror 2.0.18",

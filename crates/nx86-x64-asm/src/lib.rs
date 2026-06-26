@@ -223,6 +223,51 @@ impl RegXmm {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegMask {
+    K0,
+    K1,
+    K2,
+    K3,
+    K4,
+    K5,
+    K6,
+    K7,
+}
+
+impl RegMask {
+    const fn number(self) -> u8 {
+        match self {
+            Self::K0 => 0,
+            Self::K1 => 1,
+            Self::K2 => 2,
+            Self::K3 => 3,
+            Self::K4 => 4,
+            Self::K5 => 5,
+            Self::K6 => 6,
+            Self::K7 => 7,
+        }
+    }
+
+    const fn low3(self) -> u8 {
+        self.number() & 0b111
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::K0 => "k0",
+            Self::K1 => "k1",
+            Self::K2 => "k2",
+            Self::K3 => "k3",
+            Self::K4 => "k4",
+            Self::K5 => "k5",
+            Self::K6 => "k6",
+            Self::K7 => "k7",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mem64 {
     pub base: Reg64,
     pub index: Option<Reg64>,
@@ -421,6 +466,18 @@ impl Assembler {
         self.emit_mem_xmm(&[0xF2], 0x11, dst, src);
     }
 
+    pub fn movdqu_xmm_mem(&mut self, dst: RegXmm, src: Mem64) {
+        self.dump
+            .push(format!("movdqu {}, xmmword {}", dst.name(), mem_name(src)));
+        self.emit_xmm_mem(&[0xF3], 0x6F, dst, src);
+    }
+
+    pub fn movdqu_mem_xmm(&mut self, dst: Mem64, src: RegXmm) {
+        self.dump
+            .push(format!("movdqu xmmword {}, {}", mem_name(dst), src.name()));
+        self.emit_mem_xmm(&[0xF3], 0x7F, dst, src);
+    }
+
     pub fn addsd_xmm_mem(&mut self, dst: RegXmm, src: Mem64) {
         self.dump
             .push(format!("addsd {}, qword {}", dst.name(), mem_name(src)));
@@ -443,6 +500,81 @@ impl Assembler {
         self.dump
             .push(format!("divsd {}, qword {}", dst.name(), mem_name(src)));
         self.emit_xmm_mem(&[0xF2], 0x5E, dst, src);
+    }
+
+    pub fn addpd_xmm_mem(&mut self, dst: RegXmm, src: Mem64) {
+        self.dump
+            .push(format!("addpd {}, xmmword {}", dst.name(), mem_name(src)));
+        self.emit_xmm_mem(&[0x66], 0x58, dst, src);
+    }
+
+    pub fn paddq_xmm_mem(&mut self, dst: RegXmm, src: Mem64) {
+        self.dump
+            .push(format!("paddq {}, xmmword {}", dst.name(), mem_name(src)));
+        self.emit_xmm_mem(&[0x66], 0xD4, dst, src);
+    }
+
+    pub fn pcmpeqq_xmm_mem(&mut self, dst: RegXmm, src: Mem64) {
+        self.dump
+            .push(format!("pcmpeqq {}, xmmword {}", dst.name(), mem_name(src)));
+        self.emit_xmm_mem_0f38(&[0x66], 0x29, dst, src);
+    }
+
+    pub fn pshufd_xmm_mem_imm8(&mut self, dst: RegXmm, src: Mem64, imm: u8) {
+        self.dump.push(format!(
+            "pshufd {}, xmmword {}, {imm:#x}",
+            dst.name(),
+            mem_name(src)
+        ));
+        self.emit_xmm_mem_imm8(&[0x66], 0x70, dst, src, imm);
+    }
+
+    pub fn vmovdqu64_xmm_mem(&mut self, dst: RegXmm, src: Mem64) {
+        self.dump.push(format!(
+            "vmovdqu64 {}, xmmword {}",
+            dst.name(),
+            mem_name(src)
+        ));
+        self.emit_evex_xmm_mem(EvexSpec::map_0f(0x02, None), 0x6F, dst, src);
+    }
+
+    pub fn vmovdqu64_mem_xmm(&mut self, dst: Mem64, src: RegXmm) {
+        self.dump.push(format!(
+            "vmovdqu64 xmmword {}, {}",
+            mem_name(dst),
+            src.name()
+        ));
+        self.emit_evex_mem_xmm(EvexSpec::map_0f(0x02, None), 0x7F, dst, src);
+    }
+
+    pub fn vpcmpeqq_mask_xmm_xmm(&mut self, dst: RegMask, lhs: RegXmm, rhs: RegXmm) {
+        self.dump.push(format!(
+            "vpcmpeqq {}, {}, {}",
+            dst.name(),
+            lhs.name(),
+            rhs.name()
+        ));
+        self.emit_evex_prefix(
+            EvexSpec::map_0f38(0x01, Some(lhs)),
+            dst.number(),
+            None,
+            rhs.number(),
+        );
+        self.bytes.push(0x29);
+        self.bytes.push(modrm(0b11, dst.low3(), rhs.low3()));
+    }
+
+    pub fn vpmovm2q_xmm_mask(&mut self, dst: RegXmm, src: RegMask) {
+        self.dump
+            .push(format!("vpmovm2q {}, {}", dst.name(), src.name()));
+        self.emit_evex_prefix(
+            EvexSpec::map_0f38(0x02, None),
+            dst.number(),
+            None,
+            src.number(),
+        );
+        self.bytes.push(0x38);
+        self.bytes.push(modrm(0b11, dst.low3(), src.low3()));
     }
 
     pub fn add_reg_reg(&mut self, dst: Reg64, src: Reg64) {
@@ -625,12 +757,68 @@ impl Assembler {
         emit_mem_modrm(&mut self.bytes, dst.low3(), src);
     }
 
+    fn emit_xmm_mem_0f38(&mut self, prefix: &[u8], opcode: u8, dst: RegXmm, src: Mem64) {
+        self.bytes.extend_from_slice(prefix);
+        emit_rex_xmm(&mut self.bytes, false, Some(dst), src.index, Some(src.base));
+        self.bytes.extend_from_slice(&[0x0F, 0x38, opcode]);
+        emit_mem_modrm(&mut self.bytes, dst.low3(), src);
+    }
+
+    fn emit_xmm_mem_imm8(&mut self, prefix: &[u8], opcode: u8, dst: RegXmm, src: Mem64, imm: u8) {
+        self.bytes.extend_from_slice(prefix);
+        emit_rex_xmm(&mut self.bytes, false, Some(dst), src.index, Some(src.base));
+        self.bytes.push(0x0F);
+        self.bytes.push(opcode);
+        emit_mem_modrm(&mut self.bytes, dst.low3(), src);
+        self.bytes.push(imm);
+    }
+
     fn emit_mem_xmm(&mut self, prefix: &[u8], opcode: u8, dst: Mem64, src: RegXmm) {
         self.bytes.extend_from_slice(prefix);
         emit_rex_xmm(&mut self.bytes, false, Some(src), dst.index, Some(dst.base));
         self.bytes.push(0x0F);
         self.bytes.push(opcode);
         emit_mem_modrm(&mut self.bytes, src.low3(), dst);
+    }
+
+    fn emit_evex_xmm_mem(&mut self, spec: EvexSpec, opcode: u8, dst: RegXmm, src: Mem64) {
+        self.emit_evex_prefix(
+            spec,
+            dst.number(),
+            src.index.map(Reg64::number),
+            src.base.number(),
+        );
+        self.bytes.push(opcode);
+        emit_mem_modrm(&mut self.bytes, dst.low3(), src);
+    }
+
+    fn emit_evex_mem_xmm(&mut self, spec: EvexSpec, opcode: u8, dst: Mem64, src: RegXmm) {
+        self.emit_evex_prefix(
+            spec,
+            src.number(),
+            dst.index.map(Reg64::number),
+            dst.base.number(),
+        );
+        self.bytes.push(opcode);
+        emit_mem_modrm(&mut self.bytes, src.low3(), dst);
+    }
+
+    fn emit_evex_prefix(
+        &mut self,
+        spec: EvexSpec,
+        reg_number: u8,
+        index_number: Option<u8>,
+        rm_number: u8,
+    ) {
+        self.bytes.push(0x62);
+        self.bytes.push(evex_p0(
+            spec.map,
+            reg_number,
+            index_number.unwrap_or(0),
+            rm_number,
+        ));
+        self.bytes.push(evex_p1(spec.pp, spec.vvvv, spec.wide));
+        self.bytes.push(0x08);
     }
 
     fn emit_reg_imm32(&mut self, opcode_extension: u8, dst: Reg64, value: i32) {
@@ -649,6 +837,34 @@ impl Assembler {
     fn pop_reg_raw(&mut self, reg: Reg64) {
         emit_rex(&mut self.bytes, false, None, None, Some(reg));
         self.bytes.push(0x58 + reg.low3());
+    }
+}
+
+#[derive(Clone, Copy)]
+struct EvexSpec {
+    map: u8,
+    pp: u8,
+    wide: bool,
+    vvvv: Option<RegXmm>,
+}
+
+impl EvexSpec {
+    const fn map_0f(pp: u8, vvvv: Option<RegXmm>) -> Self {
+        Self {
+            map: 0x01,
+            pp,
+            wide: true,
+            vvvv,
+        }
+    }
+
+    const fn map_0f38(pp: u8, vvvv: Option<RegXmm>) -> Self {
+        Self {
+            map: 0x02,
+            pp,
+            wide: true,
+            vvvv,
+        }
     }
 }
 
@@ -692,6 +908,19 @@ fn emit_rex_xmm(
     if rex != 0x40 {
         bytes.push(rex);
     }
+}
+
+fn evex_p0(map: u8, reg_number: u8, index_number: u8, rm_number: u8) -> u8 {
+    (u8::from(reg_number & 0b1000 == 0) << 7)
+        | (u8::from(index_number & 0b1000 == 0) << 6)
+        | (u8::from(rm_number & 0b1000 == 0) << 5)
+        | (1 << 4)
+        | (map & 0x0F)
+}
+
+fn evex_p1(pp: u8, vvvv: Option<RegXmm>, wide: bool) -> u8 {
+    let inverted_vvvv = vvvv.map_or(0x0F, |reg| (!reg.number()) & 0x0F);
+    (u8::from(wide) << 7) | (inverted_vvvv << 3) | 0x04 | (pp & 0x03)
 }
 
 const fn modrm(mode: u8, reg: u8, rm: u8) -> u8 {
@@ -763,7 +992,8 @@ fn mem_name(mem: Mem64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AsmError, Assembler, CHAIN_EXIT_SIZE, Mem64, PatchKind, Reg64, RegXmm, encode_jmp_rel32,
+        AsmError, Assembler, CHAIN_EXIT_SIZE, Mem64, PatchKind, Reg64, RegMask, RegXmm,
+        encode_jmp_rel32,
     };
 
     #[test]
@@ -880,6 +1110,57 @@ mod tests {
         assert_eq!(
             &code.bytes()[0..8],
             &[0xF2, 0x41, 0x0F, 0x10, 0x87, 0x50, 0x01, 0x00]
+        );
+    }
+
+    #[test]
+    fn emits_packed_vector_memory_ops() {
+        let mut asm = Assembler::new();
+
+        asm.movdqu_xmm_mem(RegXmm::Xmm1, Mem64::new(Reg64::R15, 336));
+        asm.paddq_xmm_mem(RegXmm::Xmm1, Mem64::new(Reg64::R15, 352));
+        asm.addpd_xmm_mem(RegXmm::Xmm1, Mem64::new(Reg64::R15, 352));
+        asm.pcmpeqq_xmm_mem(RegXmm::Xmm1, Mem64::new(Reg64::R15, 352));
+        asm.pshufd_xmm_mem_imm8(RegXmm::Xmm1, Mem64::new(Reg64::R15, 336), 0x4e);
+        asm.movdqu_mem_xmm(Mem64::new(Reg64::R15, 368), RegXmm::Xmm1);
+
+        let code = asm.finish().expect("assembler should finish");
+        assert!(code.dump().contains("movdqu xmm1"));
+        assert!(code.dump().contains("paddq xmm1"));
+        assert!(code.dump().contains("pcmpeqq xmm1"));
+        assert!(code.dump().contains("pshufd xmm1"));
+        assert_eq!(
+            &code.bytes()[0..8],
+            &[0xF3, 0x41, 0x0F, 0x6F, 0x8F, 0x50, 0x01, 0x00]
+        );
+    }
+
+    #[test]
+    fn emits_avx512_mask_compare_bytes() {
+        let mut asm = Assembler::new();
+
+        asm.vmovdqu64_xmm_mem(RegXmm::Xmm0, Mem64::new(Reg64::R15, 336));
+        asm.vmovdqu64_xmm_mem(RegXmm::Xmm1, Mem64::new(Reg64::R15, 352));
+        asm.vpcmpeqq_mask_xmm_xmm(RegMask::K1, RegXmm::Xmm0, RegXmm::Xmm1);
+        asm.vpmovm2q_xmm_mask(RegXmm::Xmm0, RegMask::K1);
+        asm.vmovdqu64_mem_xmm(Mem64::new(Reg64::R15, 368), RegXmm::Xmm0);
+
+        let code = asm.finish().expect("assembler should finish");
+        assert!(code.dump().contains("vpcmpeqq k1, xmm0, xmm1"));
+        assert!(code.dump().contains("vpmovm2q xmm0, k1"));
+        assert_eq!(
+            &code.bytes()[0..9],
+            &[0x62, 0xD1, 0xFE, 0x08, 0x6F, 0x87, 0x50, 0x01, 0x00]
+        );
+        assert!(
+            code.bytes()
+                .windows(6)
+                .any(|bytes| bytes == [0x62, 0xF2, 0xFD, 0x08, 0x29, 0xC9])
+        );
+        assert!(
+            code.bytes()
+                .windows(6)
+                .any(|bytes| bytes == [0x62, 0xF2, 0xFE, 0x08, 0x38, 0xC1])
         );
     }
 

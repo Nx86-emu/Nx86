@@ -65,6 +65,14 @@ pub struct CompileProgress {
     pub functions_discovered: u64,
     pub functions_compiled: u64,
     pub native_coverage_estimate: f32,
+    #[serde(default)]
+    pub native_coverage_static: f32,
+    #[serde(default)]
+    pub native_coverage_executed: f32,
+    #[serde(default)]
+    pub fastmem_coverage: f32,
+    #[serde(default)]
+    pub slowmem_penalty: f32,
     pub cache_size_bytes: u64,
 }
 
@@ -162,6 +170,10 @@ mod tests {
             functions_discovered: 100,
             functions_compiled: 40,
             native_coverage_estimate: 12.5,
+            native_coverage_static: 10.0,
+            native_coverage_executed: 20.0,
+            fastmem_coverage: 90.0,
+            slowmem_penalty: 10.0,
             cache_size_bytes: 4096,
         });
 

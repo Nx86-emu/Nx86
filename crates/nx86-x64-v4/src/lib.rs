@@ -1,11 +1,16 @@
+use std::collections::{BTreeMap, HashSet};
+
 use nx86_core::guest::{CpuState, Nzcv};
 use nx86_ir::verify::{self, VerifyError};
 use nx86_ir::{
     BinaryOp, Block, BlockId, FpBinaryOp, Function, Inst, Op, Reg, Terminator, Type, Value,
-    VectorBinaryOp,
+    VectorBinaryOp, VectorCompareOp, VectorShuffle,
 };
+use nx86_profile::{ProfileEvent, ProfileLog};
 use nx86_regalloc::{Allocation, Location, allocate};
-use nx86_x64_asm::{AsmError, Assembler, CodeBuffer, Label, Mem64, PatchKind, Reg64, RegXmm};
+use nx86_x64_asm::{
+    AsmError, Assembler, CodeBuffer, Label, Mem64, PatchKind, Reg64, RegMask, RegXmm,
+};
 use thiserror::Error;
 
 pub const CRATE_NAME: &str = "nx86-x64-v4";
@@ -29,6 +34,7 @@ const FASTMEM_WRITE: i32 = 2;
 const PAGE_MASK: i32 = 4095;
 const PAGE_SHIFT: u8 = 12;
 const ARENA_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const SHUFFLE_SWAP_D_IMM: u8 = 0x4e;
 
 #[must_use]
 pub const fn crate_name() -> &'static str {
@@ -199,6 +205,8 @@ pub enum LoweringError {
     UnsupportedTerminator { terminator: &'static str },
     #[error("branch target {target:?} is outside the function block table")]
     UnknownBranchTarget { target: BlockId },
+    #[error("profiled layout selected unknown block entry {entry_pc:#x}")]
+    UnknownLayoutEntry { entry_pc: u64 },
     #[error("instruction at {guest_address:#x} is missing result value for {op}")]
     MissingResult {
         guest_address: u64,
@@ -224,6 +232,32 @@ pub struct LoweredFunctionBlock {
     pub entry_pc: u64,
     /// The block's lowered native code.
     pub lowered: LoweredBlock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeSection {
+    Hot,
+    Cold,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockLayoutEntry {
+    pub original_index: usize,
+    pub entry_pc: u64,
+    pub heat: u64,
+    pub section: CodeSection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HotColdLayout {
+    entries: Vec<BlockLayoutEntry>,
+}
+
+impl HotColdLayout {
+    #[must_use]
+    pub fn entries(&self) -> &[BlockLayoutEntry] {
+        &self.entries
+    }
 }
 
 /// Lower a verified single-block function. Branches are rejected because a lone
@@ -266,6 +300,137 @@ pub fn lower_function(function: &Function) -> Result<Vec<LoweredFunctionBlock>, 
         });
     }
     Ok(blocks)
+}
+
+/// Lower a function in profile-guided hot/cold order. Blocks stay keyed by
+/// guest PC, so dispatcher/native mappings remain stable while hot successors
+/// appear earlier in the emitted native block list.
+pub fn lower_function_with_profile(
+    function: &Function,
+    profile: &ProfileLog,
+) -> Result<(Vec<LoweredFunctionBlock>, HotColdLayout), LoweringError> {
+    verify::verify(function)?;
+    if function.blocks.is_empty() {
+        return Err(LoweringError::UnsupportedBlockCount { count: 0 });
+    }
+
+    let entry_pcs: Vec<u64> = function.blocks.iter().map(block_entry_pc).collect();
+    let layout = hot_cold_layout(function, profile)?;
+    let mut blocks = Vec::with_capacity(function.blocks.len());
+    for entry in layout.entries() {
+        let lowered = lower_block_with_entries(
+            &function.blocks[entry.original_index],
+            function.value_count,
+            &entry_pcs,
+        )?;
+        blocks.push(LoweredFunctionBlock {
+            entry_pc: entry.entry_pc,
+            lowered,
+        });
+    }
+    Ok((blocks, layout))
+}
+
+/// Compute the profile-guided hot/cold layout without emitting code. Entry block
+/// remains first; the hottest observed successor chain follows; unobserved
+/// blocks are split to the cold tail in original order.
+pub fn hot_cold_layout(
+    function: &Function,
+    profile: &ProfileLog,
+) -> Result<HotColdLayout, LoweringError> {
+    verify::verify(function)?;
+    let entry_pcs: Vec<u64> = function.blocks.iter().map(block_entry_pc).collect();
+    if entry_pcs.is_empty() {
+        return Err(LoweringError::UnsupportedBlockCount { count: 0 });
+    }
+    let mut heat = BTreeMap::<u64, u64>::new();
+    let mut edges = BTreeMap::<(u64, u64), u64>::new();
+    let known: HashSet<u64> = entry_pcs.iter().copied().collect();
+    for record in &profile.records {
+        match &record.event {
+            ProfileEvent::JitBlock { guest_pc, .. } => {
+                if known.contains(guest_pc) {
+                    *heat.entry(*guest_pc).or_default() += 1;
+                }
+            }
+            ProfileEvent::BranchTarget {
+                source_pc,
+                target_pc,
+            } => {
+                if known.contains(source_pc) {
+                    *heat.entry(*source_pc).or_default() += 1;
+                }
+                if known.contains(target_pc) {
+                    *heat.entry(*target_pc).or_default() += 1;
+                }
+                if known.contains(source_pc) && known.contains(target_pc) {
+                    *edges.entry((*source_pc, *target_pc)).or_default() += 1;
+                }
+            }
+            ProfileEvent::HelperCall { .. }
+            | ProfileEvent::Slowmem { .. }
+            | ProfileEvent::Fastmem { .. }
+            | ProfileEvent::SmcInvalidate { .. } => {}
+        }
+    }
+
+    let mut visited = HashSet::<u64>::new();
+    let mut ordered = Vec::<u64>::new();
+    let mut current = entry_pcs[0];
+    loop {
+        if !visited.insert(current) {
+            break;
+        }
+        ordered.push(current);
+        let next = edges
+            .iter()
+            .filter_map(|((source, target), count)| {
+                (*source == current && !visited.contains(target) && *count > 0)
+                    .then_some((*target, *count))
+            })
+            .max_by_key(|(target, count)| (*count, std::cmp::Reverse(*target)))
+            .map(|(target, _)| target);
+        let Some(next) = next else {
+            break;
+        };
+        current = next;
+    }
+
+    let mut remaining_hot = entry_pcs
+        .iter()
+        .copied()
+        .filter(|pc| !visited.contains(pc) && heat.get(pc).copied().unwrap_or(0) > 0)
+        .collect::<Vec<_>>();
+    remaining_hot.sort_by_key(|pc| (std::cmp::Reverse(heat.get(pc).copied().unwrap_or(0)), *pc));
+    for pc in remaining_hot {
+        visited.insert(pc);
+        ordered.push(pc);
+    }
+
+    for pc in &entry_pcs {
+        if visited.insert(*pc) {
+            ordered.push(*pc);
+        }
+    }
+
+    let mut entries = Vec::with_capacity(entry_pcs.len());
+    for entry_pc in ordered {
+        let Some(original_index) = entry_pcs.iter().position(|pc| *pc == entry_pc) else {
+            return Err(LoweringError::UnknownLayoutEntry { entry_pc });
+        };
+        let heat = heat.get(&entry_pc).copied().unwrap_or(0);
+        entries.push(BlockLayoutEntry {
+            original_index,
+            entry_pc,
+            heat,
+            section: if original_index == 0 || heat > 0 {
+                CodeSection::Hot
+            } else {
+                CodeSection::Cold
+            },
+        });
+    }
+    Ok(HotColdLayout { entries })
 }
 
 /// Lower one block selected by guest entry PC from a verified function.
@@ -575,6 +740,14 @@ fn lower_inst(
         Op::VectorBinary { op, rd, rn, rm, .. } => {
             emit_vector_binary(asm, *op, *rd, *rn, *rm)?;
         }
+        Op::VectorCompare { op, rd, rn, rm, .. } => {
+            emit_vector_compare(asm, *op, *rd, *rn, *rm)?;
+        }
+        Op::VectorShuffle {
+            shuffle, rd, rn, ..
+        } => {
+            emit_vector_shuffle(asm, *shuffle, *rd, *rn)?;
+        }
     }
 
     Ok(())
@@ -618,23 +791,50 @@ fn emit_vector_binary(
     rn: u8,
     rm: u8,
 ) -> Result<(), LoweringError> {
+    asm.movdqu_xmm_mem(RegXmm::Xmm0, vector_mem(rn)?);
     match op {
         VectorBinaryOp::AddI64 => {
-            for lane in 0..2 {
-                asm.mov_reg_mem(Reg64::Rax, vector_lane_mem(rn, lane)?);
-                asm.mov_reg_mem(Reg64::Rcx, vector_lane_mem(rm, lane)?);
-                asm.add_reg_reg(Reg64::Rax, Reg64::Rcx);
-                asm.mov_mem_reg(vector_lane_mem(rd, lane)?, Reg64::Rax);
-            }
+            asm.paddq_xmm_mem(RegXmm::Xmm0, vector_mem(rm)?);
         }
         VectorBinaryOp::AddF64 => {
-            for lane in 0..2 {
-                asm.movsd_xmm_mem(RegXmm::Xmm0, vector_lane_mem(rn, lane)?);
-                asm.addsd_xmm_mem(RegXmm::Xmm0, vector_lane_mem(rm, lane)?);
-                asm.movsd_mem_xmm(vector_lane_mem(rd, lane)?, RegXmm::Xmm0);
-            }
+            asm.addpd_xmm_mem(RegXmm::Xmm0, vector_mem(rm)?);
         }
     }
+    asm.movdqu_mem_xmm(vector_mem(rd)?, RegXmm::Xmm0);
+    Ok(())
+}
+
+fn emit_vector_compare(
+    asm: &mut Assembler,
+    op: VectorCompareOp,
+    rd: u8,
+    rn: u8,
+    rm: u8,
+) -> Result<(), LoweringError> {
+    asm.vmovdqu64_xmm_mem(RegXmm::Xmm0, vector_mem(rn)?);
+    asm.vmovdqu64_xmm_mem(RegXmm::Xmm1, vector_mem(rm)?);
+    match op {
+        VectorCompareOp::EqI64 => {
+            asm.vpcmpeqq_mask_xmm_xmm(RegMask::K1, RegXmm::Xmm0, RegXmm::Xmm1);
+            asm.vpmovm2q_xmm_mask(RegXmm::Xmm0, RegMask::K1);
+        }
+    }
+    asm.vmovdqu64_mem_xmm(vector_mem(rd)?, RegXmm::Xmm0);
+    Ok(())
+}
+
+fn emit_vector_shuffle(
+    asm: &mut Assembler,
+    shuffle: VectorShuffle,
+    rd: u8,
+    rn: u8,
+) -> Result<(), LoweringError> {
+    match shuffle {
+        VectorShuffle::SwapD => {
+            asm.pshufd_xmm_mem_imm8(RegXmm::Xmm0, vector_mem(rn)?, SHUFFLE_SWAP_D_IMM);
+        }
+    }
+    asm.movdqu_mem_xmm(vector_mem(rd)?, RegXmm::Xmm0);
     Ok(())
 }
 
@@ -930,10 +1130,21 @@ fn vector_lane_mem(register: u8, lane: u8) -> Result<Mem64, LoweringError> {
     if register >= 32 {
         return Err(LoweringError::RegisterOutOfRange { register });
     }
-    let lane_offset = if lane == 0 { 0 } else { 8 };
+    let lane_offset = match lane {
+        0 => 0,
+        1 => 8,
+        _ => return Err(LoweringError::UnsupportedOp { op: "vector lane" }),
+    };
     Ok(state_mem(
         V0_OFFSET + (i32::from(register) * 16) + lane_offset,
     ))
+}
+
+fn vector_mem(register: u8) -> Result<Mem64, LoweringError> {
+    if register >= 32 {
+        return Err(LoweringError::RegisterOutOfRange { register });
+    }
+    Ok(state_mem(V0_OFFSET + (i32::from(register) * 16)))
 }
 
 const fn state_mem(offset: i32) -> Mem64 {
@@ -999,7 +1210,23 @@ mod tests {
 
         assert!(dump.contains("movsd xmm0"));
         assert!(dump.contains("addsd xmm0"));
+        assert!(dump.contains("paddq xmm0"));
+        assert!(dump.contains("addpd xmm0"));
         assert!(dump.contains("mov [r15+0x"));
+    }
+
+    #[test]
+    fn lowers_advanced_vector_ops_with_masks_and_shuffle() {
+        let function = advanced_vector_function();
+
+        let lowered = lower_tiny_block(&function).expect("advanced vector ops should lower");
+        let dump = lowered.dump();
+
+        assert!(dump.contains("vmovdqu64 xmm0"));
+        assert!(dump.contains("vpcmpeqq k1"));
+        assert!(dump.contains("vpmovm2q xmm0"));
+        assert!(dump.contains("pshufd xmm0"));
+        assert!(dump.contains("vmovdqu64 xmmword [r15+0x"));
     }
 
     #[test]
@@ -1033,6 +1260,50 @@ mod tests {
         let halt_dump = blocks[1].lowered.dump();
         assert!(halt_dump.contains("mov rax, 0x1"));
         assert!(halt_dump.contains("mov [r15+0x110], rax"));
+    }
+
+    #[test]
+    fn profiled_layout_moves_hot_successor_before_cold_block() {
+        let function = hot_cold_function();
+        let profile = nx86_profile::ProfileLog {
+            records: vec![
+                nx86_profile::ProfileRecord::new(nx86_profile::ProfileEvent::BranchTarget {
+                    source_pc: 0x0,
+                    target_pc: 0x10,
+                }),
+                nx86_profile::ProfileRecord::new(nx86_profile::ProfileEvent::JitBlock {
+                    guest_pc: 0x10,
+                    code_size_bytes: 32,
+                    cache_file_name: "0000000000000010.nxo".to_owned(),
+                }),
+            ],
+            recovered_truncated_tail: false,
+        };
+
+        let (blocks, layout) =
+            super::lower_function_with_profile(&function, &profile).expect("profiled lower");
+        let order = layout
+            .entries()
+            .iter()
+            .map(|entry| (entry.entry_pc, entry.section))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            order,
+            vec![
+                (0x0, super::CodeSection::Hot),
+                (0x10, super::CodeSection::Hot),
+                (0x8, super::CodeSection::Cold),
+            ]
+        );
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.entry_pc)
+                .collect::<Vec<_>>(),
+            vec![0x0, 0x10, 0x8]
+        );
+        assert!(blocks[0].lowered.dump().contains("mov rax, 0x10"));
     }
 
     #[test]
@@ -1185,6 +1456,16 @@ mod tests {
         assert_eq!(std::mem::offset_of!(NativeBlockState, fpcr), 848);
         assert_eq!(std::mem::offset_of!(NativeBlockState, fpsr), 856);
         assert_eq!(size_of::<NativeBlockState>(), 864);
+    }
+
+    #[test]
+    fn vector_lane_addressing_rejects_invalid_lane() {
+        let error = super::vector_lane_mem(0, 2).expect_err("lane 2 should be invalid");
+
+        assert!(matches!(
+            error,
+            super::LoweringError::UnsupportedOp { op: "vector lane" }
+        ));
     }
 
     #[test]
@@ -1376,6 +1657,62 @@ mod tests {
         }
     }
 
+    fn advanced_vector_function() -> Function {
+        Function {
+            name: "advanced_vector".to_owned(),
+            entry_address: 0,
+            value_count: 0,
+            deopt_points: Vec::new(),
+            blocks: vec![Block {
+                instructions: vec![
+                    Inst {
+                        result: None,
+                        op: Op::FpMoveImmediate {
+                            precision: nx86_ir::FpPrecision::F64,
+                            rd: 0,
+                            bits: 1.0f64.to_bits(),
+                        },
+                        guest_address: 0,
+                    },
+                    Inst {
+                        result: None,
+                        op: Op::FpMoveImmediate {
+                            precision: nx86_ir::FpPrecision::F64,
+                            rd: 1,
+                            bits: 1.0f64.to_bits(),
+                        },
+                        guest_address: 4,
+                    },
+                    Inst {
+                        result: None,
+                        op: Op::VectorCompare {
+                            op: nx86_ir::VectorCompareOp::EqI64,
+                            arrangement: nx86_ir::VectorArrangement::TwoD,
+                            rd: 2,
+                            rn: 0,
+                            rm: 1,
+                        },
+                        guest_address: 8,
+                    },
+                    Inst {
+                        result: None,
+                        op: Op::VectorShuffle {
+                            shuffle: nx86_ir::VectorShuffle::SwapD,
+                            arrangement: nx86_ir::VectorArrangement::TwoD,
+                            rd: 3,
+                            rn: 2,
+                        },
+                        guest_address: 12,
+                    },
+                ],
+                terminator: Terminator::Halt {
+                    reason: "svc #0x0".to_owned(),
+                },
+                terminator_address: 16,
+            }],
+        }
+    }
+
     fn tiny_add_function() -> Function {
         Function {
             name: "tiny_add".to_owned(),
@@ -1550,6 +1887,77 @@ mod tests {
                         reason: "svc #0x0".to_owned(),
                     },
                     terminator_address: 8,
+                },
+            ],
+        }
+    }
+
+    fn hot_cold_function() -> Function {
+        Function {
+            name: "hot_cold".to_owned(),
+            entry_address: 0,
+            value_count: 3,
+            deopt_points: Vec::new(),
+            blocks: vec![
+                Block {
+                    instructions: vec![Inst {
+                        result: Some(Value(0)),
+                        op: Op::Const {
+                            ty: Type::I64,
+                            value: 7,
+                        },
+                        guest_address: 0,
+                    }],
+                    terminator: Terminator::Branch { target: BlockId(2) },
+                    terminator_address: 4,
+                },
+                Block {
+                    instructions: vec![
+                        Inst {
+                            result: Some(Value(1)),
+                            op: Op::Const {
+                                ty: Type::I64,
+                                value: 1,
+                            },
+                            guest_address: 8,
+                        },
+                        Inst {
+                            result: None,
+                            op: Op::SetReg {
+                                reg: Reg::X(1),
+                                value: Value(1),
+                            },
+                            guest_address: 8,
+                        },
+                    ],
+                    terminator: Terminator::Halt {
+                        reason: "cold".to_owned(),
+                    },
+                    terminator_address: 8,
+                },
+                Block {
+                    instructions: vec![
+                        Inst {
+                            result: Some(Value(2)),
+                            op: Op::Const {
+                                ty: Type::I64,
+                                value: 2,
+                            },
+                            guest_address: 0x10,
+                        },
+                        Inst {
+                            result: None,
+                            op: Op::SetReg {
+                                reg: Reg::X(0),
+                                value: Value(2),
+                            },
+                            guest_address: 0x10,
+                        },
+                    ],
+                    terminator: Terminator::Halt {
+                        reason: "hot".to_owned(),
+                    },
+                    terminator_address: 0x10,
                 },
             ],
         }

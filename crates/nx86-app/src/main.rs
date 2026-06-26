@@ -143,6 +143,10 @@ fn run_worker(worker: WorkerMode) -> Result<(), Box<dyn std::error::Error>> {
             functions_discovered: (index as u64) * 8,
             functions_compiled: (index as u64) * 5,
             native_coverage_estimate: percent.min(100.0),
+            native_coverage_static: (percent * 0.9).min(100.0),
+            native_coverage_executed: percent.min(100.0),
+            fastmem_coverage: (100.0 - (index as f32 * 3.0)).max(0.0),
+            slowmem_penalty: (index as f32 * 3.0).min(100.0),
             cache_size_bytes: (index as u64) * 4096,
         }))?;
         thread::sleep(Duration::from_millis(120));

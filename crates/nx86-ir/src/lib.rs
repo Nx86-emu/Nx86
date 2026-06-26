@@ -109,6 +109,18 @@ pub enum VectorBinaryOp {
     AddF64,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VectorCompareOp {
+    EqI64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum VectorShuffle {
+    SwapD,
+}
+
 /// An NxIR operation. Operations either define a value (e.g. [`Op::Binary`]) or
 /// produce a side effect (e.g. [`Op::SetReg`]).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,6 +206,21 @@ pub enum Op {
         rn: u8,
         rm: u8,
     },
+    /// Vector compare that writes per-lane all-ones/all-zero mask values.
+    VectorCompare {
+        op: VectorCompareOp,
+        arrangement: VectorArrangement,
+        rd: u8,
+        rn: u8,
+        rm: u8,
+    },
+    /// Vector lane shuffle/permutation within one SIMD register.
+    VectorShuffle {
+        shuffle: VectorShuffle,
+        arrangement: VectorArrangement,
+        rd: u8,
+        rn: u8,
+    },
 }
 
 impl Op {
@@ -216,7 +243,9 @@ impl Op {
             | Self::FpMoveImmediate { .. }
             | Self::FpScalarBinary { .. }
             | Self::FpCompare { .. }
-            | Self::VectorBinary { .. } => None,
+            | Self::VectorBinary { .. }
+            | Self::VectorCompare { .. }
+            | Self::VectorShuffle { .. } => None,
         }
     }
 
@@ -237,6 +266,8 @@ impl Op {
                 | Self::FpScalarBinary { .. }
                 | Self::FpCompare { .. }
                 | Self::VectorBinary { .. }
+                | Self::VectorCompare { .. }
+                | Self::VectorShuffle { .. }
         )
     }
 
@@ -250,7 +281,9 @@ impl Op {
             | Self::FpMoveImmediate { .. }
             | Self::FpScalarBinary { .. }
             | Self::FpCompare { .. }
-            | Self::VectorBinary { .. } => Vec::new(),
+            | Self::VectorBinary { .. }
+            | Self::VectorCompare { .. }
+            | Self::VectorShuffle { .. } => Vec::new(),
             Self::SetReg { value, .. } => vec![(*value, Type::I64)],
             Self::Binary { ty, lhs, rhs, .. } => vec![(*lhs, *ty), (*rhs, *ty)],
             Self::Trunc { value } => vec![(*value, Type::I64)],
@@ -519,6 +552,22 @@ impl fmt::Display for VectorBinaryOp {
     }
 }
 
+impl fmt::Display for VectorCompareOp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EqI64 => formatter.write_str("cmp.eq.i64"),
+        }
+    }
+}
+
+impl fmt::Display for VectorShuffle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SwapD => formatter.write_str("shuffle.swap.d"),
+        }
+    }
+}
+
 #[must_use]
 pub const fn barrier_option_name(option: u8) -> Option<&'static str> {
     match option & 0x0F {
@@ -606,6 +655,23 @@ fn format_op(op: &Op) -> String {
         } => {
             format!("vec.{op}.{arrangement} v{rd}, v{rn}, v{rm}")
         }
+        Op::VectorCompare {
+            op,
+            arrangement,
+            rd,
+            rn,
+            rm,
+        } => {
+            format!("vec.{op}.{arrangement} v{rd}, v{rn}, v{rm}")
+        }
+        Op::VectorShuffle {
+            shuffle,
+            arrangement,
+            rd,
+            rn,
+        } => {
+            format!("vec.{shuffle}.{arrangement} v{rd}, v{rn}")
+        }
     }
 }
 
@@ -641,7 +707,8 @@ fn format_terminator(terminator: &Terminator) -> String {
 mod tests {
     use super::{
         BarrierKind, BinaryOp, Block, FpBinaryOp, FpPrecision, Function, Inst, Module, Op, Reg,
-        Terminator, Type, Value, VectorArrangement, VectorBinaryOp, barrier_option_name,
+        Terminator, Type, Value, VectorArrangement, VectorBinaryOp, VectorCompareOp, VectorShuffle,
+        barrier_option_name,
     };
 
     fn add_function() -> Function {
@@ -854,6 +921,19 @@ mod tests {
                 rn: 0,
                 rm: 1,
             },
+            Op::VectorCompare {
+                op: VectorCompareOp::EqI64,
+                arrangement: VectorArrangement::TwoD,
+                rd: 4,
+                rn: 0,
+                rm: 1,
+            },
+            Op::VectorShuffle {
+                shuffle: VectorShuffle::SwapD,
+                arrangement: VectorArrangement::TwoD,
+                rd: 5,
+                rn: 4,
+            },
         ];
 
         for op in ops {
@@ -873,6 +953,25 @@ mod tests {
                 rm: 1,
             }),
             "vec.add.i64.2d v2, v0, v1"
+        );
+        assert_eq!(
+            super::format_op(&Op::VectorCompare {
+                op: VectorCompareOp::EqI64,
+                arrangement: VectorArrangement::TwoD,
+                rd: 4,
+                rn: 0,
+                rm: 1,
+            }),
+            "vec.cmp.eq.i64.2d v4, v0, v1"
+        );
+        assert_eq!(
+            super::format_op(&Op::VectorShuffle {
+                shuffle: VectorShuffle::SwapD,
+                arrangement: VectorArrangement::TwoD,
+                rd: 5,
+                rn: 4,
+            }),
+            "vec.shuffle.swap.d.2d v5, v4"
         );
     }
 

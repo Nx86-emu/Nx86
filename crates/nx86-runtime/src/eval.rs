@@ -8,7 +8,7 @@
 use nx86_core::guest::{CpuState, Nzcv};
 use nx86_ir::{
     BinaryOp, DeoptId, FlagOp, FpBinaryOp, Function, Inst, Op, Reg, Terminator, Type, Value,
-    VectorBinaryOp,
+    VectorBinaryOp, VectorCompareOp, VectorShuffle,
 };
 use nx86_vmm::{GuestAddress, GuestMemory, VmmFault};
 use thiserror::Error;
@@ -285,6 +285,35 @@ fn execute_op(
                         let rhs = f64::from_bits(cpu.vector_lane64(*rm, lane));
                         cpu.set_vector_lane64(*rd, lane, (lhs + rhs).to_bits());
                     }
+                }
+            }
+            None
+        }
+        Op::VectorCompare { op, rd, rn, rm, .. } => {
+            match op {
+                VectorCompareOp::EqI64 => {
+                    for lane in 0..2 {
+                        let value = if cpu.vector_lane64(*rn, lane) == cpu.vector_lane64(*rm, lane)
+                        {
+                            u64::MAX
+                        } else {
+                            0
+                        };
+                        cpu.set_vector_lane64(*rd, lane, value);
+                    }
+                }
+            }
+            None
+        }
+        Op::VectorShuffle {
+            shuffle, rd, rn, ..
+        } => {
+            match shuffle {
+                VectorShuffle::SwapD => {
+                    let low = cpu.vector_lane64(*rn, 0);
+                    let high = cpu.vector_lane64(*rn, 1);
+                    cpu.set_vector_lane64(*rd, 0, high);
+                    cpu.set_vector_lane64(*rd, 1, low);
                 }
             }
             None
@@ -843,5 +872,74 @@ mod tests {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&bytes);
         assert_eq!(u64::from_le_bytes(buf), 0xBEEF);
+    }
+
+    #[test]
+    fn advanced_vector_compare_and_shuffle_update_simd_state() {
+        use nx86_ir::{
+            Block, FpPrecision, Terminator, VectorArrangement, VectorCompareOp, VectorShuffle,
+        };
+
+        let function = Function {
+            name: "advanced_vector".to_owned(),
+            entry_address: 0,
+            value_count: 0,
+            deopt_points: Vec::new(),
+            blocks: vec![Block {
+                instructions: vec![
+                    Inst {
+                        result: None,
+                        op: Op::FpMoveImmediate {
+                            precision: FpPrecision::F64,
+                            rd: 0,
+                            bits: 1,
+                        },
+                        guest_address: 0,
+                    },
+                    Inst {
+                        result: None,
+                        op: Op::FpMoveImmediate {
+                            precision: FpPrecision::F64,
+                            rd: 1,
+                            bits: 1,
+                        },
+                        guest_address: 4,
+                    },
+                    Inst {
+                        result: None,
+                        op: Op::VectorCompare {
+                            op: VectorCompareOp::EqI64,
+                            arrangement: VectorArrangement::TwoD,
+                            rd: 2,
+                            rn: 0,
+                            rm: 1,
+                        },
+                        guest_address: 8,
+                    },
+                    Inst {
+                        result: None,
+                        op: Op::VectorShuffle {
+                            shuffle: VectorShuffle::SwapD,
+                            arrangement: VectorArrangement::TwoD,
+                            rd: 3,
+                            rn: 2,
+                        },
+                        guest_address: 12,
+                    },
+                ],
+                terminator: Terminator::Halt {
+                    reason: "svc #0x0".to_owned(),
+                },
+                terminator_address: 16,
+            }],
+        };
+        let mut memory = GuestMemory::new_logical();
+
+        let outcome = evaluate(&function, &mut memory).expect("eval should succeed");
+
+        assert_eq!(outcome.state().vector_lane64(2, 0), u64::MAX);
+        assert_eq!(outcome.state().vector_lane64(2, 1), u64::MAX);
+        assert_eq!(outcome.state().vector_lane64(3, 0), u64::MAX);
+        assert_eq!(outcome.state().vector_lane64(3, 1), u64::MAX);
     }
 }

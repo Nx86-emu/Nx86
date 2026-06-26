@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fmt, marker::PhantomData, ptr::NonNull};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    marker::PhantomData,
+    ptr::NonNull,
+};
 
 use nx86_cache::CacheManager;
 use nx86_core::guest::CpuState;
@@ -510,6 +515,7 @@ impl NativeOutcome {
             | LoweringError::StackTooLarge { .. }
             | LoweringError::AddressOverflow { .. }
             | LoweringError::UnknownBranchTarget { .. }
+            | LoweringError::UnknownLayoutEntry { .. }
             | LoweringError::Assembler(_) => NativeStatus::Error,
         };
         Self {
@@ -556,14 +562,61 @@ pub struct CoverageSnapshot {
     pub promoted_blocks: usize,
     /// Total native objects in the cache after rebuild.
     pub total_native_blocks: usize,
+    /// Static source blocks in the current function.
+    pub source_blocks: usize,
+    /// Source blocks that have a native object in the cache.
+    pub static_native_blocks: usize,
+    /// Source blocks observed in the runtime profile.
+    pub executed_blocks: usize,
+    /// Observed source blocks that have a native object in the cache.
+    pub executed_native_blocks: usize,
     /// Profile blocks whose source PC has no matching block (unpromotable).
     pub unpromotable_unknown_pc: usize,
     /// Profile blocks that failed compilation (potentially transient).
     pub failed_compilation: usize,
+    /// Native functional coverage over profile JIT candidates, in basis points.
+    pub functional_coverage_bps: u16,
+    /// Static native coverage over all known source blocks, in basis points.
+    pub static_coverage_bps: u16,
+    /// Executed native coverage over observed runtime blocks, in basis points.
+    pub executed_coverage_bps: u16,
     /// Slowmem calls observed in the profile (SPEC 16.3).
     pub slowmem_calls: u64,
+    /// Fastmem calls observed in the profile.
+    pub fastmem_calls: u64,
     /// Total memory accesses (fast + slow) if known; 0 = not tracked.
     pub total_accesses: u64,
+    /// Fastmem coverage over profiled memory accesses, in basis points.
+    pub fastmem_coverage_bps: u16,
+    /// Slowmem penalty over profiled memory accesses, in basis points.
+    pub slowmem_penalty_bps: u16,
+}
+
+impl CoverageSnapshot {
+    #[must_use]
+    pub const fn native_coverage_estimate_percent(self) -> f32 {
+        self.functional_coverage_bps as f32 / 100.0
+    }
+
+    #[must_use]
+    pub const fn static_coverage_percent(self) -> f32 {
+        self.static_coverage_bps as f32 / 100.0
+    }
+
+    #[must_use]
+    pub const fn executed_coverage_percent(self) -> f32 {
+        self.executed_coverage_bps as f32 / 100.0
+    }
+
+    #[must_use]
+    pub const fn fastmem_coverage_percent(self) -> f32 {
+        self.fastmem_coverage_bps as f32 / 100.0
+    }
+
+    #[must_use]
+    pub const fn slowmem_penalty_percent(self) -> f32 {
+        self.slowmem_penalty_bps as f32 / 100.0
+    }
 }
 
 /// A failure during profile-guided rebuild.
@@ -604,13 +657,38 @@ pub fn rebuild_from_profile(
         }
     }
 
-    let total_native_blocks = cache.scan().map_err(RebuildError::Cache)?.object_count();
+    let manifest = cache.scan().map_err(RebuildError::Cache)?;
+    let total_native_blocks = manifest.object_count();
+    let native_pcs = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.entry_address)
+        .collect::<BTreeSet<_>>();
+    let source_pcs = jit.source_entry_pcs();
+    let source_pc_set = source_pcs.iter().copied().collect::<BTreeSet<_>>();
+    let source_blocks = jit.source_block_count();
+    let static_native_blocks = source_pcs
+        .iter()
+        .filter(|pc| native_pcs.contains(pc))
+        .count();
+    let executed_pcs = executed_profile_pcs(profile, &source_pc_set);
+    let executed_blocks = executed_pcs.len();
+    let executed_native_blocks = executed_pcs
+        .iter()
+        .filter(|pc| native_pcs.contains(pc))
+        .count();
 
     let slowmem_calls = profile
         .records
         .iter()
         .filter(|r| matches!(r.event, ProfileEvent::Slowmem { .. }))
         .count() as u64;
+    let fastmem_calls = profile
+        .records
+        .iter()
+        .filter(|r| matches!(r.event, ProfileEvent::Fastmem { .. }))
+        .count() as u64;
+    let total_accesses = slowmem_calls + fastmem_calls;
 
     Ok(RebuildOutcome {
         total_jit_blocks,
@@ -621,14 +699,65 @@ pub fn rebuild_from_profile(
         coverage: CoverageSnapshot {
             promoted_blocks: promoted,
             total_native_blocks,
+            source_blocks,
+            static_native_blocks,
+            executed_blocks,
+            executed_native_blocks,
             unpromotable_unknown_pc: skipped_unknown_pc,
             failed_compilation: errors,
+            functional_coverage_bps: coverage_bps(promoted, total_jit_blocks),
+            static_coverage_bps: coverage_bps(static_native_blocks, source_blocks),
+            executed_coverage_bps: coverage_bps(executed_native_blocks, executed_blocks),
             slowmem_calls,
-            // Fastmem access counting requires per-block instrumentation (future
-            // phase); only slowmem is observable from profile events today.
-            total_accesses: 0,
+            fastmem_calls,
+            total_accesses,
+            fastmem_coverage_bps: coverage_bps_u64(fastmem_calls, total_accesses),
+            slowmem_penalty_bps: coverage_bps_u64(slowmem_calls, total_accesses),
         },
     })
+}
+
+fn executed_profile_pcs(profile: &ProfileLog, source_pcs: &BTreeSet<u64>) -> BTreeSet<u64> {
+    let mut executed = BTreeSet::new();
+    for record in &profile.records {
+        match &record.event {
+            ProfileEvent::JitBlock { guest_pc, .. }
+            | ProfileEvent::HelperCall { guest_pc, .. }
+            | ProfileEvent::Slowmem { guest_pc, .. }
+            | ProfileEvent::Fastmem { guest_pc, .. }
+            | ProfileEvent::SmcInvalidate { guest_pc, .. } => {
+                if source_pcs.contains(guest_pc) {
+                    executed.insert(*guest_pc);
+                }
+            }
+            ProfileEvent::BranchTarget {
+                source_pc,
+                target_pc,
+            } => {
+                if source_pcs.contains(source_pc) {
+                    executed.insert(*source_pc);
+                }
+                if source_pcs.contains(target_pc) {
+                    executed.insert(*target_pc);
+                }
+            }
+        }
+    }
+    executed
+}
+
+fn coverage_bps(numerator: usize, denominator: usize) -> u16 {
+    if denominator == 0 {
+        return 0;
+    }
+    (((numerator as u128) * 10_000) / (denominator as u128)).min(10_000) as u16
+}
+
+fn coverage_bps_u64(numerator: u64, denominator: u64) -> u16 {
+    if denominator == 0 {
+        return 0;
+    }
+    (((numerator as u128) * 10_000) / (denominator as u128)).min(10_000) as u16
 }
 
 pub fn run_tiny_native_block(
@@ -1448,10 +1577,20 @@ mod tests {
                 coverage: CoverageSnapshot {
                     promoted_blocks: 1,
                     total_native_blocks: 1,
+                    source_blocks: 2,
+                    static_native_blocks: 1,
+                    executed_blocks: 1,
+                    executed_native_blocks: 1,
                     unpromotable_unknown_pc: 0,
                     failed_compilation: 0,
+                    functional_coverage_bps: 10_000,
+                    static_coverage_bps: 5_000,
+                    executed_coverage_bps: 10_000,
                     slowmem_calls: 0,
+                    fastmem_calls: 0,
                     total_accesses: 0,
+                    fastmem_coverage_bps: 0,
+                    slowmem_penalty_bps: 0,
                 },
             }
         );
@@ -1459,6 +1598,50 @@ mod tests {
             cache.load(0x8).expect("load promoted object").entry_address,
             0x8
         );
+    }
+
+    #[test]
+    fn rebuild_from_profile_reports_native_coverage_metrics() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache = nx86_cache::CacheManager::open(dir.path()).expect("open cache");
+        let function = two_block_branch_function();
+        let jit = nx86_jit::EmergencyJit::new(function, cache.clone()).expect("create JIT");
+
+        let profile = nx86_profile::ProfileLog {
+            records: vec![
+                nx86_profile::ProfileRecord::new(nx86_profile::ProfileEvent::JitBlock {
+                    guest_pc: 0x8,
+                    code_size_bytes: 42,
+                    cache_file_name: "0000000000000008.nxo".to_owned(),
+                }),
+                nx86_profile::ProfileRecord::new(nx86_profile::ProfileEvent::Fastmem {
+                    guest_pc: 0x8,
+                    address: 0x1000,
+                    size_bytes: 8,
+                    access: nx86_profile::MemoryAccessKind::Read,
+                }),
+                nx86_profile::ProfileRecord::new(nx86_profile::ProfileEvent::Slowmem {
+                    guest_pc: 0x8,
+                    address: 0x2000,
+                    size_bytes: 8,
+                    access: nx86_profile::MemoryAccessKind::Write,
+                    reason_code: "unmapped".to_owned(),
+                }),
+            ],
+            recovered_truncated_tail: false,
+        };
+
+        let outcome = rebuild_from_profile(&profile, &jit, &cache).expect("rebuild");
+
+        assert_eq!(outcome.coverage.functional_coverage_bps, 10_000);
+        assert_eq!(outcome.coverage.static_coverage_bps, 5_000);
+        assert_eq!(outcome.coverage.executed_coverage_bps, 10_000);
+        assert_eq!(outcome.coverage.fastmem_calls, 1);
+        assert_eq!(outcome.coverage.slowmem_calls, 1);
+        assert_eq!(outcome.coverage.total_accesses, 2);
+        assert_eq!(outcome.coverage.fastmem_coverage_bps, 5_000);
+        assert_eq!(outcome.coverage.slowmem_penalty_bps, 5_000);
+        assert_eq!(outcome.coverage.native_coverage_estimate_percent(), 100.0);
     }
 
     #[test]

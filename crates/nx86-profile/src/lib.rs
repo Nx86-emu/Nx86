@@ -68,6 +68,12 @@ pub enum ProfileEvent {
         access: MemoryAccessKind,
         reason_code: String,
     },
+    Fastmem {
+        guest_pc: u64,
+        address: u64,
+        size_bytes: u32,
+        access: MemoryAccessKind,
+    },
     SmcInvalidate {
         guest_pc: u64,
         write_address: u64,
@@ -175,6 +181,7 @@ impl ProfileWriter {
                 ProfileEvent::JitBlock { .. }
                 | ProfileEvent::HelperCall { .. }
                 | ProfileEvent::Slowmem { .. }
+                | ProfileEvent::Fastmem { .. }
                 | ProfileEvent::SmcInvalidate { .. } => None,
             })
             .collect();
@@ -204,6 +211,7 @@ impl ProfileSink for ProfileWriter {
             ProfileEvent::JitBlock { .. }
             | ProfileEvent::HelperCall { .. }
             | ProfileEvent::Slowmem { .. }
+            | ProfileEvent::Fastmem { .. }
             | ProfileEvent::SmcInvalidate { .. } => None,
         };
         if branch_target.is_some_and(|target| self.branch_targets.contains(&target)) {
@@ -270,6 +278,7 @@ impl ProfileLog {
                 ProfileEvent::BranchTarget { .. }
                 | ProfileEvent::HelperCall { .. }
                 | ProfileEvent::Slowmem { .. }
+                | ProfileEvent::Fastmem { .. }
                 | ProfileEvent::SmcInvalidate { .. } => None,
             })
             .collect()
@@ -449,6 +458,14 @@ fn validate_record_shape(
             "access",
             "reason_code",
         ],
+        ProfileEvent::Fastmem { .. } => &[
+            "format_version",
+            "kind",
+            "guest_pc",
+            "address",
+            "size_bytes",
+            "access",
+        ],
         ProfileEvent::SmcInvalidate { .. } => &[
             "format_version",
             "kind",
@@ -493,10 +510,16 @@ fn validate_event(event: &ProfileEvent) -> Result<(), ProfileError> {
                 field: "size_bytes",
             })
         }
+        ProfileEvent::Fastmem { size_bytes, .. } if !matches!(*size_bytes, 1 | 2 | 4 | 8 | 16) => {
+            Err(ProfileError::InvalidField {
+                field: "size_bytes",
+            })
+        }
         ProfileEvent::JitBlock { .. }
         | ProfileEvent::BranchTarget { .. }
         | ProfileEvent::HelperCall { .. }
         | ProfileEvent::Slowmem { .. }
+        | ProfileEvent::Fastmem { .. }
         | ProfileEvent::SmcInvalidate { .. } => Ok(()),
     }
 }
@@ -647,6 +670,12 @@ mod tests {
                 size_bytes: 8,
                 access: MemoryAccessKind::Read,
                 reason_code: "page-not-fastmem".to_owned(),
+            },
+            ProfileEvent::Fastmem {
+                guest_pc: 0x2004,
+                address: 0x9000,
+                size_bytes: 16,
+                access: MemoryAccessKind::Write,
             },
             ProfileEvent::SmcInvalidate {
                 guest_pc: 0x2004,
@@ -921,6 +950,17 @@ mod tests {
                 size_bytes: 3,
                 access: MemoryAccessKind::Read,
                 reason_code: "page-not-fastmem".to_owned(),
+            }),
+            Err(ProfileError::InvalidField {
+                field: "size_bytes"
+            })
+        ));
+        assert!(matches!(
+            writer.record(ProfileEvent::Fastmem {
+                guest_pc: 1,
+                address: 2,
+                size_bytes: 3,
+                access: MemoryAccessKind::Read,
             }),
             Err(ProfileError::InvalidField {
                 field: "size_bytes"

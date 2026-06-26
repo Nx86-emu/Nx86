@@ -88,6 +88,16 @@ impl EmergencyJit {
             halt_reason,
         }))
     }
+
+    #[must_use]
+    pub fn source_block_count(&self) -> usize {
+        self.function.blocks.len()
+    }
+
+    #[must_use]
+    pub fn source_entry_pcs(&self) -> Vec<u64> {
+        self.function.blocks.iter().map(block_entry_pc).collect()
+    }
 }
 
 /// A failure preparing or compiling an emergency-JIT block.

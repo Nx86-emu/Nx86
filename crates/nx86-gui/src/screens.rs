@@ -384,6 +384,10 @@ pub fn compile(ui: &mut egui::Ui, state: &mut CompileUiState) -> CompileAction {
         functions_discovered: 0,
         functions_compiled: 0,
         native_coverage_estimate: 0.0,
+        native_coverage_static: 0.0,
+        native_coverage_executed: 0.0,
+        fastmem_coverage: 0.0,
+        slowmem_penalty: 0.0,
         cache_size_bytes: 0,
     });
 
@@ -407,6 +411,29 @@ pub fn compile(ui: &mut egui::Ui, state: &mut CompileUiState) -> CompileAction {
             &mut columns[2],
             "Native Coverage",
             &format!("{:.2}%", progress.native_coverage_estimate),
+        );
+    });
+
+    ui.columns(4, |columns| {
+        metric(
+            &mut columns[0],
+            "Static Native",
+            &format!("{:.2}%", progress.native_coverage_static),
+        );
+        metric(
+            &mut columns[1],
+            "Executed Native",
+            &format!("{:.2}%", progress.native_coverage_executed),
+        );
+        metric(
+            &mut columns[2],
+            "Fastmem",
+            &format!("{:.2}%", progress.fastmem_coverage),
+        );
+        metric(
+            &mut columns[3],
+            "Slowmem Penalty",
+            &format!("{:.2}%", progress.slowmem_penalty),
         );
     });
 
