@@ -168,6 +168,13 @@ impl Scheduler {
         thread_id
     }
 
+    pub fn reset(&mut self) {
+        let cap = self.replay.cap;
+        self.threads.clear();
+        self.replay = ReplayLog::new(cap);
+        self.next_thread_id = 1;
+    }
+
     pub fn run_synthetic(
         &mut self,
         program: &SyntheticThreadProgram,
@@ -179,6 +186,7 @@ impl Scheduler {
             return Err(SchedulerError::ZeroQuantum);
         }
 
+        self.reset();
         for thread in &program.threads {
             self.spawn(&thread.name, thread.entry_pc, thread.work_units);
         }
@@ -193,8 +201,7 @@ impl Scheduler {
                 if self.threads[index].status == GuestThreadStatus::Halted {
                     continue;
                 }
-                self.run_thread_quantum(index, program.quantum);
-                dispatch_count += 1;
+                dispatch_count += self.run_thread_quantum(index, program.quantum);
             }
         }
 
@@ -265,17 +272,19 @@ impl Scheduler {
             .collect()
     }
 
-    fn run_thread_quantum(&mut self, index: usize, quantum: u64) {
+    fn run_thread_quantum(&mut self, index: usize, quantum: u64) -> u64 {
         let thread_id = self.threads[index].thread_id();
+        let mut dispatches = 0;
         for _ in 0..quantum {
             if self.threads[index].remaining_work == 0 {
                 self.halt_thread(index);
-                return;
+                return dispatches;
             }
 
             self.threads[index].status = GuestThreadStatus::Running;
             let pc = self.threads[index].cpu.pc();
             self.record(thread_id, pc, ReplayEventKind::Dispatch);
+            dispatches += 1;
             self.threads[index].cpu_ticks += 1;
             self.threads[index].remaining_work -= 1;
             self.threads[index].cpu.set_pc(pc + 4);
@@ -291,6 +300,7 @@ impl Scheduler {
                 ReplayEventKind::Yield,
             );
         }
+        dispatches
     }
 
     fn halt_thread(&mut self, index: usize) {
@@ -529,6 +539,60 @@ mod tests {
         assert!(scheduler.replay().events().iter().any(|event| {
             matches!(event.kind, ReplayEventKind::Dispatch) && event.thread_id == 2
         }));
+    }
+
+    #[test]
+    fn repeated_synthetic_runs_reset_previous_threads_and_replay() {
+        let program = SyntheticThreadProgram::two_thread_counter();
+        let mut scheduler = Scheduler::new(SchedulerMode::HostThreads);
+
+        let first = scheduler
+            .run_synthetic(&program)
+            .expect("first run should complete");
+        let second = scheduler
+            .run_synthetic(&program)
+            .expect("second run should complete");
+
+        assert_eq!(first.thread_count, 2);
+        assert_eq!(second.thread_count, 2);
+        assert_eq!(scheduler.threads().len(), 2);
+        assert_eq!(scheduler.threads()[0].thread_id(), 1);
+        assert_eq!(scheduler.replay().events()[0].sequence, 0);
+    }
+
+    #[test]
+    fn dispatch_report_counts_recorded_dispatch_events() {
+        let program = SyntheticThreadProgram {
+            quantum: 2,
+            threads: vec![
+                super::SyntheticThread {
+                    name: "empty".to_owned(),
+                    entry_pc: 0x1000,
+                    work_units: 0,
+                },
+                super::SyntheticThread {
+                    name: "worker".to_owned(),
+                    entry_pc: 0x2000,
+                    work_units: 3,
+                },
+            ],
+        };
+        let mut scheduler = Scheduler::new(SchedulerMode::HostThreads);
+
+        let report = scheduler
+            .run_synthetic(&program)
+            .expect("program should run");
+        let recorded_dispatches = scheduler
+            .replay()
+            .events()
+            .iter()
+            .filter(|event| matches!(event.kind, ReplayEventKind::Dispatch))
+            .count() as u64;
+
+        assert_eq!(report.dispatch_count, 3);
+        assert_eq!(report.dispatch_count, recorded_dispatches);
+        assert_eq!(report.rows[0].cpu_ticks, 0);
+        assert_eq!(report.rows[0].status, GuestThreadStatus::Halted);
     }
 
     #[test]
