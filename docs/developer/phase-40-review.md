@@ -30,6 +30,11 @@ Current AArch64 fixture coverage uses scalar `fmov` to seed low lanes, so unit
 tests also cover state layout and native lane lowering. Broader NEON immediate
 or load coverage will let future fixtures exercise high-lane nonzero data.
 
+### FINDING-3: invalid native vector lanes are rejected (fixed)
+
+Audit found that native vector state addressing treated any non-zero lane as
+lane 1. The helper now rejects lanes outside `0..2` instead of aliasing them.
+
 ## Test coverage
 
 | Test | What |
@@ -39,6 +44,7 @@ or load coverage will let future fixtures exercise high-lane nonzero data.
 | `neon_synthetic_test_passes` | interpreter/NxIR exactness and native availability/status gating |
 | `emits_scalar_double_sse_memory_ops` | assembler SSE emission |
 | `native_memory_abi_offsets_are_stable` | expanded native state ABI offsets |
+| `vector_lane_addressing_rejects_invalid_lane` | native vector state addressing rejects invalid lane indexes |
 | `lowers_scalar_fp_and_vector_ops` | x86_64-v4 lowerer accepts vector ops |
 
 ## Verification
