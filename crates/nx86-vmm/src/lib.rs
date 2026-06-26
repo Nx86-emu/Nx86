@@ -177,6 +177,28 @@ impl GuestMemory {
         self.pages.get(&address.page_base()).map(|p| p.permissions)
     }
 
+    pub fn set_page_permissions(
+        &mut self,
+        address: GuestAddress,
+        permissions: PagePermissions,
+    ) -> Result<(), VmmFault> {
+        let page_base = address.page_base();
+        self.check_range(GuestAddress(page_base), PAGE_SIZE as usize)?;
+        let page = self.pages.get_mut(&page_base).ok_or(VmmFault::Unmapped {
+            address: GuestAddress(page_base),
+        })?;
+        let previous = page.permissions;
+        self.arena.protect_page(page_base, permissions)?;
+        page.permissions = permissions;
+        self.set_fastmem_permissions(page_base, permissions);
+        if previous.execute && !permissions.execute {
+            smc_signal::unregister_executable_page(page_base);
+        } else if !previous.execute && permissions.execute {
+            smc_signal::register_executable_page(page_base);
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn page_generation(&self, address: GuestAddress) -> Option<u64> {
         self.page_generations.get(&address.page_base()).copied()
@@ -652,6 +674,18 @@ mod arena {
             Ok(())
         }
 
+        pub fn protect_page(
+            &self,
+            page_base: u64,
+            permissions: PagePermissions,
+        ) -> Result<(), VmmFault> {
+            if self.base == 0 {
+                return Ok(());
+            }
+            let address = self.address(page_base)?;
+            self.protect(address, host_protection(permissions))
+        }
+
         pub fn copy_in(&self, guest_address: u64, bytes: &[u8]) -> Result<(), VmmFault> {
             let address = self.address(guest_address)?;
             // SAFETY: GuestMemory validated the complete writable mapped range.
@@ -760,6 +794,14 @@ mod arena {
         }
 
         pub const fn unmap_page(&self, _page_base: u64) -> Result<(), VmmFault> {
+            Ok(())
+        }
+
+        pub const fn protect_page(
+            &self,
+            _page_base: u64,
+            _permissions: PagePermissions,
+        ) -> Result<(), VmmFault> {
             Ok(())
         }
 
@@ -989,6 +1031,33 @@ mod tests {
     fn page_permissions_returns_none_for_unmapped() {
         let memory = GuestMemory::new_logical();
         assert_eq!(memory.page_permissions(GuestAddress(0)), None);
+    }
+
+    #[test]
+    fn page_permissions_can_be_changed_after_loading() {
+        let mut memory = GuestMemory::new_logical();
+        memory
+            .map_page(GuestAddress(0x1000), PagePermissions::READ_WRITE)
+            .expect("page should map writable for loading");
+        memory
+            .write(GuestAddress(0x1000), &[1, 2, 3, 4])
+            .expect("loader write should succeed");
+
+        memory
+            .set_page_permissions(GuestAddress(0x1000), PagePermissions::READ_EXECUTE)
+            .expect("permissions should update");
+
+        assert_eq!(
+            memory.page_permissions(GuestAddress(0x1000)),
+            Some(PagePermissions::READ_EXECUTE)
+        );
+        assert_eq!(
+            memory
+                .read(GuestAddress(0x1000), 4)
+                .expect("read should still succeed"),
+            vec![1, 2, 3, 4]
+        );
+        assert!(memory.write(GuestAddress(0x1000), &[5]).is_err());
     }
 
     #[test]

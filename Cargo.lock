@@ -1559,6 +1559,13 @@ version = "0.0.0"
 [[package]]
 name = "nx86-import"
 version = "0.0.0"
+dependencies = [
+ "nx86-vmm",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
 
 [[package]]
 name = "nx86-input"
@@ -1641,6 +1648,8 @@ dependencies = [
  "nx86-arm64-lift",
  "nx86-backend",
  "nx86-core",
+ "nx86-hle",
+ "nx86-import",
  "nx86-ir",
  "nx86-ir-opt",
  "nx86-testsuite",

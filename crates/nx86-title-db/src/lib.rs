@@ -86,6 +86,39 @@ impl TitleDatabase {
         Ok(entry)
     }
 
+    /// Create a title backed by a simple local homebrew module descriptor.
+    ///
+    /// The caller-supplied TOML is persisted verbatim under the title's
+    /// `content/` directory. Validation and loading live in `nx86-import`; the
+    /// title database only records this as user-provided homebrew content.
+    pub fn create_homebrew_title(
+        &self,
+        title_id: TitleId,
+        display_name: impl Into<String>,
+        module_toml: &str,
+    ) -> Result<TitleEntry, TitleDbError> {
+        let now = unix_now();
+        let title_root = self.layout.ensure_title_dirs(title_id.as_str())?;
+        let content_path = title_root.join(HOMEBREW_CONTENT_FILE);
+        let entry = TitleEntry {
+            title_id,
+            display_name: display_name.into(),
+            source_kind: TitleSourceKind::Homebrew,
+            content_path: Some(content_path.clone()),
+            folder_path: title_root,
+            created_at_unix_secs: now,
+            updated_at_unix_secs: now,
+        };
+
+        self.insert_title(&entry)?;
+        fs::write(&content_path, module_toml).map_err(|source| TitleDbError::WriteContent {
+            path: content_path,
+            source,
+        })?;
+        write_sidecars(&entry)?;
+        Ok(entry)
+    }
+
     /// Read a title's stored content (e.g. the synthetic program TOML), if any.
     pub fn read_content(&self, entry: &TitleEntry) -> Result<Option<String>, TitleDbError> {
         let Some(content_path) = entry.content_path.as_ref() else {
@@ -272,6 +305,7 @@ impl From<TitleId> for String {
 pub enum TitleSourceKind {
     Placeholder,
     Synthetic,
+    Homebrew,
 }
 
 impl TitleSourceKind {
@@ -280,6 +314,7 @@ impl TitleSourceKind {
         match self {
             Self::Placeholder => "placeholder",
             Self::Synthetic => "synthetic",
+            Self::Homebrew => "homebrew",
         }
     }
 }
@@ -291,6 +326,7 @@ impl TryFrom<&str> for TitleSourceKind {
         match value {
             "placeholder" => Ok(Self::Placeholder),
             "synthetic" => Ok(Self::Synthetic),
+            "homebrew" => Ok(Self::Homebrew),
             _ => Err(TitleDbError::InvalidSourceKind {
                 value: value.to_owned(),
             }),
@@ -391,6 +427,8 @@ fn read_toml<T: for<'de> Deserialize<'de>>(path: impl AsRef<Path>) -> Result<T, 
 
 /// Title-relative path where synthetic program content is persisted.
 const SYNTHETIC_CONTENT_FILE: &str = "content/program.nxsynth.toml";
+/// Title-relative path where simple homebrew module descriptors are persisted.
+const HOMEBREW_CONTENT_FILE: &str = "content/homebrew.nxhb.toml";
 
 fn unix_now() -> i64 {
     SystemTime::now()
@@ -561,6 +599,45 @@ mod tests {
             .read_sidecars(&title_id)
             .expect("sidecars should read");
         assert_eq!(sidecars.settings.storage_mode, "synthetic");
+    }
+
+    #[test]
+    fn homebrew_title_persists_and_reads_back_content() {
+        let root = tempdir().expect("temp dir should be created");
+        let storage =
+            StorageConfig::from_roots(root.path().join("data"), root.path().join("cache"));
+        let layout = StorageLayout::from_config(root.path().join("config"), &storage);
+        let title_id = TitleId::parse("0100ABCD12345678").expect("title id should parse");
+        let module = "[metadata]\nname = \"Exit\"\n[program]\narm64-hex = \"01 00 00 D4\"\n";
+
+        let database = TitleDatabase::open(layout.clone()).expect("database should open");
+        let entry = database
+            .create_homebrew_title(title_id.clone(), "Homebrew Title", module)
+            .expect("homebrew title should be created");
+
+        assert_eq!(entry.source_kind, TitleSourceKind::Homebrew);
+        let content_path = entry
+            .content_path
+            .as_ref()
+            .expect("homebrew title carries content");
+        assert!(content_path.ends_with("content/homebrew.nxhb.toml"));
+        assert!(content_path.is_file());
+        assert_eq!(
+            database
+                .read_content(&entry)
+                .expect("content should read")
+                .expect("homebrew title has content"),
+            module
+        );
+
+        let reopened = TitleDatabase::open(layout).expect("database should reopen");
+        let listed = reopened.list_titles().expect("titles should list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source_kind, TitleSourceKind::Homebrew);
+        let sidecars = reopened
+            .read_sidecars(&title_id)
+            .expect("sidecars should read");
+        assert_eq!(sidecars.settings.storage_mode, "homebrew");
     }
 
     #[test]

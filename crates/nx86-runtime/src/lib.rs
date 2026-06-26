@@ -5,6 +5,8 @@ use nx86_arm64_decode::{
 use nx86_arm64_lift::lift_program;
 use nx86_backend::{run_dispatched_function_in, run_tiny_native_block_in};
 use nx86_core::guest::{CpuState, CpuStateDiff, Nzcv};
+use nx86_hle::{MinimalServiceTable, SvcOutcome};
+use nx86_import::{HomebrewImportError, HomebrewModule};
 use nx86_testsuite::{Framebuffer, MemoryDiff, SyntheticArm64Test, SyntheticTestError};
 use nx86_vmm::{GuestAddress, GuestMemory, PAGE_SIZE, PagePermissions, VmmFault};
 use thiserror::Error;
@@ -376,6 +378,68 @@ pub struct TraceStep {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HomebrewBootResult {
+    pub module_name: String,
+    pub interpreter: InterpreterResult,
+    pub service_outcome: Option<SvcOutcome>,
+}
+
+impl HomebrewBootResult {
+    #[must_use]
+    pub const fn exit_code(&self) -> Option<u64> {
+        match self.service_outcome {
+            Some(SvcOutcome::Exit { code }) => Some(code),
+            _ => None,
+        }
+    }
+}
+
+pub fn boot_homebrew(module: &HomebrewModule) -> Result<HomebrewBootResult, HomebrewBootError> {
+    let instructions = decode_program(module.program_bytes(), module.program_load_address())?;
+    let mut memory = GuestMemory::new_logical();
+    module.map_into(&mut memory)?;
+
+    let mut initial_state = CpuState::new();
+    initial_state.set_pc(module.entry_point());
+    initial_state.set_sp(module.stack_top());
+
+    let interpreter =
+        TinyInterpreter::new(instructions.clone()).run_in(initial_state, &mut memory)?;
+    let service_outcome = svc_immediate_for_halt(&interpreter.final_state, &instructions)
+        .map(|imm| MinimalServiceTable::new().handle_svc(imm, interpreter.final_state.x(0)));
+
+    Ok(HomebrewBootResult {
+        module_name: module.metadata().name.clone(),
+        interpreter,
+        service_outcome,
+    })
+}
+
+fn svc_immediate_for_halt(state: &CpuState, instructions: &[DecodedInstruction]) -> Option<u16> {
+    if !state.halted() {
+        return None;
+    }
+    let svc_pc = state.pc().checked_sub(4)?;
+    instructions
+        .iter()
+        .find(|instruction| instruction.address == svc_pc)
+        .and_then(|instruction| match instruction.kind {
+            InstructionKind::Svc { imm } => Some(imm),
+            _ => None,
+        })
+}
+
+#[derive(Debug, Error)]
+pub enum HomebrewBootError {
+    #[error("decode error: {0}")]
+    Decode(#[from] DecodeError),
+    #[error("homebrew import error: {0}")]
+    Import(#[from] HomebrewImportError),
+    #[error("interpreter error: {0}")]
+    Interpreter(#[from] InterpreterError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyntheticRunResult {
     pub interpreter: InterpreterResult,
     pub register_diffs: Vec<CpuStateDiff>,
@@ -694,9 +758,63 @@ pub enum InterpreterError {
 mod tests {
     use nx86_arm64_decode::decode_program;
     use nx86_core::guest::CpuState;
+    use nx86_hle::SvcOutcome;
+    use nx86_import::HomebrewModule;
     use nx86_testsuite::SyntheticArm64Test;
 
-    use super::{InterpreterError, NativeStatus, TinyInterpreter, run_synthetic_test};
+    use super::{
+        InterpreterError, NativeStatus, TinyInterpreter, boot_homebrew, run_synthetic_test,
+    };
+
+    #[test]
+    fn simple_homebrew_boots_to_clean_exit() {
+        let module = HomebrewModule::parse(
+            r#"
+            [metadata]
+            name = "exit-code"
+
+            [program]
+            load-address = "0x8000"
+            entry-point = "0x8000"
+            stack-top = "0x9000_0000"
+            arm64-hex = "40 05 80 D2 01 00 00 D4"
+            "#,
+        )
+        .expect("homebrew should parse");
+
+        let result = boot_homebrew(&module).expect("homebrew should boot");
+
+        assert_eq!(result.module_name, "exit-code");
+        assert_eq!(result.exit_code(), Some(42));
+        assert_eq!(result.service_outcome, Some(SvcOutcome::Exit { code: 42 }));
+        assert_eq!(result.interpreter.final_state.pc(), 0x8008);
+        assert_eq!(result.interpreter.final_state.sp(), 0x9000_0000);
+    }
+
+    #[test]
+    fn homebrew_unknown_svc_is_reported() {
+        let module = HomebrewModule::parse(
+            r#"
+            [metadata]
+            name = "unknown-service"
+
+            [program]
+            load-address = "0x8000"
+            entry-point = "0x8000"
+            stack-top = "0x9000_0000"
+            arm64-hex = "21 00 00 D4"
+            "#,
+        )
+        .expect("homebrew should parse");
+
+        let result = boot_homebrew(&module).expect("homebrew should boot");
+
+        assert_eq!(result.exit_code(), None);
+        assert_eq!(
+            result.service_outcome,
+            Some(SvcOutcome::Unhandled { imm: 1 })
+        );
+    }
 
     #[test]
     fn synthetic_add_program_executes_and_matches_expected_registers() {

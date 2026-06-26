@@ -10,7 +10,7 @@ Vulkan graphics backend.
 
 ## Current Prototype Target
 
-Phase 0 through Phase 24 define the current prototype:
+Phase 0 through Phase 44 define the current prototype:
 
 - Linux x86_64-v4 target
 - Rust monorepo
@@ -37,11 +37,22 @@ Phase 0 through Phase 24 define the current prototype:
 - versioned per-title runtime profiles for JIT, branch, helper, and slowmem events
 - 64 GiB VMM skeleton with software page mapping and debug dumps
 - internal Vulkan boundary crate prepared for future `ash` work
+- native block chaining, fastmem/slowmem observability, memory mirroring, and
+  self-modifying-code invalidation hooks
+- atomics, barrier semantics, guest threading, scheduler replay, and optional
+  fiber/task scheduling for synthetic workloads
+- scalar FP and basic NEON/vector support, including packed x86_64-v4 vector
+  lowering for the current v.2d surface
+- profile-guided hot/cold layout and expanded Native Coverage metrics
+- simple `.nxhb.toml` homebrew module loading, title persistence, entrypoint/stack
+  setup, and minimal `svc #0` exit handling
 
-The prototype does not import or run Switch software yet. Native x86_64 code
-generation remains limited to synthetic integer programs: conditional branches,
-memory operations, flags lowering, profile-guided rebuilding, and homebrew
-execution remain later phases, as described in `SPEC.md`.
+The prototype does not import or run commercial Switch software yet. Native
+x86_64 code generation remains limited to the current synthetic decoder/lifter
+surface, and the Phase 44 homebrew path uses an Nx86-owned descriptor format
+rather than encrypted platform containers. Broader HLE services, real NRO/NSO
+containers, graphics, audio, input, and commercial title startup remain later
+phases, as described in `SPEC.md`.
 
 ## Build
 

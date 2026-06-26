@@ -9,21 +9,23 @@ The first prototype target is a Linux x86_64-v4 desktop application with an egui
 shell. It contains a first-launch wizard, Library, Compile, Tests, and Settings
 screens, persistent settings, placeholder title storage, worker IPC smoke,
 synthetic ARM64 test display, guest CPU state, a narrow AArch64 decoder, a tiny
-synthetic interpreter, an NxIR differential oracle, a VMM skeleton, and the
-first internal x86_64 native-codegen path for synthetic integer programs. The
-native path includes register allocation and spills, persistent `.nxo` objects,
-a managed cache, multi-block dispatch through unconditional branches,
-compile-on-demand fallback, versioned runtime profiles, and native fastmem with
-checked VMM fallback. It does not implement real title import, Switch runtime
-execution, conditional-branch lowering, slowmem reporting, graphics, or Switch
-rendering.
+synthetic interpreter, an NxIR differential oracle, a VMM skeleton, a simple
+homebrew descriptor loader, and the first internal x86_64 native-codegen path for
+synthetic programs. The native path includes register allocation and spills,
+persistent `.nxo` objects, a managed cache, multi-block dispatch,
+compile-on-demand fallback, versioned runtime profiles, native fastmem with
+checked VMM fallback, basic threading/replay structures, FP/SIMD coverage,
+hot/cold layout, and Native Coverage reporting. It does not implement commercial
+title import, real NRO/NSO containers, broad HLE services, graphics, audio,
+input, or Switch rendering.
 
-## Active Phase 0-30 Crates
+## Active Phase 0-44 Crates
 
 - `nx86-app`: binary entrypoint, logging setup, config load, GUI launch.
 - `nx86-gui`: egui shell, wizard, theme, navigation, title list, worker progress, synthetic test display, decode display, tiny interpreter status, framebuffer rendering, NxIR/native dump agreement, and the Inspector screen (title-sourced disassembly, recovered CFG, NxIR, and native-mapping views).
 - `nx86-core`: shared config, storage layout, IPC model, guest CPU state, flag (NZCV) and condition-code semantics, Linux XDG-backed persistence, and the experimental native-patch-chaining preference.
-- `nx86-title-db`: SQLite title database, deterministic title folder creation, TOML sidecars, and synthetic-program title content for the Inspector.
+- `nx86-title-db`: SQLite title database, deterministic title folder creation, TOML sidecars, synthetic-program title content for the Inspector, and homebrew module content persistence.
+- `nx86-import`: simple `.nxhb.toml` homebrew descriptor parsing, validation, and guest-memory mapping.
 - `nx86-arm64-decode`: narrow decoder for MOV/ADD/SUB/logical/loads/stores/B/B.cond/ADDS/SUBS/SVC.
 - `nx86-ir`: NxIR data model (module/function/block/SSA values), the verifier,
   and speculation primitives — a guard terminator with a per-function deopt-point
@@ -36,7 +38,7 @@ rendering.
   program's bytes and entry PC it produces disassembly, the recovered CFG, the
   lifted NxIR dump, and the native (x86_64) mapping, degrading gracefully when
   lifting or lowering is unavailable.
-- `nx86-runtime`: tiny synthetic interpreter (with guest memory), NxIR evaluator (with guard/deopt routing via `EvalOutcome`), native backend attempt, and the CPU-plus-memory differential synthetic-test harness.
+- `nx86-runtime`: tiny synthetic interpreter (with guest memory), NxIR evaluator (with guard/deopt routing via `EvalOutcome`), native backend attempt, CPU-plus-memory differential synthetic-test harness, and Phase 44 homebrew boot helper.
 - `nx86-backend`: native execution orchestration, interpreter comparison, memory attachment with typed slowmem fallback, and the multi-block dispatcher with emergency-JIT fallback, software chain caching, guarded native chain installation, statistics, and invalidation.
 - `nx86-x64-asm`: internal x86_64 assembler API, labels, indexed and width-specific memory operands, code buffer, dump, control-flow/call primitives, and fixed-size runtime patch sites.
 - `nx86-jit`: Linux x86_64 executable memory, trusted generated-code call wrappers, W^X runtime patching, and on-demand single-block compilation into the object cache.
@@ -47,7 +49,8 @@ rendering.
 - `nx86-profile`: strict versioned JSONL runtime profiles with typed events,
   crash-tail recovery, file-wide branch-pair deduplication, Unix file locking,
   destination hardening, and partial-append rollback.
-- `nx86-vmm`: 64 GiB guest memory arena, page-backed Linux fastmem, eligibility metadata, and checked software page-table helpers.
+- `nx86-vmm`: 64 GiB guest memory arena, page-backed Linux fastmem, eligibility metadata, checked software page-table helpers, and page permission transitions for loader seeding.
+- `nx86-hle`: minimal Phase 44 service table for homebrew `svc #0` exit classification.
 - `nx86-debug`: tracing-based logging setup.
 - `nx86-testsuite`: synthetic ARM64 test file format, framebuffer spec, and result diffs.
 - `nx86-vulkan`: internal safe boundary around `ash`.
