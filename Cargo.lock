@@ -114,6 +114,9 @@ name = "ash"
 version = "0.38.0+1.3.281"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0bb44936d800fea8f016d7f2311c6a4f97aebd5dc86f09906139ec848cf3a46f"
+dependencies = [
+ "libloading",
+]
 
 [[package]]
 name = "atomic-waker"
@@ -1619,6 +1622,7 @@ version = "0.0.0"
 dependencies = [
  "nx86-core",
  "nx86-debug",
+ "nx86-gpu",
  "nx86-gui",
  "tracing",
 ]
@@ -1703,6 +1707,10 @@ version = "0.0.0"
 [[package]]
 name = "nx86-gpu"
 version = "0.0.0"
+dependencies = [
+ "nx86-testsuite",
+ "nx86-vulkan",
+]
 
 [[package]]
 name = "nx86-gso"
@@ -1718,6 +1726,7 @@ dependencies = [
  "nx86-audio",
  "nx86-cache",
  "nx86-core",
+ "nx86-gpu",
  "nx86-input",
  "nx86-inspector",
  "nx86-runtime",

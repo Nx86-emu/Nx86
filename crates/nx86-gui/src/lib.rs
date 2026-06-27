@@ -100,6 +100,9 @@ pub struct Nx86App {
     input_runtime: GamepadRuntime,
     input_snapshot: InputSnapshot,
     audio_runtime: AudioRuntime,
+    /// Phase 48 renderer. Built once (Vulkan device bring-up is expensive) and
+    /// reused for every demo-frame render instead of re-detecting per click.
+    renderer: nx86_gpu::Renderer,
     worker_process: Option<WorkerProcess>,
 }
 
@@ -129,6 +132,7 @@ impl Nx86App {
             input_runtime: GamepadRuntime::new(),
             input_snapshot: InputSnapshot::neutral(),
             audio_runtime: AudioRuntime::new(),
+            renderer: nx86_gpu::Renderer::new(),
             worker_process: None,
         };
         app.initialize_services_if_ready();
@@ -155,6 +159,7 @@ impl Nx86App {
             input_runtime: GamepadRuntime::unavailable("disabled in tests"),
             input_snapshot: InputSnapshot::neutral(),
             audio_runtime: AudioRuntime::null("disabled in tests"),
+            renderer: nx86_gpu::Renderer::new(),
             worker_process: None,
         }
     }
@@ -542,6 +547,7 @@ impl Nx86App {
                 screens::TestAction::None => {}
                 screens::TestAction::PickFile => self.pick_synthetic_test_file(),
                 screens::TestAction::LoadPath => self.load_synthetic_test_from_state(),
+                screens::TestAction::RenderDemoFrame => self.render_demo_frame(),
             },
             AppScreen::Scheduler => match screens::scheduler(ui, &mut self.scheduler_ui) {
                 screens::SchedulerAction::None => {}
@@ -726,6 +732,16 @@ impl Nx86App {
         self.load_synthetic_test_from_state();
     }
 
+    /// Render the Phase 48 demonstration frame through `nx86-gpu` (Vulkan when
+    /// available, deterministic software fallback otherwise) and surface it via
+    /// the existing framebuffer view.
+    fn render_demo_frame(&mut self) {
+        let frame = self.renderer.render_demo(16, 12);
+        self.test_ui.renderer_backend = Some(self.renderer.backend().label());
+        self.test_ui.framebuffer = Some((frame.width, frame.height, frame.bytes));
+        self.test_ui.framebuffer_texture = None;
+    }
+
     fn load_synthetic_test_from_state(&mut self) {
         match SyntheticArm64Test::load(&self.test_ui.path) {
             Ok(test) => {
@@ -741,6 +757,7 @@ impl Nx86App {
                 self.test_ui.memory_dumps.clear();
                 self.test_ui.framebuffer = None;
                 self.test_ui.framebuffer_texture = None;
+                self.test_ui.renderer_backend = None;
                 self.test_ui.nxir_status = None;
                 self.test_ui.nxir_dump = None;
                 self.test_ui.native_status = None;
@@ -757,6 +774,7 @@ impl Nx86App {
         self.test_ui.memory_dumps.clear();
         self.test_ui.framebuffer = None;
         self.test_ui.framebuffer_texture = None;
+        self.test_ui.renderer_backend = None;
         self.test_ui.nxir_status = None;
         self.test_ui.nxir_dump = None;
         self.test_ui.native_status = None;
@@ -999,6 +1017,57 @@ mod tests {
         app.set_selected_screen(AppScreen::Compile);
 
         assert_eq!(app.selected_screen(), AppScreen::Compile);
+    }
+
+    #[test]
+    fn render_demo_frame_populates_framebuffer_and_backend() {
+        let mut app = Nx86App::new_for_test(AppConfig::default());
+        app.render_demo_frame();
+
+        let (width, height, bytes) = app
+            .test_ui
+            .framebuffer
+            .as_ref()
+            .expect("demo render should populate the framebuffer");
+        assert_eq!(*width, 16);
+        assert_eq!(*height, 12);
+        assert_eq!(bytes.len(), 16 * 12 * 4);
+        // The texture cache is reset so the new frame uploads on the next paint.
+        assert!(app.test_ui.framebuffer_texture.is_none());
+        assert!(
+            app.test_ui
+                .renderer_backend
+                .as_deref()
+                .is_some_and(|backend| !backend.is_empty()),
+            "the backend label must be recorded"
+        );
+    }
+
+    #[test]
+    fn analyzing_a_test_clears_a_stale_renderer_backend_label() {
+        let test = SyntheticArm64Test::parse(
+            r#"
+            [metadata]
+            name = "gui add"
+
+            [program]
+            arm64-hex = "20 00 80 D2 01 08 00 91 01 00 00 D4"
+
+            [expected.registers]
+            x1 = "0x3"
+            halted = "true"
+            "#,
+        )
+        .expect("test should parse");
+        let mut app = Nx86App::new_for_test(AppConfig::default());
+
+        // A demo render leaves a backend label behind...
+        app.render_demo_frame();
+        assert!(app.test_ui.renderer_backend.is_some());
+
+        // ...which must not outlive the frame it described once a test is run.
+        app.analyze_synthetic_test(&test);
+        assert!(app.test_ui.renderer_backend.is_none());
     }
 
     #[test]

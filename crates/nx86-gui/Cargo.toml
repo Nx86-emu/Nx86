@@ -17,6 +17,7 @@ nx86-arm64-decode = { path = "../nx86-arm64-decode" }
 nx86-audio = { path = "../nx86-audio", default-features = false }
 nx86-cache = { path = "../nx86-cache" }
 nx86-core = { path = "../nx86-core" }
+nx86-gpu = { path = "../nx86-gpu" }
 nx86-input = { path = "../nx86-input", default-features = false }
 nx86-inspector = { path = "../nx86-inspector" }
 nx86-runtime = { path = "../nx86-runtime", default-features = false }

@@ -58,7 +58,14 @@ motion/rumble, or Switch rendering.
 - `nx86-audio`: default-feature `cpal` host audio backend, null sink fallback, stereo `f32` buffer queue, frame counters, and deterministic timing hooks.
 - `nx86-debug`: tracing-based logging setup.
 - `nx86-testsuite`: synthetic ARM64 test file format, framebuffer spec, and result diffs.
-- `nx86-vulkan`: internal safe boundary around `ash`.
+- `nx86-vulkan`: internal safe boundary around `ash` — loader-based availability
+  detection, instance/physical-device/logical-device bring-up, an offscreen
+  render-to-image (clear → `R8G8B8A8` readback) frame path, and a
+  windowed-present swapchain backend. All `unsafe` `ash` and raw Vulkan handles
+  stay inside this crate.
+- `nx86-gpu`: renderer orchestration above `nx86-vulkan` — selects the Vulkan
+  device when present, else a deterministic CPU test-card fallback, and yields
+  `RenderedFrame` RGBA8 bytes for the GUI framebuffer view.
 
 ## Skeleton Crates
 
@@ -78,8 +85,10 @@ future vendor-specific optimization.
 manifest version requirements, so the workspace pins `=0.38.0` in `Cargo.toml`
 and records the resolved `0.38.0+1.3.281` package in `Cargo.lock`. Raw Vulkan
 handles and unsafe Vulkan calls must not leak into higher-level emulator crates.
-Until Phase 48, `nx86-vulkan` exposes only safe placeholder types and Vulkan
-capability metadata.
+As of Phase 48, `nx86-vulkan` is a real safe boundary: it loads the Vulkan loader
+at runtime (the `loaded` feature), so hosts without a loader — the Apple Silicon
+dev host and headless CI — report a clean `Unavailable` and callers fall back to
+a deterministic software frame instead of failing to build, link, or run.
 
 Higher-level graphics crates such as `wgpu` and `vulkano` are not core renderer
 choices for Nx86 because they hide behavior that the emulator needs to control.

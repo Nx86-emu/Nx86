@@ -152,6 +152,13 @@ fn run_worker(worker: WorkerMode) -> Result<(), Box<dyn std::error::Error>> {
         thread::sleep(Duration::from_millis(120));
     }
 
+    // The isolated runtime process owns the renderer (Phase 48). Produce a frame
+    // and report it over the versioned JSON-line IPC, exercising the GPU path on
+    // Linux and the deterministic software fallback elsewhere.
+    if matches!(kind, WorkerKind::RuntimeSmoke) {
+        emit_event(&IpcEvent::Log(render_demo_report()))?;
+    }
+
     emit_event(&IpcEvent::Completed(CompletedEvent {
         job_id: kind.label().to_owned(),
         success: true,
@@ -159,6 +166,26 @@ fn run_worker(worker: WorkerMode) -> Result<(), Box<dyn std::error::Error>> {
     }))?;
 
     Ok(())
+}
+
+/// Render the Phase 48 demonstration frame and summarize it as a log event.
+fn render_demo_report() -> LogEvent {
+    let renderer = nx86_gpu::Renderer::new();
+    let frame = renderer.render_demo(16, 12);
+    let painted = frame
+        .bytes
+        .chunks_exact(4)
+        .filter(|pixel| *pixel != nx86_gpu::BACKGROUND)
+        .count();
+    LogEvent {
+        level: LogLevel::Info,
+        message: format!(
+            "rendered {}x{} frame via {} ({painted} foreground px)",
+            frame.width,
+            frame.height,
+            renderer.backend().label(),
+        ),
+    }
 }
 
 fn emit_event(event: &IpcEvent) -> Result<(), Box<dyn std::error::Error>> {

@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 nx86-core = { path = "../nx86-core" }
 nx86-debug = { path = "../nx86-debug" }
+nx86-gpu = { path = "../nx86-gpu" }
 nx86-gui = { path = "../nx86-gui", default-features = false }
 tracing.workspace = true
 

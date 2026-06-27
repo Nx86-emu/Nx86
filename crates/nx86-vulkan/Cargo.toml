@@ -6,7 +6,10 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-ash.workspace = true
+# `loaded` pulls in `libloading` + `std` so the Vulkan loader is resolved at
+# runtime. Hosts without a loader (the Apple Silicon dev host, headless CI)
+# report a clean `Unavailable` instead of failing to build or link.
+ash = { workspace = true, features = ["loaded"] }
 
 [lints]
 workspace = true

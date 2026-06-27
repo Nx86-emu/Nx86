@@ -96,6 +96,9 @@ pub struct TestUiState {
     /// Cached GPU texture for [`Self::framebuffer`]; rebuilt when the pixels
     /// change (cleared by the analysis step).
     pub framebuffer_texture: Option<egui::TextureHandle>,
+    /// Backend label from the last Phase 48 demo render (Vulkan device or the
+    /// software fallback reason), shown next to the render control.
+    pub renderer_backend: Option<String>,
     /// Whether NxIR evaluation agreed with the interpreter, as a status line.
     pub nxir_status: Option<String>,
     /// NxIR text dump from the last run, if lifting succeeded.
@@ -111,6 +114,7 @@ pub enum TestAction {
     None,
     PickFile,
     LoadPath,
+    RenderDemoFrame,
 }
 
 pub struct SchedulerUiState {
@@ -468,6 +472,41 @@ pub fn tests(ui: &mut egui::Ui, state: &mut TestUiState) -> TestAction {
         ui.label(message);
     }
 
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+    ui.strong("Renderer (Phase 48)");
+    ui.horizontal(|ui| {
+        if ui.button("Render demo frame").clicked() {
+            action = TestAction::RenderDemoFrame;
+        }
+        if let Some(backend) = &state.renderer_backend {
+            ui.monospace(backend);
+        }
+    });
+
+    if let Some((width, height, bytes)) = &state.framebuffer {
+        ui.add_space(10.0);
+        ui.strong("Framebuffer");
+        ui.monospace(format!("{width}x{height} RGBA8"));
+        if state.framebuffer_texture.is_none() && !bytes.is_empty() {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [*width as usize, *height as usize],
+                bytes,
+            );
+            state.framebuffer_texture = Some(ui.ctx().load_texture(
+                "nx86-framebuffer",
+                image,
+                egui::TextureOptions::NEAREST,
+            ));
+        }
+        if let Some(texture) = &state.framebuffer_texture {
+            let scale = 24.0;
+            let size = egui::vec2(*width as f32 * scale, *height as f32 * scale);
+            ui.image(egui::load::SizedTexture::new(texture.id(), size));
+        }
+    }
+
     if let Some(test) = &state.loaded {
         ui.add_space(12.0);
         ui.heading(&test.metadata.name);
@@ -517,28 +556,6 @@ pub fn tests(ui: &mut egui::Ui, state: &mut TestUiState) -> TestAction {
             ui.strong("VMM memory dumps");
             for dump in &state.memory_dumps {
                 ui.monospace(dump);
-            }
-        }
-
-        if let Some((width, height, bytes)) = &state.framebuffer {
-            ui.add_space(10.0);
-            ui.strong("Framebuffer");
-            ui.monospace(format!("{width}x{height} RGBA8"));
-            if state.framebuffer_texture.is_none() && !bytes.is_empty() {
-                let image = egui::ColorImage::from_rgba_unmultiplied(
-                    [*width as usize, *height as usize],
-                    bytes,
-                );
-                state.framebuffer_texture = Some(ui.ctx().load_texture(
-                    "nx86-framebuffer",
-                    image,
-                    egui::TextureOptions::NEAREST,
-                ));
-            }
-            if let Some(texture) = &state.framebuffer_texture {
-                let scale = 24.0;
-                let size = egui::vec2(*width as f32 * scale, *height as f32 * scale);
-                ui.image(egui::load::SizedTexture::new(texture.id(), size));
             }
         }
 
