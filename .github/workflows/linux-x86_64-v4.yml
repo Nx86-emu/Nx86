@@ -125,7 +125,7 @@ jobs:
           )
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.RELEASE_NAME }}
           path: |
@@ -143,13 +143,13 @@ jobs:
 
     steps:
       - name: Download workflow artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ env.RELEASE_NAME }}
           path: dist
 
       - name: Upload GitHub Release artifact
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/${{ env.RELEASE_NAME }}.tar.gz
@@ -170,13 +170,13 @@ jobs:
         run: echo "name=nightly+${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Download workflow artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ env.RELEASE_NAME }}
           path: dist
 
       - name: Publish nightly release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.release.outputs.name }}
           name: ${{ steps.release.outputs.name }}
