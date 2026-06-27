@@ -17,6 +17,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
   RELEASE_BINARY: target/x86_64-unknown-linux-gnu/release/nx86-app
   RELEASE_NAME: nx86-app-linux-x86_64-v4
 
@@ -43,8 +45,10 @@ jobs:
             build-essential \
             file \
             gzip \
+            libasound2-dev \
             libegl1-mesa-dev \
             libgl1-mesa-dev \
+            libudev-dev \
             libwayland-dev \
             libx11-dev \
             libxkbcommon-dev \

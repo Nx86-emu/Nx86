@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     pub compiler: CompilerConfig,
     pub graphics: GraphicsConfig,
+    pub input: InputConfig,
     pub profile_sharing: ProfileSharingConfig,
 }
 
@@ -204,6 +205,277 @@ impl Default for ProfileSharingConfig {
             enabled: false,
             upload_requires_approval: true,
             download_requires_approval: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct InputConfig {
+    pub gamepad_enabled: bool,
+    pub keyboard: KeyboardInputConfig,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            gamepad_enabled: true,
+            keyboard: KeyboardInputConfig::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct KeyboardInputConfig {
+    pub dpad_up: KeyboardKey,
+    pub dpad_down: KeyboardKey,
+    pub dpad_left: KeyboardKey,
+    pub dpad_right: KeyboardKey,
+    pub a: KeyboardKey,
+    pub b: KeyboardKey,
+    pub x: KeyboardKey,
+    pub y: KeyboardKey,
+    pub l: KeyboardKey,
+    pub r: KeyboardKey,
+    pub zl: KeyboardKey,
+    pub zr: KeyboardKey,
+    pub plus: KeyboardKey,
+    pub minus: KeyboardKey,
+}
+
+impl Default for KeyboardInputConfig {
+    fn default() -> Self {
+        Self {
+            dpad_up: KeyboardKey::W,
+            dpad_down: KeyboardKey::S,
+            dpad_left: KeyboardKey::A,
+            dpad_right: KeyboardKey::D,
+            a: KeyboardKey::Space,
+            b: KeyboardKey::J,
+            x: KeyboardKey::K,
+            y: KeyboardKey::U,
+            l: KeyboardKey::Q,
+            r: KeyboardKey::E,
+            zl: KeyboardKey::Z,
+            zr: KeyboardKey::X,
+            plus: KeyboardKey::Enter,
+            minus: KeyboardKey::Tab,
+        }
+    }
+}
+
+impl KeyboardInputConfig {
+    #[must_use]
+    pub const fn key_for(self, binding: InputBinding) -> KeyboardKey {
+        match binding {
+            InputBinding::DPadUp => self.dpad_up,
+            InputBinding::DPadDown => self.dpad_down,
+            InputBinding::DPadLeft => self.dpad_left,
+            InputBinding::DPadRight => self.dpad_right,
+            InputBinding::A => self.a,
+            InputBinding::B => self.b,
+            InputBinding::X => self.x,
+            InputBinding::Y => self.y,
+            InputBinding::L => self.l,
+            InputBinding::R => self.r,
+            InputBinding::ZL => self.zl,
+            InputBinding::ZR => self.zr,
+            InputBinding::Plus => self.plus,
+            InputBinding::Minus => self.minus,
+        }
+    }
+
+    pub fn set_key_for(&mut self, binding: InputBinding, key: KeyboardKey) {
+        match binding {
+            InputBinding::DPadUp => self.dpad_up = key,
+            InputBinding::DPadDown => self.dpad_down = key,
+            InputBinding::DPadLeft => self.dpad_left = key,
+            InputBinding::DPadRight => self.dpad_right = key,
+            InputBinding::A => self.a = key,
+            InputBinding::B => self.b = key,
+            InputBinding::X => self.x = key,
+            InputBinding::Y => self.y = key,
+            InputBinding::L => self.l = key,
+            InputBinding::R => self.r = key,
+            InputBinding::ZL => self.zl = key,
+            InputBinding::ZR => self.zr = key,
+            InputBinding::Plus => self.plus = key,
+            InputBinding::Minus => self.minus = key,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InputBinding {
+    DPadUp,
+    DPadDown,
+    DPadLeft,
+    DPadRight,
+    A,
+    B,
+    X,
+    Y,
+    L,
+    R,
+    ZL,
+    ZR,
+    Plus,
+    Minus,
+}
+
+impl InputBinding {
+    pub const ALL: [Self; 14] = [
+        Self::DPadUp,
+        Self::DPadDown,
+        Self::DPadLeft,
+        Self::DPadRight,
+        Self::A,
+        Self::B,
+        Self::X,
+        Self::Y,
+        Self::L,
+        Self::R,
+        Self::ZL,
+        Self::ZR,
+        Self::Plus,
+        Self::Minus,
+    ];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DPadUp => "D-pad Up",
+            Self::DPadDown => "D-pad Down",
+            Self::DPadLeft => "D-pad Left",
+            Self::DPadRight => "D-pad Right",
+            Self::A => "A",
+            Self::B => "B",
+            Self::X => "X",
+            Self::Y => "Y",
+            Self::L => "L",
+            Self::R => "R",
+            Self::ZL => "ZL",
+            Self::ZR => "ZR",
+            Self::Plus => "Plus",
+            Self::Minus => "Minus",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeyboardKey {
+    #[default]
+    Space,
+    Enter,
+    Tab,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+}
+
+impl KeyboardKey {
+    pub const ALL: [Self; 33] = [
+        Self::Space,
+        Self::Enter,
+        Self::Tab,
+        Self::ArrowUp,
+        Self::ArrowDown,
+        Self::ArrowLeft,
+        Self::ArrowRight,
+        Self::A,
+        Self::B,
+        Self::C,
+        Self::D,
+        Self::E,
+        Self::F,
+        Self::G,
+        Self::H,
+        Self::I,
+        Self::J,
+        Self::K,
+        Self::L,
+        Self::M,
+        Self::N,
+        Self::O,
+        Self::P,
+        Self::Q,
+        Self::R,
+        Self::S,
+        Self::T,
+        Self::U,
+        Self::V,
+        Self::W,
+        Self::X,
+        Self::Y,
+        Self::Z,
+    ];
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Space => "Space",
+            Self::Enter => "Enter",
+            Self::Tab => "Tab",
+            Self::ArrowUp => "Arrow Up",
+            Self::ArrowDown => "Arrow Down",
+            Self::ArrowLeft => "Arrow Left",
+            Self::ArrowRight => "Arrow Right",
+            Self::A => "A",
+            Self::B => "B",
+            Self::C => "C",
+            Self::D => "D",
+            Self::E => "E",
+            Self::F => "F",
+            Self::G => "G",
+            Self::H => "H",
+            Self::I => "I",
+            Self::J => "J",
+            Self::K => "K",
+            Self::L => "L",
+            Self::M => "M",
+            Self::N => "N",
+            Self::O => "O",
+            Self::P => "P",
+            Self::Q => "Q",
+            Self::R => "R",
+            Self::S => "S",
+            Self::T => "T",
+            Self::U => "U",
+            Self::V => "V",
+            Self::W => "W",
+            Self::X => "X",
+            Self::Y => "Y",
+            Self::Z => "Z",
         }
     }
 }
@@ -474,6 +746,9 @@ mod tests {
         assert_eq!(config.prototype.graphics_backend, "vulkan");
         assert_eq!(config.prototype.gui_framework, "egui");
         assert_eq!(config.graphics.backend, GraphicsBackend::Vulkan);
+        assert!(config.input.gamepad_enabled);
+        assert_eq!(config.input.keyboard.dpad_up, super::KeyboardKey::W);
+        assert_eq!(config.input.keyboard.a, super::KeyboardKey::Space);
         assert!(!config.compiler.native_patch_chaining);
         assert!(!config.compiler.debug_memory_mirrors);
         assert!(config.first_run.phase3_wizard_pending);
@@ -519,11 +794,71 @@ mod tests {
         config.compiler.all_core_warning_acknowledged = true;
         config.compiler.native_patch_chaining = true;
         config.compiler.debug_memory_mirrors = true;
+        config.input.gamepad_enabled = false;
+        config
+            .input
+            .keyboard
+            .set_key_for(super::InputBinding::A, super::KeyboardKey::K);
 
         let serialized = toml::to_string_pretty(&config).expect("config should serialize");
         let decoded: AppConfig = toml::from_str(&serialized).expect("config should parse");
 
         assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn old_config_without_input_section_uses_defaults() {
+        let decoded: AppConfig = toml::from_str(
+            r#"
+            [ui]
+            selected-screen = "settings"
+            theme-mode = "light"
+            developer-mode-visible = true
+            "#,
+        )
+        .expect("old config should parse");
+
+        assert_eq!(decoded.ui.selected_screen, AppScreen::Settings);
+        assert!(decoded.input.gamepad_enabled);
+        assert_eq!(
+            decoded
+                .input
+                .keyboard
+                .key_for(super::InputBinding::DPadLeft),
+            super::KeyboardKey::A
+        );
+        assert_eq!(
+            decoded.input.keyboard.key_for(super::InputBinding::Plus),
+            super::KeyboardKey::Enter
+        );
+    }
+
+    #[test]
+    fn partial_input_config_uses_keyboard_defaults() {
+        let decoded: AppConfig = toml::from_str(
+            r#"
+            [input]
+            gamepad-enabled = false
+
+            [input.keyboard]
+            a = "b"
+            "#,
+        )
+        .expect("partial input config should parse");
+
+        assert!(!decoded.input.gamepad_enabled);
+        assert_eq!(
+            decoded.input.keyboard.key_for(super::InputBinding::A),
+            super::KeyboardKey::B
+        );
+        assert_eq!(
+            decoded.input.keyboard.key_for(super::InputBinding::DPadUp),
+            super::KeyboardKey::W
+        );
+        assert_eq!(
+            decoded.input.keyboard.key_for(super::InputBinding::Plus),
+            super::KeyboardKey::Enter
+        );
     }
 
     #[test]

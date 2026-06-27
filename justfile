@@ -94,7 +94,7 @@ docs-open:
 
 # Scan locked dependencies against the RustSec advisory database.
 audit:
-    cargo audit
+    cargo audit --deny warnings
 
 # Validate GitHub Actions workflows (requires actionlint).
 workflow-check:

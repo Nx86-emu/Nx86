@@ -1,12 +1,12 @@
 [package]
-name = "nx86-input"
+name = "nx86-service"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-gilrs.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

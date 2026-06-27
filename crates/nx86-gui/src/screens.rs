@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
 use eframe::egui;
+use nx86_audio::AudioStatus;
 use nx86_core::{
-    config::{AppConfig, ThemeMode, available_parallelism},
+    config::{AppConfig, InputBinding, KeyboardKey, ThemeMode, available_parallelism},
     ipc::{CompileProgress, IpcEvent, LogLevel},
     storage::StorageLayout,
 };
+use nx86_input::{GamepadStatus, InputSnapshot};
 use nx86_scheduler::{
     ReplayMetadata, Scheduler, SchedulerComparison, SchedulerMode, SyntheticThreadProgram,
     ThreadGuiRow, compare_host_threads_and_fibers,
@@ -781,8 +783,16 @@ fn inspector_dump(ui: &mut egui::Ui, title: &str, id_salt: &str, body: &str) {
         });
 }
 
-pub fn settings(ui: &mut egui::Ui, config: &mut AppConfig, layout: Option<&StorageLayout>) -> bool {
-    screen_header(ui, "Settings", "Phase 10");
+pub fn settings(
+    ui: &mut egui::Ui,
+    config: &mut AppConfig,
+    layout: Option<&StorageLayout>,
+    gamepad_status: &GamepadStatus,
+    input_snapshot: InputSnapshot,
+    audio_status: &AudioStatus,
+    audio_muted: &mut bool,
+) -> bool {
+    screen_header(ui, "Settings", "Phase 47");
     let mut changed = false;
 
     ui.horizontal(|ui| {
@@ -820,6 +830,10 @@ pub fn settings(ui: &mut egui::Ui, config: &mut AppConfig, layout: Option<&Stora
             ui.monospace(config.graphics.backend.label());
             ui.end_row();
 
+            ui.label("Audio backend");
+            ui.monospace(audio_status.backend.label());
+            ui.end_row();
+
             ui.label("Compile thread cap");
             ui.monospace(config.compiler.compile_thread_cap.to_string());
             ui.end_row();
@@ -839,6 +853,85 @@ pub fn settings(ui: &mut egui::Ui, config: &mut AppConfig, layout: Option<&Stora
                 "complete"
             });
             ui.end_row();
+        });
+
+    ui.add_space(18.0);
+    ui.strong("Audio");
+    egui::Grid::new("audio-status-grid")
+        .num_columns(2)
+        .min_col_width(210.0)
+        .spacing([18.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("Output");
+            ui.monospace(audio_status.label());
+            ui.end_row();
+
+            ui.label("Sample rate");
+            ui.monospace(format!("{} Hz", audio_status.sample_rate));
+            ui.end_row();
+
+            ui.label("Channels");
+            ui.monospace(audio_status.channels.to_string());
+            ui.end_row();
+
+            ui.label("Queued frames");
+            ui.monospace(audio_status.queued_frames.to_string());
+            ui.end_row();
+
+            ui.label("Underflows");
+            ui.monospace(audio_status.underflows.to_string());
+            ui.end_row();
+        });
+
+    let _audio_changed = ui.checkbox(audio_muted, "Mute audio output").changed();
+
+    ui.add_space(18.0);
+    ui.strong("Input");
+    egui::Grid::new("input-status-grid")
+        .num_columns(2)
+        .min_col_width(210.0)
+        .spacing([18.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("Gamepad backend");
+            ui.monospace(if config.input.gamepad_enabled {
+                gamepad_status.label()
+            } else {
+                "disabled".to_owned()
+            });
+            ui.end_row();
+
+            ui.label("Controller state");
+            ui.monospace(format!("{:#018x}", input_snapshot.packed()));
+            ui.end_row();
+        });
+
+    changed |= ui
+        .checkbox(&mut config.input.gamepad_enabled, "Poll connected gamepads")
+        .changed();
+
+    ui.add_space(8.0);
+    egui::Grid::new("keyboard-bindings-grid")
+        .num_columns(2)
+        .min_col_width(210.0)
+        .spacing([18.0, 8.0])
+        .show(ui, |ui| {
+            for binding in InputBinding::ALL {
+                ui.label(binding.label());
+                let mut key = config.input.keyboard.key_for(binding);
+                let before = key;
+                egui::ComboBox::from_id_salt(format!("input-binding-{}", binding.label()))
+                    .selected_text(key.label())
+                    .show_ui(ui, |ui| {
+                        for candidate in KeyboardKey::ALL {
+                            ui.selectable_value(&mut key, candidate, candidate.label());
+                        }
+                    });
+                if key != before {
+                    config.input.keyboard.set_key_for(binding, key);
+                    changed = true;
+                }
+                ui.end_row();
+            }
         });
 
     if let Some(layout) = layout {

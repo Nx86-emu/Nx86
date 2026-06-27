@@ -10,11 +10,16 @@ use std::{
 
 use eframe::egui;
 use nx86_arm64_decode::decode_program;
+use nx86_audio::AudioRuntime;
 use nx86_core::{
-    config::{AppConfig, AppScreen, ConfigError, ConfigStore},
+    config::{
+        AppConfig, AppScreen, ConfigError, ConfigStore, InputBinding, KeyboardInputConfig,
+        KeyboardKey,
+    },
     ipc::{CancelledEvent, IpcEvent, WorkerKind, decode_event},
     storage::StorageLayout,
 };
+use nx86_input::{ControllerButtons, GamepadRuntime, InputAction, InputSnapshot};
 use nx86_inspector::inspect_program;
 use nx86_runtime::{NativeStatus, run_synthetic_test};
 use nx86_testsuite::SyntheticArm64Test;
@@ -92,6 +97,9 @@ pub struct Nx86App {
     test_ui: screens::TestUiState,
     scheduler_ui: screens::SchedulerUiState,
     inspector_ui: screens::InspectorUiState,
+    input_runtime: GamepadRuntime,
+    input_snapshot: InputSnapshot,
+    audio_runtime: AudioRuntime,
     worker_process: Option<WorkerProcess>,
 }
 
@@ -118,6 +126,9 @@ impl Nx86App {
             test_ui: screens::TestUiState::default(),
             scheduler_ui: screens::SchedulerUiState::default(),
             inspector_ui: screens::InspectorUiState::default(),
+            input_runtime: GamepadRuntime::new(),
+            input_snapshot: InputSnapshot::neutral(),
+            audio_runtime: AudioRuntime::new(),
             worker_process: None,
         };
         app.initialize_services_if_ready();
@@ -141,6 +152,9 @@ impl Nx86App {
             test_ui: screens::TestUiState::default(),
             scheduler_ui: screens::SchedulerUiState::default(),
             inspector_ui: screens::InspectorUiState::default(),
+            input_runtime: GamepadRuntime::unavailable("disabled in tests"),
+            input_snapshot: InputSnapshot::neutral(),
+            audio_runtime: AudioRuntime::null("disabled in tests"),
             worker_process: None,
         }
     }
@@ -487,6 +501,7 @@ impl Nx86App {
 
     fn draw_content(&mut self, ui: &mut egui::Ui) {
         self.poll_worker();
+        self.poll_input(ui.ctx());
 
         if self.config.wizard_is_pending() {
             match screens::first_launch_wizard(ui, &mut self.config, self.service_error.as_deref())
@@ -539,11 +554,34 @@ impl Nx86App {
                 }
             }
             AppScreen::Settings => {
-                if screens::settings(ui, &mut self.config, self.storage_layout.as_ref()) {
+                let audio_status = self.audio_runtime.status();
+                let mut audio_muted = audio_status.muted;
+                if screens::settings(
+                    ui,
+                    &mut self.config,
+                    self.storage_layout.as_ref(),
+                    self.input_runtime.status(),
+                    self.input_snapshot,
+                    &audio_status,
+                    &mut audio_muted,
+                ) {
                     theme::apply_theme(ui.ctx(), self.config.ui.theme_mode);
+                }
+                if audio_muted != audio_status.muted {
+                    self.audio_runtime.set_muted(audio_muted);
                 }
             }
         }
+    }
+
+    fn poll_input(&mut self, context: &egui::Context) {
+        let keyboard_buttons = keyboard_buttons_from_egui(context, &self.config.input.keyboard);
+        let gamepad_buttons = if self.config.input.gamepad_enabled {
+            self.input_runtime.poll().buttons()
+        } else {
+            ControllerButtons::empty()
+        };
+        self.input_snapshot = InputSnapshot::from_buttons(keyboard_buttons.union(gamepad_buttons));
     }
 
     fn start_worker(&mut self, kind: WorkerKind) {
@@ -859,6 +897,80 @@ fn memory_dump_summary(range: &nx86_testsuite::ExpectedMemoryRange) -> Result<St
     ))
 }
 
+fn keyboard_buttons_from_egui(
+    context: &egui::Context,
+    mapping: &KeyboardInputConfig,
+) -> ControllerButtons {
+    let mut buttons = ControllerButtons::empty();
+    context.input(|input| {
+        for binding in InputBinding::ALL {
+            let key = mapping.key_for(binding);
+            buttons.set(
+                input_action_for_binding(binding),
+                input.key_down(egui_key_for_config(key)),
+            );
+        }
+    });
+    buttons
+}
+
+fn input_action_for_binding(binding: InputBinding) -> InputAction {
+    match binding {
+        InputBinding::DPadUp => InputAction::DPadUp,
+        InputBinding::DPadDown => InputAction::DPadDown,
+        InputBinding::DPadLeft => InputAction::DPadLeft,
+        InputBinding::DPadRight => InputAction::DPadRight,
+        InputBinding::A => InputAction::A,
+        InputBinding::B => InputAction::B,
+        InputBinding::X => InputAction::X,
+        InputBinding::Y => InputAction::Y,
+        InputBinding::L => InputAction::L,
+        InputBinding::R => InputAction::R,
+        InputBinding::ZL => InputAction::ZL,
+        InputBinding::ZR => InputAction::ZR,
+        InputBinding::Plus => InputAction::Plus,
+        InputBinding::Minus => InputAction::Minus,
+    }
+}
+
+fn egui_key_for_config(key: KeyboardKey) -> egui::Key {
+    match key {
+        KeyboardKey::Space => egui::Key::Space,
+        KeyboardKey::Enter => egui::Key::Enter,
+        KeyboardKey::Tab => egui::Key::Tab,
+        KeyboardKey::ArrowUp => egui::Key::ArrowUp,
+        KeyboardKey::ArrowDown => egui::Key::ArrowDown,
+        KeyboardKey::ArrowLeft => egui::Key::ArrowLeft,
+        KeyboardKey::ArrowRight => egui::Key::ArrowRight,
+        KeyboardKey::A => egui::Key::A,
+        KeyboardKey::B => egui::Key::B,
+        KeyboardKey::C => egui::Key::C,
+        KeyboardKey::D => egui::Key::D,
+        KeyboardKey::E => egui::Key::E,
+        KeyboardKey::F => egui::Key::F,
+        KeyboardKey::G => egui::Key::G,
+        KeyboardKey::H => egui::Key::H,
+        KeyboardKey::I => egui::Key::I,
+        KeyboardKey::J => egui::Key::J,
+        KeyboardKey::K => egui::Key::K,
+        KeyboardKey::L => egui::Key::L,
+        KeyboardKey::M => egui::Key::M,
+        KeyboardKey::N => egui::Key::N,
+        KeyboardKey::O => egui::Key::O,
+        KeyboardKey::P => egui::Key::P,
+        KeyboardKey::Q => egui::Key::Q,
+        KeyboardKey::R => egui::Key::R,
+        KeyboardKey::S => egui::Key::S,
+        KeyboardKey::T => egui::Key::T,
+        KeyboardKey::U => egui::Key::U,
+        KeyboardKey::V => egui::Key::V,
+        KeyboardKey::W => egui::Key::W,
+        KeyboardKey::X => egui::Key::X,
+        KeyboardKey::Y => egui::Key::Y,
+        KeyboardKey::Z => egui::Key::Z,
+    }
+}
+
 fn native_status_line(status: NativeStatus, error: Option<&str>) -> String {
     match (status, error) {
         (NativeStatus::MatchesInterpreter, _) => "matches interpreter".to_owned(),
@@ -874,7 +986,8 @@ fn native_status_line(status: NativeStatus, error: Option<&str>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use nx86_core::config::{AppConfig, AppScreen};
+    use nx86_core::config::{AppConfig, AppScreen, InputBinding, KeyboardKey};
+    use nx86_input::InputAction;
     use nx86_testsuite::SyntheticArm64Test;
 
     use super::Nx86App;
@@ -886,6 +999,27 @@ mod tests {
         app.set_selected_screen(AppScreen::Compile);
 
         assert_eq!(app.selected_screen(), AppScreen::Compile);
+    }
+
+    #[test]
+    fn input_bindings_map_to_runtime_actions_and_keys() {
+        assert_eq!(
+            super::input_action_for_binding(InputBinding::A),
+            InputAction::A
+        );
+        assert_eq!(
+            super::input_action_for_binding(InputBinding::DPadUp),
+            InputAction::DPadUp
+        );
+        assert_eq!(
+            super::egui_key_for_config(KeyboardKey::Space),
+            egui::Key::Space
+        );
+        assert_eq!(
+            super::egui_key_for_config(KeyboardKey::ArrowLeft),
+            egui::Key::ArrowLeft
+        );
+        assert_eq!(super::egui_key_for_config(KeyboardKey::Y), egui::Key::Y);
     }
 
     #[test]

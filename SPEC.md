@@ -2928,18 +2928,19 @@ Exit criteria:
 
 ---
 
-### Phase 47: Audio Runtime Skeleton
+### Phase 47: Guest IPC v0 and Audio Runtime Skeleton
 
 Goals:
 
-1. audio output abstraction
-2. buffer model
-3. service skeleton
-4. timing tests
+1. guest service IPC v0
+2. audio output abstraction
+3. buffer model
+4. audio service skeleton
+5. timing tests
 
 Exit criteria:
 
-1. simple audio test works
+1. simple audio test works through a guest IPC audio command buffer
 
 ---
 

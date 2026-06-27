@@ -8,12 +8,15 @@ rust-version.workspace = true
 [dependencies]
 nx86-arm64-decode = { path = "../nx86-arm64-decode" }
 nx86-arm64-lift = { path = "../nx86-arm64-lift" }
+nx86-audio = { path = "../nx86-audio" }
 nx86-backend = { path = "../nx86-backend" }
 nx86-core = { path = "../nx86-core" }
 nx86-hle = { path = "../nx86-hle" }
+nx86-input = { path = "../nx86-input" }
 nx86-import = { path = "../nx86-import" }
 nx86-ir = { path = "../nx86-ir" }
 nx86-ir-opt = { path = "../nx86-ir-opt" }
+nx86-service = { path = "../nx86-service" }
 nx86-testsuite = { path = "../nx86-testsuite" }
 nx86-vmm = { path = "../nx86-vmm" }
 thiserror.workspace = true

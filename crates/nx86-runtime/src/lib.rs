@@ -3,10 +3,15 @@ use nx86_arm64_decode::{
     VectorBinaryOp, decode_program,
 };
 use nx86_arm64_lift::lift_program;
+use nx86_audio::{AudioBuffer, AudioRuntime, AudioStatus};
 use nx86_backend::{run_dispatched_function_in, run_tiny_native_block_in};
 use nx86_core::guest::{CpuState, CpuStateDiff, Nzcv};
-use nx86_hle::{MinimalServiceTable, SvcOutcome};
+use nx86_hle::{ServiceDispatcher, ServiceName, SvcOutcome, SvcRequest};
 use nx86_import::{HomebrewImportError, HomebrewModule};
+use nx86_input::InputSnapshot;
+use nx86_service::{
+    BufferDescriptorKind, GuestCommand, GuestServiceName, ResultCode, SessionHandle, SessionTable,
+};
 use nx86_testsuite::{Framebuffer, MemoryDiff, SyntheticArm64Test, SyntheticTestError};
 use nx86_vmm::{GuestAddress, GuestMemory, PAGE_SIZE, PagePermissions, VmmFault};
 use thiserror::Error;
@@ -55,9 +60,23 @@ impl TinyInterpreter {
     /// loads are observable after execution.
     pub fn run_in(
         &self,
-        mut state: CpuState,
+        state: CpuState,
         memory: &mut GuestMemory,
     ) -> Result<InterpreterResult, InterpreterError> {
+        self.run_in_with_svc_handler(state, memory, |imm, state, _memory| {
+            state.halt(format!("svc #{imm:#x}"));
+        })
+    }
+
+    fn run_in_with_svc_handler<F>(
+        &self,
+        mut state: CpuState,
+        memory: &mut GuestMemory,
+        mut handle_svc: F,
+    ) -> Result<InterpreterResult, InterpreterError>
+    where
+        F: FnMut(u16, &mut CpuState, &mut GuestMemory),
+    {
         let mut trace = Vec::new();
 
         for _ in 0..self.max_steps {
@@ -74,7 +93,7 @@ impl TinyInterpreter {
                 pc,
                 disassembly: instruction.disassembly.clone(),
             });
-            self.execute(instruction, &mut state, memory)?;
+            self.execute(instruction, &mut state, memory, &mut handle_svc)?;
         }
 
         Err(InterpreterError::StepLimit {
@@ -101,6 +120,7 @@ impl TinyInterpreter {
         instruction: &DecodedInstruction,
         state: &mut CpuState,
         memory: &mut GuestMemory,
+        handle_svc: &mut impl FnMut(u16, &mut CpuState, &mut GuestMemory),
     ) -> Result<(), InterpreterError> {
         let next_pc = instruction.address + 4;
         match instruction.kind {
@@ -165,7 +185,7 @@ impl TinyInterpreter {
             }
             InstructionKind::Svc { imm } => {
                 state.set_pc(next_pc);
-                state.halt(format!("svc #{imm:#x}"));
+                handle_svc(imm, state, memory);
             }
             InstructionKind::Store {
                 rt,
@@ -382,6 +402,8 @@ pub struct HomebrewBootResult {
     pub module_name: String,
     pub interpreter: InterpreterResult,
     pub service_outcome: Option<SvcOutcome>,
+    pub service_events: Vec<ServiceEvent>,
+    pub audio_status: AudioStatus,
 }
 
 impl HomebrewBootResult {
@@ -394,7 +416,71 @@ impl HomebrewBootResult {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceEvent {
+    pub imm: u16,
+    pub service: Option<ServiceName>,
+    pub outcome: SvcOutcome,
+    pub guest_ipc: Option<GuestIpcEvent>,
+}
+
+impl ServiceEvent {
+    #[must_use]
+    pub const fn new(imm: u16, outcome: SvcOutcome) -> Self {
+        Self {
+            imm,
+            service: outcome.service(),
+            outcome,
+            guest_ipc: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_guest_ipc(mut self, guest_ipc: GuestIpcEvent) -> Self {
+        self.guest_ipc = Some(guest_ipc);
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestIpcEvent {
+    pub service: GuestServiceName,
+    pub session: SessionHandle,
+    pub command_id: u32,
+    pub result: ResultCode,
+    pub value: u64,
+}
+
 pub fn boot_homebrew(module: &HomebrewModule) -> Result<HomebrewBootResult, HomebrewBootError> {
+    boot_homebrew_with_input(module, InputSnapshot::neutral())
+}
+
+pub fn boot_homebrew_with_input(
+    module: &HomebrewModule,
+    input: InputSnapshot,
+) -> Result<HomebrewBootResult, HomebrewBootError> {
+    boot_homebrew_with_input_provider(module, || input)
+}
+
+pub fn boot_homebrew_with_input_provider<F>(
+    module: &HomebrewModule,
+    mut input_provider: F,
+) -> Result<HomebrewBootResult, HomebrewBootError>
+where
+    F: FnMut() -> InputSnapshot,
+{
+    let mut audio = AudioRuntime::null("deterministic homebrew audio");
+    boot_homebrew_with_input_provider_and_audio(module, &mut input_provider, &mut audio)
+}
+
+pub fn boot_homebrew_with_input_provider_and_audio<F>(
+    module: &HomebrewModule,
+    mut input_provider: F,
+    audio: &mut AudioRuntime,
+) -> Result<HomebrewBootResult, HomebrewBootError>
+where
+    F: FnMut() -> InputSnapshot,
+{
     let instructions = decode_program(module.program_bytes(), module.program_load_address())?;
     let mut memory = GuestMemory::new_logical();
     module.map_into(&mut memory)?;
@@ -403,30 +489,186 @@ pub fn boot_homebrew(module: &HomebrewModule) -> Result<HomebrewBootResult, Home
     initial_state.set_pc(module.entry_point());
     initial_state.set_sp(module.stack_top());
 
-    let interpreter =
-        TinyInterpreter::new(instructions.clone()).run_in(initial_state, &mut memory)?;
-    let service_outcome = svc_immediate_for_halt(&interpreter.final_state, &instructions)
-        .map(|imm| MinimalServiceTable::new().handle_svc(imm, interpreter.final_state.x(0)));
+    let services = ServiceDispatcher::new();
+    let mut sessions = SessionTable::new();
+    let mut service_events = Vec::new();
+    let mut service_outcome = None;
+    let interpreter = TinyInterpreter::new(instructions).run_in_with_svc_handler(
+        initial_state,
+        &mut memory,
+        |imm, state, memory| {
+            let (status, value, guest_ipc) = match imm {
+                5 => {
+                    let session = sessions.open_service(GuestServiceName::AudioOut);
+                    (ResultCode::SUCCESS, u64::from(session.0), None)
+                }
+                6 => dispatch_audio_ipc(state, memory, &sessions, audio),
+                _ => (ResultCode::SUCCESS, 0, None),
+            };
+            let input = if imm == 4 {
+                input_provider()
+            } else {
+                InputSnapshot::neutral()
+            };
+            let request = svc_request_from_state(imm, state, input)
+                .with_audio_result(u64::from(status.0), value);
+            let outcome = services.handle_svc(request);
+            let event = match guest_ipc {
+                Some(guest_ipc) => ServiceEvent::new(imm, outcome).with_guest_ipc(guest_ipc),
+                None => ServiceEvent::new(imm, outcome),
+            };
+            service_events.push(event);
+            service_outcome = Some(outcome);
+            apply_svc_outcome(imm, outcome, state);
+        },
+    )?;
 
     Ok(HomebrewBootResult {
         module_name: module.metadata().name.clone(),
         interpreter,
         service_outcome,
+        service_events,
+        audio_status: audio.status(),
     })
 }
 
-fn svc_immediate_for_halt(state: &CpuState, instructions: &[DecodedInstruction]) -> Option<u16> {
-    if !state.halted() {
+pub const AUDIO_COMMAND_APPEND_BUFFER: u32 = 1;
+pub const AUDIO_COMMAND_QUERY_STATUS: u32 = 2;
+pub const AUDIO_COMMAND_ADVANCE_CLOCK: u32 = 3;
+
+fn dispatch_audio_ipc(
+    state: &CpuState,
+    memory: &mut GuestMemory,
+    sessions: &SessionTable,
+    audio: &mut AudioRuntime,
+) -> (ResultCode, u64, Option<GuestIpcEvent>) {
+    let command_address = state.x(0);
+    let command_size = match usize::try_from(state.x(1)) {
+        Ok(size) => size,
+        Err(_) => return (ResultCode::INVALID_COMMAND_BUFFER, 0, None),
+    };
+    let command_bytes = match memory.read(GuestAddress(command_address), command_size) {
+        Ok(bytes) => bytes,
+        Err(_) => return (ResultCode::INVALID_COMMAND_BUFFER, 0, None),
+    };
+    let command = match GuestCommand::from_bytes(&command_bytes) {
+        Ok(command) => command,
+        Err(_) => return (ResultCode::INVALID_COMMAND_BUFFER, 0, None),
+    };
+    let routed = match sessions.route(&command) {
+        Ok(routed) => routed,
+        Err(_) => {
+            let result = ResultCode::INVALID_HANDLE;
+            return (result, 0, Some(guest_ipc_event(&command, result, 0)));
+        }
+    };
+    if routed.service != GuestServiceName::AudioOut {
+        let result = ResultCode::UNSUPPORTED_COMMAND;
+        return (result, 0, Some(guest_ipc_event(&command, result, 0)));
+    }
+
+    let (result, value) = match command.command_id {
+        AUDIO_COMMAND_APPEND_BUFFER => append_audio_buffer(&command, memory, audio),
+        AUDIO_COMMAND_QUERY_STATUS => {
+            let status = audio.status();
+            (ResultCode::SUCCESS, status.queued_frames)
+        }
+        AUDIO_COMMAND_ADVANCE_CLOCK => {
+            let frames = command.payload.first().copied().unwrap_or(0);
+            audio.advance_test_clock(frames);
+            let status = audio.status();
+            (ResultCode::SUCCESS, status.queued_frames)
+        }
+        _ => (ResultCode::UNSUPPORTED_COMMAND, 0),
+    };
+    (
+        result,
+        value,
+        Some(guest_ipc_event(&command, result, value)),
+    )
+}
+
+fn append_audio_buffer(
+    command: &GuestCommand,
+    memory: &GuestMemory,
+    audio: &mut AudioRuntime,
+) -> (ResultCode, u64) {
+    let Some(descriptor) = command.descriptors.iter().find(|descriptor| {
+        matches!(
+            descriptor.kind,
+            BufferDescriptorKind::Static
+                | BufferDescriptorKind::Send
+                | BufferDescriptorKind::Exchange
+        )
+    }) else {
+        return (ResultCode::INVALID_COMMAND_BUFFER, 0);
+    };
+    let Ok(size) = usize::try_from(descriptor.size) else {
+        return (ResultCode::INVALID_COMMAND_BUFFER, 0);
+    };
+    let Ok(bytes) = memory.read(GuestAddress(descriptor.address), size) else {
+        return (ResultCode::INVALID_COMMAND_BUFFER, 0);
+    };
+    let Some(sample_rate) = command
+        .payload
+        .first()
+        .and_then(|value| u32::try_from(*value).ok())
+    else {
+        return (ResultCode::INVALID_COMMAND_BUFFER, 0);
+    };
+    let Some(samples) = stereo_f32_samples_from_bytes(&bytes) else {
+        return (ResultCode::INVALID_COMMAND_BUFFER, 0);
+    };
+    let Ok(buffer) = AudioBuffer::stereo_f32(samples, sample_rate) else {
+        return (ResultCode::INVALID_COMMAND_BUFFER, 0);
+    };
+    match audio.enqueue(buffer) {
+        Ok(queued_frames) => (ResultCode::SUCCESS, queued_frames),
+        Err(_) => (ResultCode::UNSUPPORTED_COMMAND, 0),
+    }
+}
+
+fn stereo_f32_samples_from_bytes(bytes: &[u8]) -> Option<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) {
         return None;
     }
-    let svc_pc = state.pc().checked_sub(4)?;
-    instructions
-        .iter()
-        .find(|instruction| instruction.address == svc_pc)
-        .and_then(|instruction| match instruction.kind {
-            InstructionKind::Svc { imm } => Some(imm),
-            _ => None,
-        })
+    let mut samples = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        let mut sample = [0; 4];
+        sample.copy_from_slice(chunk);
+        samples.push(f32::from_le_bytes(sample));
+    }
+    Some(samples)
+}
+
+fn guest_ipc_event(command: &GuestCommand, result: ResultCode, value: u64) -> GuestIpcEvent {
+    GuestIpcEvent {
+        service: command.service,
+        session: command.session,
+        command_id: command.command_id,
+        result,
+        value,
+    }
+}
+
+fn svc_request_from_state(imm: u16, state: &CpuState, input: InputSnapshot) -> SvcRequest {
+    let mut args = [0; 8];
+    for (index, arg) in args.iter_mut().enumerate() {
+        *arg = state.x(index as u8);
+    }
+    SvcRequest::new(imm, args, state.thread().thread_id, input.packed())
+}
+
+fn apply_svc_outcome(imm: u16, outcome: SvcOutcome, state: &mut CpuState) {
+    match outcome {
+        SvcOutcome::Continue { status, value, .. } => {
+            state.set_x(0, status);
+            state.set_x(1, value);
+        }
+        SvcOutcome::Exit { .. } | SvcOutcome::Unhandled { .. } => {
+            state.halt(format!("svc #{imm:#x}"));
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -757,13 +999,21 @@ pub enum InterpreterError {
 #[cfg(test)]
 mod tests {
     use nx86_arm64_decode::decode_program;
+    use nx86_audio::AudioRuntime;
     use nx86_core::guest::CpuState;
-    use nx86_hle::SvcOutcome;
+    use nx86_hle::{ServiceName, SvcOutcome};
     use nx86_import::HomebrewModule;
+    use nx86_input::{ControllerButtons, InputAction, InputSnapshot};
+    use nx86_service::{
+        BufferDescriptor, BufferDescriptorKind, GuestCommand, GuestServiceName, ResultCode,
+        SessionHandle,
+    };
     use nx86_testsuite::SyntheticArm64Test;
 
     use super::{
-        InterpreterError, NativeStatus, TinyInterpreter, boot_homebrew, run_synthetic_test,
+        AUDIO_COMMAND_APPEND_BUFFER, InterpreterError, NativeStatus, TinyInterpreter,
+        boot_homebrew, boot_homebrew_with_input, boot_homebrew_with_input_provider,
+        boot_homebrew_with_input_provider_and_audio, run_synthetic_test,
     };
 
     #[test]
@@ -787,6 +1037,8 @@ mod tests {
         assert_eq!(result.module_name, "exit-code");
         assert_eq!(result.exit_code(), Some(42));
         assert_eq!(result.service_outcome, Some(SvcOutcome::Exit { code: 42 }));
+        assert_eq!(result.service_events.len(), 1);
+        assert_eq!(result.service_events[0].imm, 0);
         assert_eq!(result.interpreter.final_state.pc(), 0x8008);
         assert_eq!(result.interpreter.final_state.sp(), 0x9000_0000);
     }
@@ -802,7 +1054,7 @@ mod tests {
             load-address = "0x8000"
             entry-point = "0x8000"
             stack-top = "0x9000_0000"
-            arm64-hex = "21 00 00 D4"
+            arm64-hex = "E1 00 00 D4"
             "#,
         )
         .expect("homebrew should parse");
@@ -812,8 +1064,232 @@ mod tests {
         assert_eq!(result.exit_code(), None);
         assert_eq!(
             result.service_outcome,
-            Some(SvcOutcome::Unhandled { imm: 1 })
+            Some(SvcOutcome::Unhandled { imm: 7 })
         );
+        assert_eq!(result.service_events.len(), 1);
+        assert_eq!(result.service_events[0].service, None);
+    }
+
+    #[test]
+    fn homebrew_basic_services_continue_until_exit() {
+        let module = HomebrewModule::parse(
+            r#"
+            [metadata]
+            name = "basic-services"
+
+            [program]
+            load-address = "0x8000"
+            entry-point = "0x8000"
+            stack-top = "0x9000_0000"
+            arm64-hex = "21 00 00 D4 41 00 00 D4 61 00 00 D4 81 00 00 D4 E0 00 80 D2 01 00 00 D4"
+            "#,
+        )
+        .expect("homebrew should parse");
+
+        let result = boot_homebrew(&module).expect("homebrew should boot");
+
+        assert_eq!(result.exit_code(), Some(7));
+        assert_eq!(result.interpreter.trace.len(), 6);
+        assert_eq!(result.interpreter.final_state.pc(), 0x8018);
+        assert_eq!(result.service_events.len(), 5);
+        assert_eq!(
+            result
+                .service_events
+                .iter()
+                .filter_map(|event| event.service)
+                .collect::<Vec<_>>(),
+            vec![
+                ServiceName::FileSystem,
+                ServiceName::Thread,
+                ServiceName::Memory,
+                ServiceName::Input,
+            ]
+        );
+        assert_eq!(
+            result.service_events[1].outcome.service(),
+            Some(ServiceName::Thread)
+        );
+        assert_eq!(
+            result.service_events[2].outcome.service(),
+            Some(ServiceName::Memory)
+        );
+        assert_eq!(
+            result.service_events[3].outcome.service(),
+            Some(ServiceName::Input)
+        );
+    }
+
+    #[test]
+    fn homebrew_input_service_returns_injected_controller_state() {
+        let module = HomebrewModule::parse(
+            r#"
+            [metadata]
+            name = "input-state"
+
+            [program]
+            load-address = "0x8000"
+            entry-point = "0x8000"
+            stack-top = "0x9000_0000"
+            arm64-hex = "81 00 00 D4 01 00 00 D4"
+            "#,
+        )
+        .expect("homebrew should parse");
+        let buttons = ControllerButtons::empty()
+            .with(InputAction::A)
+            .with(InputAction::DPadUp);
+        let input = InputSnapshot::from_buttons(buttons);
+
+        let result = boot_homebrew_with_input(&module, input).expect("homebrew should boot");
+
+        assert_eq!(result.exit_code(), Some(0));
+        assert_eq!(result.interpreter.final_state.x(1), buttons.bits());
+        assert_eq!(result.service_events.len(), 2);
+        assert_eq!(
+            result.service_events[0].outcome,
+            SvcOutcome::Continue {
+                service: ServiceName::Input,
+                status: 0,
+                value: buttons.bits(),
+            }
+        );
+    }
+
+    #[test]
+    fn homebrew_input_provider_is_sampled_for_each_input_service() {
+        let module = HomebrewModule::parse(
+            r#"
+            [metadata]
+            name = "input-provider"
+
+            [program]
+            load-address = "0x8000"
+            entry-point = "0x8000"
+            stack-top = "0x9000_0000"
+            arm64-hex = "81 00 00 D4 81 00 00 D4 01 00 00 D4"
+            "#,
+        )
+        .expect("homebrew should parse");
+        let mut samples = [
+            InputSnapshot::from_buttons(ControllerButtons::empty().with(InputAction::A)),
+            InputSnapshot::from_buttons(ControllerButtons::empty().with(InputAction::B)),
+        ]
+        .into_iter();
+
+        let result = boot_homebrew_with_input_provider(&module, || {
+            samples.next().unwrap_or_else(InputSnapshot::neutral)
+        })
+        .expect("homebrew should boot");
+
+        assert_eq!(result.exit_code(), Some(0));
+        assert_eq!(result.service_events.len(), 3);
+        assert_eq!(
+            result.service_events[0].outcome,
+            SvcOutcome::Continue {
+                service: ServiceName::Input,
+                status: 0,
+                value: ControllerButtons::A,
+            }
+        );
+        assert_eq!(
+            result.service_events[1].outcome,
+            SvcOutcome::Continue {
+                service: ServiceName::Input,
+                status: 0,
+                value: ControllerButtons::B,
+            }
+        );
+    }
+
+    #[test]
+    fn homebrew_audio_service_accepts_guest_ipc_command_buffer() {
+        let pcm = stereo_f32_bytes(&[0.25, -0.25, 0.5, -0.5]);
+        let command = GuestCommand::request(
+            GuestServiceName::AudioOut,
+            SessionHandle(0x100),
+            AUDIO_COMMAND_APPEND_BUFFER,
+        )
+        .with_payload([48_000])
+        .with_descriptor(BufferDescriptor::new(
+            BufferDescriptorKind::Send,
+            0,
+            0x11000,
+            pcm.len() as u64,
+        ));
+        let command_bytes = command.to_bytes();
+        let program = program_bytes(&[
+            svc(5),
+            movz_shift(0, 1, 16),
+            movz(1, command_bytes.len() as u16),
+            svc(6),
+            svc(0),
+        ]);
+        let module_source = format!(
+            r#"
+            [metadata]
+            name = "audio-ipc"
+
+            [program]
+            load-address = "0x8000"
+            entry-point = "0x8000"
+            stack-top = "0x9000_0000"
+            arm64-hex = "{}"
+
+            [[segments]]
+            name = "audio-command"
+            address = "0x10000"
+            permissions = "r"
+            bytes-hex = "{}"
+
+            [[segments]]
+            name = "audio-pcm"
+            address = "0x11000"
+            permissions = "r"
+            bytes-hex = "{}"
+            "#,
+            hex(&program),
+            hex(&command_bytes),
+            hex(&pcm),
+        );
+        let module = HomebrewModule::parse(&module_source).expect("homebrew should parse");
+        let mut audio = AudioRuntime::null("test");
+
+        let result = boot_homebrew_with_input_provider_and_audio(
+            &module,
+            InputSnapshot::neutral,
+            &mut audio,
+        )
+        .expect("homebrew should boot");
+
+        assert_eq!(result.exit_code(), Some(0));
+        assert_eq!(result.service_events.len(), 3);
+        assert_eq!(
+            result.service_events[0].outcome,
+            SvcOutcome::Continue {
+                service: ServiceName::AudioOut,
+                status: 0,
+                value: 0x100,
+            }
+        );
+        assert_eq!(
+            result.service_events[1].guest_ipc.as_ref().map(|event| {
+                (
+                    event.service,
+                    event.session,
+                    event.command_id,
+                    event.result,
+                    event.value,
+                )
+            }),
+            Some((
+                GuestServiceName::AudioOut,
+                SessionHandle(0x100),
+                AUDIO_COMMAND_APPEND_BUFFER,
+                ResultCode::SUCCESS,
+                2,
+            ))
+        );
+        assert_eq!(result.audio_status.submitted_frames, 2);
+        assert_eq!(result.audio_status.queued_frames, 2);
     }
 
     #[test]
@@ -1261,5 +1737,37 @@ mod tests {
             .expect_err("branch should fail");
 
         assert!(matches!(error, InterpreterError::BranchOutOfProgram { .. }));
+    }
+
+    fn movz(rd: u8, imm16: u16) -> [u8; 4] {
+        (0xD280_0000 | (u32::from(imm16) << 5) | u32::from(rd)).to_le_bytes()
+    }
+
+    fn movz_shift(rd: u8, imm16: u16, shift: u8) -> [u8; 4] {
+        let hw = u32::from(shift / 16);
+        (0xD280_0000 | (hw << 21) | (u32::from(imm16) << 5) | u32::from(rd)).to_le_bytes()
+    }
+
+    fn svc(imm: u16) -> [u8; 4] {
+        (0xD400_0001 | (u32::from(imm) << 5)).to_le_bytes()
+    }
+
+    fn program_bytes(instructions: &[[u8; 4]]) -> Vec<u8> {
+        instructions.iter().flat_map(|bytes| *bytes).collect()
+    }
+
+    fn stereo_f32_bytes(samples: &[f32]) -> Vec<u8> {
+        samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect()
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
