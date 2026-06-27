@@ -5,8 +5,12 @@ edition.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["host-gilrs"]
+host-gilrs = ["dep:gilrs"]
+
 [dependencies]
-gilrs.workspace = true
+gilrs = { workspace = true, optional = true }
 
 [lints]
 workspace = true

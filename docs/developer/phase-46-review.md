@@ -26,6 +26,11 @@ state and sample repeated input service calls.
 Adding `gilrs` pulls in Linux `libudev` support. Both GitHub workflows now
 install `libudev-dev` and `pkg-config` before locked Rust builds.
 
+The Linux x86_64-v4 static-CRT artifact builds `nx86-app` with
+`--no-default-features`, which disables the host gamepad backend and uses the
+deterministic unavailable-gamepad fallback instead of requiring static
+`libudev`.
+
 ### FINDING-3: config compatibility needed defaults (fixed)
 
 The new input config is covered by serde defaults, so existing config files that

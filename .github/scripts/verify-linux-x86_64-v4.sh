@@ -103,7 +103,7 @@ echo "::endgroup::"
 
 echo "::group::Dynamic linking"
 if readelf -l "$binary" | grep -q 'Requesting program interpreter'; then
-  echo "::warning::binary has a dynamic ELF interpreter; this is allowed by the pragmatic GUI artifact profile"
+  echo "binary has a dynamic ELF interpreter; this is allowed by the pragmatic GUI artifact profile"
   readelf -l "$binary" | grep 'Requesting program interpreter'
 else
   echo "binary has no dynamic ELF interpreter"
@@ -121,7 +121,7 @@ else
   ldd_status=$?
   printf '%s\n' "$ldd_output"
   if [[ "$ldd_output" != *"not a dynamic executable"* ]]; then
-    echo "::warning::ldd exited with status $ldd_status"
+    echo "ldd exited with status $ldd_status"
   fi
 fi
 echo "::endgroup::"
@@ -140,6 +140,6 @@ if cpu_supports_x86_64_v4; then
   echo "runtime-smoke output:"
   tail -n 20 "$runtime_log"
 else
-  echo "::warning::skipping worker smoke because this runner cannot execute x86-64-v4 code"
+  echo "skipping worker smoke because this runner cannot execute x86-64-v4 code"
 fi
 echo "::endgroup::"

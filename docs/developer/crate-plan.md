@@ -54,8 +54,8 @@ motion/rumble, or Switch rendering.
 - `nx86-vmm`: 64 GiB guest memory arena, page-backed Linux fastmem, eligibility metadata, checked software page-table helpers, and page permission transitions for loader seeding.
 - `nx86-hle`: skeleton service dispatcher for homebrew exit plus filesystem, thread, memory, input, and audio service stubs.
 - `nx86-service`: guest IPC v0 command/response buffers, sessions, domains, object handles, descriptors, handle transfers, and result codes.
-- `nx86-input`: controller button bitset, input snapshots, and `gilrs` gamepad polling for the Phase 46 input runtime.
-- `nx86-audio`: `cpal` host audio backend, null sink fallback, stereo `f32` buffer queue, frame counters, and deterministic timing hooks.
+- `nx86-input`: controller button bitset, input snapshots, and default-feature `gilrs` gamepad polling for the Phase 46 input runtime.
+- `nx86-audio`: default-feature `cpal` host audio backend, null sink fallback, stereo `f32` buffer queue, frame counters, and deterministic timing hooks.
 - `nx86-debug`: tracing-based logging setup.
 - `nx86-testsuite`: synthetic ARM64 test file format, framebuffer spec, and result diffs.
 - `nx86-vulkan`: internal safe boundary around `ash`.

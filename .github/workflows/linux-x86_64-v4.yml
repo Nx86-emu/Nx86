@@ -89,7 +89,7 @@ jobs:
       - name: Build release artifact
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-cpu=x86-64-v4 -C target-feature=+crt-static -C strip=symbols
-        run: cargo build -p nx86-app --release --target x86_64-unknown-linux-gnu --locked
+        run: cargo build -p nx86-app --release --target x86_64-unknown-linux-gnu --no-default-features --locked
 
       - name: Verify release artifact
         run: bash .github/scripts/verify-linux-x86_64-v4.sh "$RELEASE_BINARY"
@@ -109,10 +109,13 @@ jobs:
 
           This binary is built with:
             RUSTFLAGS="-C target-cpu=x86-64-v4 -C target-feature=+crt-static -C strip=symbols"
+            cargo build -p nx86-app --release --target x86_64-unknown-linux-gnu --no-default-features
 
           The current GUI stack may runtime-load host display, OpenGL/EGL,
           Vulkan, portal, and file-dialog libraries. This artifact is not a
-          fully self-contained musl GUI binary.
+          fully self-contained musl GUI binary. Host cpal audio and gilrs
+          gamepad backends are disabled for this static-CRT artifact; the app
+          uses the built-in null audio sink and unavailable gamepad fallback.
           NOTE
 
           tar -czf "dist/${RELEASE_NAME}.tar.gz" -C dist "$RELEASE_NAME"

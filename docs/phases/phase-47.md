@@ -11,7 +11,9 @@ audio runtime.
   object handles, result codes, handle transfers, buffer descriptors, and binary
   command/response buffer round trips.
 - **Audio output abstraction** - `nx86-audio` owns `AudioRuntime`, a `cpal`
-  host output backend, and a null sink fallback for headless machines.
+  host output backend, and a null sink fallback for headless machines. The
+  host backend is a default Cargo feature so static-CRT artifacts can disable it
+  and ship with the null sink fallback.
 - **Buffer model** - audio buffers are interleaved stereo `f32` samples with a
   non-zero sample rate. The runtime tracks submitted, queued, consumed, and
   underflowed frames.

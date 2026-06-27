@@ -5,6 +5,11 @@ edition.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["host-audio", "host-input"]
+host-audio = ["nx86-gui/host-audio"]
+host-input = ["nx86-gui/host-input"]
+
 [[bin]]
 name = "nx86-app"
 path = "src/main.rs"
@@ -12,7 +17,7 @@ path = "src/main.rs"
 [dependencies]
 nx86-core = { path = "../nx86-core" }
 nx86-debug = { path = "../nx86-debug" }
-nx86-gui = { path = "../nx86-gui" }
+nx86-gui = { path = "../nx86-gui", default-features = false }
 tracing.workspace = true
 
 [lints]

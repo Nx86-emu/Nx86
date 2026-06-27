@@ -10,6 +10,8 @@ from keyboard mapping, gamepad polling, or an injected test snapshot.
   snapshots, and action labels for homebrew-visible input.
 - **Gamepad backend** - `nx86-input` polls connected controllers through
   `gilrs` 0.11.2 and maps common gamepad buttons to the Nx86 controller state.
+  This backend is a default Cargo feature; release artifacts may disable it and
+  fall back to the deterministic unavailable-gamepad state.
 - **Keyboard mapping** - `nx86-core` persists default keyboard bindings in
   `AppConfig`, and `nx86-gui` translates egui key state into controller bits.
 - **Controller config UI** - Settings shows gamepad backend status, current

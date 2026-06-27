@@ -1,8 +1,8 @@
-use std::{
-    collections::VecDeque,
-    sync::{Arc, Mutex},
-};
+use std::collections::VecDeque;
+#[cfg(feature = "host-cpal")]
+use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "host-cpal")]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use thiserror::Error;
 
@@ -97,12 +97,20 @@ pub struct AudioRuntime {
 impl AudioRuntime {
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            backend: CpalAudioBackend::try_new()
-                .map(AudioBackend::Cpal)
-                .unwrap_or_else(|error| {
-                    AudioBackend::Null(NullAudioSink::new(Some(error.to_string())))
-                }),
+        #[cfg(feature = "host-cpal")]
+        {
+            Self {
+                backend: CpalAudioBackend::try_new()
+                    .map(AudioBackend::Cpal)
+                    .unwrap_or_else(|error| {
+                        AudioBackend::Null(NullAudioSink::new(Some(error.to_string())))
+                    }),
+            }
+        }
+
+        #[cfg(not(feature = "host-cpal"))]
+        {
+            Self::null("host audio backend disabled at build time")
         }
     }
 
@@ -138,6 +146,7 @@ impl Default for AudioRuntime {
 }
 
 enum AudioBackend {
+    #[cfg(feature = "host-cpal")]
     Cpal(CpalAudioBackend),
     Null(NullAudioSink),
 }
@@ -145,6 +154,7 @@ enum AudioBackend {
 impl AudioBackend {
     fn enqueue(&mut self, buffer: AudioBuffer) -> Result<u64, AudioError> {
         match self {
+            #[cfg(feature = "host-cpal")]
             Self::Cpal(backend) => backend.enqueue(buffer),
             Self::Null(backend) => Ok(backend.enqueue(buffer)),
         }
@@ -152,6 +162,7 @@ impl AudioBackend {
 
     fn advance_test_clock(&mut self, frames: u64) {
         match self {
+            #[cfg(feature = "host-cpal")]
             Self::Cpal(_) => {}
             Self::Null(backend) => backend.advance(frames),
         }
@@ -159,6 +170,7 @@ impl AudioBackend {
 
     fn set_muted(&mut self, muted: bool) {
         match self {
+            #[cfg(feature = "host-cpal")]
             Self::Cpal(backend) => backend.set_muted(muted),
             Self::Null(backend) => backend.set_muted(muted),
         }
@@ -166,18 +178,21 @@ impl AudioBackend {
 
     fn status(&self) -> AudioStatus {
         match self {
+            #[cfg(feature = "host-cpal")]
             Self::Cpal(backend) => backend.status(),
             Self::Null(backend) => backend.status(),
         }
     }
 }
 
+#[cfg(feature = "host-cpal")]
 struct CpalAudioBackend {
     shared: Arc<Mutex<AudioShared>>,
     _stream: cpal::Stream,
     device_name: Option<String>,
 }
 
+#[cfg(feature = "host-cpal")]
 impl CpalAudioBackend {
     fn try_new() -> Result<Self, AudioInitError> {
         let host = cpal::default_host();
@@ -317,6 +332,7 @@ impl AudioShared {
         }
     }
 
+    #[cfg(feature = "host-cpal")]
     fn fill_f32(&mut self, output: &mut [f32]) {
         let output_channels = usize::from(self.output_channels);
         for frame in output.chunks_mut(output_channels) {
@@ -377,6 +393,7 @@ impl AudioShared {
     }
 }
 
+#[cfg(feature = "host-cpal")]
 fn build_stream_f32(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -392,6 +409,7 @@ fn build_stream_f32(
         .map_err(AudioInitError::BuildStream)
 }
 
+#[cfg(feature = "host-cpal")]
 fn build_stream_i16(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -413,6 +431,7 @@ fn build_stream_i16(
         .map_err(AudioInitError::BuildStream)
 }
 
+#[cfg(feature = "host-cpal")]
 fn build_stream_u16(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -435,6 +454,7 @@ fn build_stream_u16(
         .map_err(AudioInitError::BuildStream)
 }
 
+#[cfg(feature = "host-cpal")]
 fn fill_output_f32(output: &mut [f32], shared: &Arc<Mutex<AudioShared>>) {
     if let Ok(mut shared) = shared.lock() {
         shared.fill_f32(output);
@@ -444,6 +464,7 @@ fn fill_output_f32(output: &mut [f32], shared: &Arc<Mutex<AudioShared>>) {
 }
 
 #[derive(Debug, Error)]
+#[cfg(feature = "host-cpal")]
 pub enum AudioInitError {
     #[error("no host audio output device is available")]
     NoOutputDevice,
@@ -469,7 +490,9 @@ pub enum AudioError {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioBackendKind, AudioBuffer, AudioError, AudioRuntime, AudioShared};
+    #[cfg(feature = "host-cpal")]
+    use super::AudioShared;
+    use super::{AudioBackendKind, AudioBuffer, AudioError, AudioRuntime};
 
     #[test]
     fn stereo_buffer_rejects_unaligned_sample_count() {
@@ -514,6 +537,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "host-cpal")]
     fn host_output_channel_count_does_not_change_stereo_queue_accounting() {
         let mut shared = AudioShared::new(48_000, 4, false);
         assert_eq!(shared.enqueue(vec![0.2, -0.2, 0.5, -0.5], 48_000), 2);

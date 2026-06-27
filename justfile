@@ -145,7 +145,7 @@ release-build-linux:
         exit 1
     fi
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-C target-cpu=x86-64-v4 -C target-feature=+crt-static -C strip=symbols' \
-        cargo build -p nx86-app --release --target {{ linux_target }} --locked
+        cargo build -p nx86-app --release --target {{ linux_target }} --no-default-features --locked
 
 # Inspect and smoke-test a Linux x86_64-v4 release artifact.
 release-verify-linux binary=release_binary:

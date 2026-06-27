@@ -5,14 +5,19 @@ edition.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["host-audio", "host-input"]
+host-audio = ["nx86-audio/host-cpal"]
+host-input = ["nx86-input/host-gilrs"]
+
 [dependencies]
 nx86-arm64-decode = { path = "../nx86-arm64-decode" }
 nx86-arm64-lift = { path = "../nx86-arm64-lift" }
-nx86-audio = { path = "../nx86-audio" }
+nx86-audio = { path = "../nx86-audio", default-features = false }
 nx86-backend = { path = "../nx86-backend" }
 nx86-core = { path = "../nx86-core" }
 nx86-hle = { path = "../nx86-hle" }
-nx86-input = { path = "../nx86-input" }
+nx86-input = { path = "../nx86-input", default-features = false }
 nx86-import = { path = "../nx86-import" }
 nx86-ir = { path = "../nx86-ir" }
 nx86-ir-opt = { path = "../nx86-ir-opt" }

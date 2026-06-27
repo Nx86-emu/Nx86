@@ -1,3 +1,4 @@
+#[cfg(feature = "host-gilrs")]
 use gilrs::{Button, EventType, Gilrs};
 
 pub const CRATE_NAME: &str = "nx86-input";
@@ -206,6 +207,7 @@ impl GamepadStatus {
 
 #[derive(Debug)]
 pub struct GamepadRuntime {
+    #[cfg(feature = "host-gilrs")]
     gilrs: Option<Gilrs>,
     buttons: ControllerButtons,
     status: GamepadStatus,
@@ -214,26 +216,35 @@ pub struct GamepadRuntime {
 impl GamepadRuntime {
     #[must_use]
     pub fn new() -> Self {
-        match Gilrs::new() {
-            Ok(gilrs) => {
-                let connected_gamepads = gilrs.gamepads().count();
-                Self {
-                    gilrs: Some(gilrs),
-                    buttons: ControllerButtons::empty(),
-                    status: GamepadStatus {
-                        available: true,
-                        connected_gamepads,
-                        last_error: None,
-                    },
+        #[cfg(feature = "host-gilrs")]
+        {
+            match Gilrs::new() {
+                Ok(gilrs) => {
+                    let connected_gamepads = gilrs.gamepads().count();
+                    Self {
+                        gilrs: Some(gilrs),
+                        buttons: ControllerButtons::empty(),
+                        status: GamepadStatus {
+                            available: true,
+                            connected_gamepads,
+                            last_error: None,
+                        },
+                    }
                 }
+                Err(error) => Self::unavailable(error.to_string()),
             }
-            Err(error) => Self::unavailable(error.to_string()),
+        }
+
+        #[cfg(not(feature = "host-gilrs"))]
+        {
+            Self::unavailable("host gamepad backend disabled at build time")
         }
     }
 
     #[must_use]
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
+            #[cfg(feature = "host-gilrs")]
             gilrs: None,
             buttons: ControllerButtons::empty(),
             status: GamepadStatus {
@@ -259,6 +270,12 @@ impl GamepadRuntime {
         &self.status
     }
 
+    #[cfg(not(feature = "host-gilrs"))]
+    pub fn poll(&mut self) -> InputSnapshot {
+        self.snapshot()
+    }
+
+    #[cfg(feature = "host-gilrs")]
     pub fn poll(&mut self) -> InputSnapshot {
         let Some(gilrs) = self.gilrs.as_mut() else {
             return self.snapshot();
@@ -292,6 +309,7 @@ impl Default for GamepadRuntime {
 }
 
 #[must_use]
+#[cfg(feature = "host-gilrs")]
 pub const fn action_for_gilrs_button(button: Button) -> Option<InputAction> {
     match button {
         Button::DPadUp => Some(InputAction::DPadUp),
@@ -314,10 +332,10 @@ pub const fn action_for_gilrs_button(button: Button) -> Option<InputAction> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ControllerButtons, InputAction, InputSnapshot, action_for_gilrs_button,
-        neutral_controller_state,
-    };
+    #[cfg(feature = "host-gilrs")]
+    use super::action_for_gilrs_button;
+    use super::{ControllerButtons, InputAction, InputSnapshot, neutral_controller_state};
+    #[cfg(feature = "host-gilrs")]
     use gilrs::Button;
 
     #[test]
@@ -341,6 +359,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "host-gilrs")]
     fn gilrs_buttons_map_to_controller_actions() {
         assert_eq!(action_for_gilrs_button(Button::South), Some(InputAction::A));
         assert_eq!(action_for_gilrs_button(Button::East), Some(InputAction::B));

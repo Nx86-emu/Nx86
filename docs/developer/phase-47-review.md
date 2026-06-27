@@ -33,6 +33,10 @@ two different IPC domains.
 sink if the host backend or output device is unavailable. Tests use the null
 sink and deterministic frame advancement.
 
+The Linux x86_64-v4 static-CRT artifact builds `nx86-app` with
+`--no-default-features`, disabling the host `cpal` backend and using the null
+sink fallback instead of requiring static `libasound`.
+
 ### FINDING-4: stereo queue accounting depended on host channel count (fixed)
 
 Audio buffers are now queued and counted as stereo PCM frames regardless of the

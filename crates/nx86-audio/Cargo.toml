@@ -5,8 +5,12 @@ edition.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["host-cpal"]
+host-cpal = ["dep:cpal"]
+
 [dependencies]
-cpal.workspace = true
+cpal = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [lints]
