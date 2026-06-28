@@ -159,6 +159,7 @@ fn run_worker(worker: WorkerMode) -> Result<(), Box<dyn std::error::Error>> {
             // local) so it is consistent with the bps-truncated headline; this
             // keeps the GUI's "gated by" comparison exact.
             shader_readiness: coverage.shader_readiness_percent(),
+            pipeline_readiness: 0.0,
             cache_size_bytes: (index as u64) * 4096,
         }))?;
         thread::sleep(Duration::from_millis(120));

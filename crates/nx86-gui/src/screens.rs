@@ -399,6 +399,7 @@ pub fn compile(ui: &mut egui::Ui, state: &mut CompileUiState) -> CompileAction {
         fastmem_coverage: 0.0,
         slowmem_penalty: 0.0,
         shader_readiness: 0.0,
+        pipeline_readiness: 0.0,
         cache_size_bytes: 0,
     });
 

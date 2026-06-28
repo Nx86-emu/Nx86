@@ -16,6 +16,7 @@
 mod context;
 mod error;
 mod offscreen;
+pub mod pipeline_cache;
 mod swapchain;
 
 pub use context::VulkanContext;

@@ -11,6 +11,11 @@ pub const CRATE_NAME: &str = "nx86-import";
 pub const HOMEBREW_FORMAT_VERSION: u32 = 1;
 pub const DEFAULT_STACK_SIZE: u64 = 64 * 1024;
 
+const MAX_STACK_SIZE: u64 = 8 * 1024 * 1024;
+const MAX_HEX_DECODE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SEGMENTS: usize = 256;
+const MAX_TOTAL_MAPPED_BYTES: u64 = 256 * 1024 * 1024;
+
 #[must_use]
 pub const fn crate_name() -> &'static str {
     CRATE_NAME
@@ -46,6 +51,12 @@ impl HomebrewModule {
         if stack_size == 0 {
             return Err(HomebrewImportError::EmptyStack);
         }
+        if stack_size > MAX_STACK_SIZE {
+            return Err(HomebrewImportError::StackTooLarge {
+                max: MAX_STACK_SIZE,
+                got: stack_size,
+            });
+        }
 
         let bytes = decode_hex(&parsed.program.arm64_hex)?;
         if bytes.is_empty() {
@@ -73,6 +84,12 @@ impl HomebrewModule {
             arm64_bytes: bytes,
         };
         let mut segments = Vec::new();
+        if parsed.segments.len() > MAX_SEGMENTS {
+            return Err(HomebrewImportError::TooManySegments {
+                max: MAX_SEGMENTS,
+                got: parsed.segments.len(),
+            });
+        }
         for (index, segment) in parsed.segments.into_iter().enumerate() {
             let address = parse_u64(&segment.address, "segments.address")?;
             let bytes = decode_hex(&segment.bytes_hex)?;
@@ -150,6 +167,25 @@ impl HomebrewModule {
     }
 
     pub fn map_into(&self, memory: &mut GuestMemory) -> Result<(), HomebrewImportError> {
+        let mut total_bytes: u64 = self.program.arm64_bytes.len() as u64;
+        for segment in &self.segments {
+            total_bytes = total_bytes.checked_add(segment.bytes.len() as u64).ok_or(
+                HomebrewImportError::AddressOverflow {
+                    name: "total mapping".to_owned(),
+                },
+            )?;
+        }
+        total_bytes = total_bytes.checked_add(self.program.stack_size).ok_or(
+            HomebrewImportError::AddressOverflow {
+                name: "total mapping".to_owned(),
+            },
+        )?;
+        if total_bytes > MAX_TOTAL_MAPPED_BYTES {
+            return Err(HomebrewImportError::TotalMappingTooLarge {
+                max: MAX_TOTAL_MAPPED_BYTES,
+                got: total_bytes,
+            });
+        }
         map_bytes(
             memory,
             self.program.load_address,
@@ -325,6 +361,13 @@ fn decode_hex(source: &str) -> Result<Vec<u8>, HomebrewImportError> {
         .collect();
     if !compact.len().is_multiple_of(2) {
         return Err(HomebrewImportError::OddHexLength);
+    }
+    let decoded_len = compact.len() / 2;
+    if decoded_len > MAX_HEX_DECODE_BYTES {
+        return Err(HomebrewImportError::ProgramTooLarge {
+            max: MAX_HEX_DECODE_BYTES,
+            got: decoded_len,
+        });
     }
 
     let mut bytes = Vec::with_capacity(compact.len() / 2);
@@ -518,6 +561,14 @@ pub enum HomebrewImportError {
     },
     #[error("stack size must be non-zero")]
     EmptyStack,
+    #[error("stack size {got} exceeds maximum {max}")]
+    StackTooLarge { max: u64, got: u64 },
+    #[error("decoded program bytes {got} exceed maximum {max}")]
+    ProgramTooLarge { max: usize, got: usize },
+    #[error("segment count {got} exceeds maximum {max}")]
+    TooManySegments { max: usize, got: usize },
+    #[error("total mapped bytes {got} exceed maximum {max}")]
+    TotalMappingTooLarge { max: u64, got: u64 },
     #[error("stack top is below stack size")]
     StackUnderflow,
     #[error("range `{name}` overflows the guest address space")]
@@ -668,5 +719,14 @@ mod tests {
             error,
             HomebrewImportError::InvalidPermissions { .. }
         ));
+    }
+
+    #[test]
+    fn rejects_stack_size_above_maximum() {
+        let source = SIMPLE.replace("stack-size = \"0x4000\"", "stack-size = \"0x900000\"");
+
+        let error = HomebrewModule::parse(&source).expect_err("stack size should be rejected");
+
+        assert!(matches!(error, HomebrewImportError::StackTooLarge { .. }));
     }
 }

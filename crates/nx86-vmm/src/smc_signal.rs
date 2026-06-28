@@ -10,7 +10,7 @@
 
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 const MAX_EXEC_PAGES: usize = 1024;
 const MAX_SMC_EVENTS: usize = 256;
@@ -37,6 +37,8 @@ static REPROTECT_EVENTS: [AtomicU64; MAX_SMC_EVENTS] = {
 };
 static REPROTECT_HEAD: AtomicUsize = AtomicUsize::new(0);
 static REPROTECT_TAIL: AtomicUsize = AtomicUsize::new(0);
+
+static SMC_OVERFLOW: AtomicBool = AtomicBool::new(false);
 
 // ── Public API (cross-platform, real impl gated) ──────────────────────────
 
@@ -78,14 +80,20 @@ pub fn reprotect_pages() {
     platform::reprotect_pages_impl();
 }
 
+/// Check and clear the SMC overflow flag. Returns `true` if the SMC event
+/// ring overflowed since the last call, meaning some events were dropped and
+/// the dispatch loop should re-scan executable pages conservatively.
+pub fn take_smc_overflow() -> bool {
+    SMC_OVERFLOW.swap(false, Ordering::AcqRel)
+}
+
 // ── Internal helpers (cross-platform) ─────────────────────────────────────
 
 fn push_smc_event(write_address: u64) {
     let tail = SMC_EVENT_TAIL.load(Ordering::Relaxed);
     let next = (tail + 1) % MAX_SMC_EVENTS;
-    // Drop events if the ring is full — the dispatch loop drains faster than
-    // the signal handler can fill it in practice.
     if next == SMC_EVENT_HEAD.load(Ordering::Acquire) {
+        SMC_OVERFLOW.store(true, Ordering::Relaxed);
         return;
     }
     SMC_EVENTS[tail].store(write_address, Ordering::Release);
@@ -96,6 +104,9 @@ fn push_reprotect_event(host_page_addr: u64) {
     let tail = REPROTECT_TAIL.load(Ordering::Relaxed);
     let next = (tail + 1) % MAX_SMC_EVENTS;
     if next == REPROTECT_HEAD.load(Ordering::Acquire) {
+        // Ring full — reprotect inline to avoid leaving pages RWX.
+        // mprotect is async-signal-safe by POSIX.
+        platform::reprotect_one_page(host_page_addr);
         return;
     }
     REPROTECT_EVENTS[tail].store(host_page_addr, Ordering::Release);
@@ -199,6 +210,21 @@ mod platform {
                     libc::PROT_READ | libc::PROT_EXEC,
                 );
             }
+        }
+    }
+
+    /// Immediately re-protect a single page back to RX. Called from
+    /// `push_reprotect_event` when the ring is full. This is async-signal-safe
+    /// because `mprotect` is async-signal-safe by POSIX.
+    pub(super) fn reprotect_one_page(host_page_addr: u64) {
+        // SAFETY: the page was originally mapped by the arena and temporarily
+        // upgraded to RWX by the signal handler. Restoring RX is safe.
+        unsafe {
+            libc::mprotect(
+                host_page_addr as *mut libc::c_void,
+                4096,
+                libc::PROT_READ | libc::PROT_EXEC,
+            );
         }
     }
 
@@ -382,6 +408,8 @@ mod platform {
     }
 
     pub(super) fn reprotect_pages_impl() {}
+
+    pub(super) fn reprotect_one_page(_host_page_addr: u64) {}
 
     pub(super) fn uninstall_smc_handler_impl() {}
 }

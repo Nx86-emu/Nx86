@@ -17,6 +17,7 @@
 mod aot;
 mod cache;
 mod object;
+pub mod pipeline_hints;
 
 use std::fmt;
 use std::str::FromStr;
@@ -47,8 +48,8 @@ pub const fn crate_name() -> &'static str {
 /// Mirrors the `PROFILE_FORMAT_VERSION` convention in `nx86-profile`.
 pub const SHADER_FORMAT_VERSION: u32 = 1;
 
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+pub(crate) const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+pub(crate) const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// The programmable pipeline stage a shader targets.
 ///

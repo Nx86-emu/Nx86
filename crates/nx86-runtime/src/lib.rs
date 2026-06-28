@@ -536,6 +536,9 @@ pub const AUDIO_COMMAND_APPEND_BUFFER: u32 = 1;
 pub const AUDIO_COMMAND_QUERY_STATUS: u32 = 2;
 pub const AUDIO_COMMAND_ADVANCE_CLOCK: u32 = 3;
 
+const MAX_IPC_COMMAND_SIZE: usize = 4 * 1024;
+const MAX_AUDIO_DESCRIPTOR_SIZE: usize = 8 * 1024 * 1024;
+
 fn dispatch_audio_ipc(
     state: &CpuState,
     memory: &mut GuestMemory,
@@ -544,8 +547,8 @@ fn dispatch_audio_ipc(
 ) -> (ResultCode, u64, Option<GuestIpcEvent>) {
     let command_address = state.x(0);
     let command_size = match usize::try_from(state.x(1)) {
-        Ok(size) => size,
-        Err(_) => return (ResultCode::INVALID_COMMAND_BUFFER, 0, None),
+        Ok(size) if size <= MAX_IPC_COMMAND_SIZE => size,
+        _ => return (ResultCode::INVALID_COMMAND_BUFFER, 0, None),
     };
     let command_bytes = match memory.read(GuestAddress(command_address), command_size) {
         Ok(bytes) => bytes,
@@ -606,6 +609,9 @@ fn append_audio_buffer(
     let Ok(size) = usize::try_from(descriptor.size) else {
         return (ResultCode::INVALID_COMMAND_BUFFER, 0);
     };
+    if size > MAX_AUDIO_DESCRIPTOR_SIZE {
+        return (ResultCode::INVALID_COMMAND_BUFFER, 0);
+    }
     let Ok(bytes) = memory.read(GuestAddress(descriptor.address), size) else {
         return (ResultCode::INVALID_COMMAND_BUFFER, 0);
     };

@@ -68,6 +68,8 @@ pub struct NativeCoverage {
     pub cpu_functional_bps: u16,
     /// Shader readiness, in basis points.
     pub shader_readiness_bps: u16,
+    /// Pipeline readiness, in basis points.
+    pub pipeline_readiness_bps: u16,
 }
 
 impl NativeCoverage {
@@ -76,18 +78,28 @@ impl NativeCoverage {
         Self {
             cpu_functional_bps: cpu_functional_bps.min(COVERAGE_FULL_BPS),
             shader_readiness_bps: shader_readiness_bps.min(COVERAGE_FULL_BPS),
+            pipeline_readiness_bps: COVERAGE_FULL_BPS,
         }
     }
 
+    #[must_use]
+    pub fn with_pipeline(mut self, pipeline_readiness_bps: u16) -> Self {
+        self.pipeline_readiness_bps = pipeline_readiness_bps.min(COVERAGE_FULL_BPS);
+        self
+    }
+
     /// The combined headline, in basis points. Min-gate: the weakest axis caps
-    /// the result (so it reaches full scale only when both axes do).
+    /// the result (so it reaches full scale only when all axes do).
     #[must_use]
     pub const fn combined_estimate_bps(self) -> u16 {
-        if self.cpu_functional_bps < self.shader_readiness_bps {
-            self.cpu_functional_bps
-        } else {
-            self.shader_readiness_bps
+        let mut min = self.cpu_functional_bps;
+        if self.shader_readiness_bps < min {
+            min = self.shader_readiness_bps;
         }
+        if self.pipeline_readiness_bps < min {
+            min = self.pipeline_readiness_bps;
+        }
+        min
     }
 
     /// The combined headline as a percentage in `[0, 100]`.
@@ -104,6 +116,11 @@ impl NativeCoverage {
     #[must_use]
     pub fn shader_readiness_percent(self) -> f32 {
         self.shader_readiness_bps as f32 / 100.0
+    }
+
+    #[must_use]
+    pub fn pipeline_readiness_percent(self) -> f32 {
+        self.pipeline_readiness_bps as f32 / 100.0
     }
 
     /// The §15.4 band of the combined headline.
@@ -163,5 +180,20 @@ mod tests {
         assert_eq!(coverage.cpu_functional_bps, COVERAGE_FULL_BPS);
         assert_eq!(coverage.shader_readiness_bps, COVERAGE_FULL_BPS);
         assert_eq!(coverage.band(), CoverageBand::Perfect);
+    }
+
+    #[test]
+    fn three_axis_min_gate() {
+        let coverage = NativeCoverage::new(9_000, 8_000).with_pipeline(7_000);
+        assert_eq!(coverage.combined_estimate_bps(), 7_000);
+        assert_eq!(coverage.band(), CoverageBand::Poor);
+
+        // All three at full = Perfect.
+        let full = NativeCoverage::new(10_000, 10_000).with_pipeline(10_000);
+        assert_eq!(full.band(), CoverageBand::Perfect);
+
+        // Pipeline axis short of full is not Perfect.
+        let partial = NativeCoverage::new(10_000, 10_000).with_pipeline(9_999);
+        assert_ne!(partial.band(), CoverageBand::Perfect);
     }
 }

@@ -1923,6 +1923,8 @@ name = "nx86-vulkan"
 version = "0.0.0"
 dependencies = [
  "ash",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

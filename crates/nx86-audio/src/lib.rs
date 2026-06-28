@@ -9,6 +9,7 @@ use thiserror::Error;
 pub const CRATE_NAME: &str = "nx86-audio";
 pub const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 pub const STEREO_CHANNELS: u16 = 2;
+const MAX_QUEUED_FRAMES: u64 = 480_000;
 
 #[must_use]
 pub const fn crate_name() -> &'static str {
@@ -315,6 +316,9 @@ impl AudioShared {
     fn enqueue(&mut self, samples: Vec<f32>, sample_rate: u32) -> u64 {
         self.sample_rate = sample_rate;
         let frames = samples.len() as u64 / u64::from(STEREO_CHANNELS);
+        if self.queued_frames() + frames > MAX_QUEUED_FRAMES {
+            return self.queued_frames();
+        }
         self.submitted_frames = self.submitted_frames.saturating_add(frames);
         self.samples.extend(samples);
         self.queued_frames()

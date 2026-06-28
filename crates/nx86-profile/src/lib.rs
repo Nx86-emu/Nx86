@@ -20,6 +20,8 @@ pub const CRATE_NAME: &str = "nx86-profile";
 pub const PROFILE_FORMAT_VERSION: u32 = 1;
 /// Maximum serialized size of one profile record accepted by the reader.
 pub const MAX_PROFILE_RECORD_BYTES: usize = 16 * 1024;
+/// Maximum profile file size accepted by the reader.
+const MAX_PROFILE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 #[must_use]
 pub const fn crate_name() -> &'static str {
@@ -145,6 +147,13 @@ impl ProfileWriter {
             .is_file()
         {
             return Err(ProfileError::NotRegularFile { path });
+        }
+        let file_len = file
+            .metadata()
+            .map_err(|source| ProfileError::io(&path, source))?
+            .len();
+        if file_len > MAX_PROFILE_FILE_BYTES {
+            return Err(ProfileError::FileTooLarge);
         }
         lock_exclusive(&file, &path)?;
 
@@ -303,6 +312,9 @@ pub fn read_profile(path: impl AsRef<Path>) -> Result<ProfileLog, ProfileError> 
         return Err(ProfileError::NotRegularFile {
             path: path.to_path_buf(),
         });
+    }
+    if metadata.len() > MAX_PROFILE_FILE_BYTES {
+        return Err(ProfileError::FileTooLarge);
     }
     let mut options = OpenOptions::new();
     options.read(true);

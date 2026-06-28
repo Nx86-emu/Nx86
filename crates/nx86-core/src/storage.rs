@@ -66,6 +66,14 @@ impl StorageLayout {
         self.title_dir(title_id).join("cache").join("shaders")
     }
 
+    /// Per-title pipeline cache directory (`cache/pipelines/`), created by
+    /// [`Self::ensure_title_dirs`]. Phase 51 stores the Vulkan pipeline cache
+    /// blob here.
+    #[must_use]
+    pub fn pipeline_cache_dir(&self, title_id: &str) -> PathBuf {
+        self.title_dir(title_id).join("cache").join("pipelines")
+    }
+
     pub fn ensure_base_dirs(&self) -> Result<(), StorageError> {
         for path in [
             &self.data_root,
@@ -181,6 +189,18 @@ mod tests {
         assert_eq!(
             layout.shader_cache_dir("0100ABCD12345678"),
             layout.title_dir("0100ABCD12345678").join("cache/shaders")
+        );
+    }
+
+    #[test]
+    fn pipeline_cache_dir_is_under_the_title_cache_folder() {
+        let root = tempdir().expect("temp dir should be created");
+        let storage =
+            StorageConfig::from_roots(root.path().join("data"), root.path().join("cache"));
+        let layout = StorageLayout::from_config(root.path().join("config"), &storage);
+        assert_eq!(
+            layout.pipeline_cache_dir("0100ABCD12345678"),
+            layout.title_dir("0100ABCD12345678").join("cache/pipelines")
         );
     }
 }

@@ -77,6 +77,10 @@ pub struct CompileProgress {
     /// `native_coverage_estimate` via the min-gate in [`crate::coverage`].
     #[serde(default)]
     pub shader_readiness: f32,
+    /// Pipeline readiness percentage (Phase 51), folded into
+    /// `native_coverage_estimate` via the min-gate in [`crate::coverage`].
+    #[serde(default)]
+    pub pipeline_readiness: f32,
     pub cache_size_bytes: u64,
 }
 
@@ -179,6 +183,7 @@ mod tests {
             fastmem_coverage: 90.0,
             slowmem_penalty: 10.0,
             shader_readiness: 60.0,
+            pipeline_readiness: 0.0,
             cache_size_bytes: 4096,
         });
 

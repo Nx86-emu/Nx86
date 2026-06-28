@@ -4,6 +4,9 @@ use nx86_core::guest::{CpuState, CpuStateDiff, RegisterName, RegisterParseError,
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+const MAX_HEX_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FRAMEBUFFER_DIMENSION: u32 = 8192;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub struct SyntheticArm64Test {
@@ -18,6 +21,24 @@ pub struct SyntheticArm64Test {
 impl SyntheticArm64Test {
     pub fn parse(source: &str) -> Result<Self, SyntheticTestError> {
         let mut test: Self = toml::from_str(source).map_err(SyntheticTestError::Toml)?;
+        if let Some(ref fb) = test.framebuffer {
+            if fb.width > MAX_FRAMEBUFFER_DIMENSION || fb.height > MAX_FRAMEBUFFER_DIMENSION {
+                return Err(SyntheticTestError::FramebufferTooLarge {
+                    max_dimension: MAX_FRAMEBUFFER_DIMENSION,
+                    width: fb.width,
+                    height: fb.height,
+                });
+            }
+            let _ = fb
+                .width
+                .checked_mul(fb.height)
+                .and_then(|area| area.checked_mul(4))
+                .ok_or(SyntheticTestError::FramebufferTooLarge {
+                    max_dimension: MAX_FRAMEBUFFER_DIMENSION,
+                    width: fb.width,
+                    height: fb.height,
+                })?;
+        }
         test.program.bytes = decode_hex(&test.program.arm64_hex)?;
         for range in &mut test.expected.memory {
             range.bytes = decode_hex(&range.bytes_hex)?;
@@ -294,6 +315,14 @@ pub enum SyntheticTestError {
     InvalidEntryPoint { value: String },
     #[error("invalid memory address `{value}`")]
     InvalidMemoryAddress { value: String },
+    #[error("decoded hex bytes {got} exceed maximum {max}")]
+    HexTooLarge { max: usize, got: usize },
+    #[error("framebuffer dimensions {width}x{height} exceed maximum {max_dimension}")]
+    FramebufferTooLarge {
+        max_dimension: u32,
+        width: u32,
+        height: u32,
+    },
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
@@ -314,6 +343,13 @@ fn decode_hex(source: &str) -> Result<Vec<u8>, SyntheticTestError> {
 
     if !compact.len().is_multiple_of(2) {
         return Err(SyntheticTestError::OddHexLength);
+    }
+    let decoded_len = compact.len() / 2;
+    if decoded_len > MAX_HEX_BYTES {
+        return Err(SyntheticTestError::HexTooLarge {
+            max: MAX_HEX_BYTES,
+            got: decoded_len,
+        });
     }
 
     let mut bytes = Vec::with_capacity(compact.len() / 2);
