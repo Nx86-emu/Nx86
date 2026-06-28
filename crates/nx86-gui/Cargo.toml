@@ -22,6 +22,7 @@ nx86-input = { path = "../nx86-input", default-features = false }
 nx86-inspector = { path = "../nx86-inspector" }
 nx86-runtime = { path = "../nx86-runtime", default-features = false }
 nx86-scheduler = { path = "../nx86-scheduler" }
+nx86-shader = { path = "../nx86-shader" }
 nx86-testsuite = { path = "../nx86-testsuite" }
 nx86-title-db = { path = "../nx86-title-db" }
 nx86-vmm = { path = "../nx86-vmm" }

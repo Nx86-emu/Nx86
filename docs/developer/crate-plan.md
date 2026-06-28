@@ -65,7 +65,12 @@ motion/rumble, or Switch rendering.
   stay inside this crate.
 - `nx86-gpu`: renderer orchestration above `nx86-vulkan` — selects the Vulkan
   device when present, else a deterministic CPU test-card fallback, and yields
-  `RenderedFrame` RGBA8 bytes for the GUI framebuffer view.
+  the shared `nx86_testsuite::Framebuffer` RGBA8 bytes for the GUI framebuffer
+  view.
+- `nx86-shader`: shader translation skeleton — `ShaderStage`/`ShaderMetadata`
+  model, FNV-1a `ShaderHash`, a deterministic placeholder `translate` path, the
+  integrity-checked `.nxshader` object container, and a `ShaderCache` (mirroring
+  `nx86-cache`) over a title's `cache/shaders/` folder. No real SPIR-V/GPU yet.
 
 ## Skeleton Crates
 

@@ -58,6 +58,14 @@ impl StorageLayout {
             .join(RUNTIME_PROFILE_FILE)
     }
 
+    /// Per-title shader object cache directory (`cache/shaders/`), created by
+    /// [`Self::ensure_title_dirs`]. Phase 49 stores `.nxshader` objects here,
+    /// kept separate from the CPU cache per SPEC §33.2.
+    #[must_use]
+    pub fn shader_cache_dir(&self, title_id: &str) -> PathBuf {
+        self.title_dir(title_id).join("cache").join("shaders")
+    }
+
     pub fn ensure_base_dirs(&self) -> Result<(), StorageError> {
         for path in [
             &self.data_root,
@@ -160,5 +168,19 @@ mod tests {
         assert!(title_root.join("cache/cpu").is_dir());
         assert!(title_root.join("profiles").is_dir());
         assert!(title_root.join("inspector").is_dir());
+        // Phase 49 shader cache folder is part of the required layout.
+        assert!(layout.shader_cache_dir("0100ABCD12345678").is_dir());
+    }
+
+    #[test]
+    fn shader_cache_dir_is_under_the_title_cache_folder() {
+        let root = tempdir().expect("temp dir should be created");
+        let storage =
+            StorageConfig::from_roots(root.path().join("data"), root.path().join("cache"));
+        let layout = StorageLayout::from_config(root.path().join("config"), &storage);
+        assert_eq!(
+            layout.shader_cache_dir("0100ABCD12345678"),
+            layout.title_dir("0100ABCD12345678").join("cache/shaders")
+        );
     }
 }

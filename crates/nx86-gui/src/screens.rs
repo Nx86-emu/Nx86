@@ -99,6 +99,8 @@ pub struct TestUiState {
     /// Backend label from the last Phase 48 demo render (Vulkan device or the
     /// software fallback reason), shown next to the render control.
     pub renderer_backend: Option<String>,
+    /// Status line from the last Phase 49 sample-shader translate/cache action.
+    pub shader_status: Option<String>,
     /// Whether NxIR evaluation agreed with the interpreter, as a status line.
     pub nxir_status: Option<String>,
     /// NxIR text dump from the last run, if lifting succeeded.
@@ -115,6 +117,7 @@ pub enum TestAction {
     PickFile,
     LoadPath,
     RenderDemoFrame,
+    CompileSampleShader,
 }
 
 pub struct SchedulerUiState {
@@ -484,6 +487,15 @@ pub fn tests(ui: &mut egui::Ui, state: &mut TestUiState) -> TestAction {
             ui.monospace(backend);
         }
     });
+
+    ui.add_space(8.0);
+    ui.strong("Shaders (Phase 49)");
+    if ui.button("Translate & cache sample shader").clicked() {
+        action = TestAction::CompileSampleShader;
+    }
+    if let Some(status) = &state.shader_status {
+        ui.monospace(status);
+    }
 
     if let Some((width, height, bytes)) = &state.framebuffer {
         ui.add_space(10.0);

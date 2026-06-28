@@ -1624,6 +1624,9 @@ dependencies = [
  "nx86-debug",
  "nx86-gpu",
  "nx86-gui",
+ "nx86-shader",
+ "nx86-testsuite",
+ "tempfile",
  "tracing",
 ]
 
@@ -1731,6 +1734,7 @@ dependencies = [
  "nx86-inspector",
  "nx86-runtime",
  "nx86-scheduler",
+ "nx86-shader",
  "nx86-testsuite",
  "nx86-title-db",
  "nx86-vmm",
@@ -1871,6 +1875,12 @@ dependencies = [
 [[package]]
 name = "nx86-shader"
 version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "nx86-testsuite"

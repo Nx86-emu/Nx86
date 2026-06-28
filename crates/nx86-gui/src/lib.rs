@@ -548,6 +548,7 @@ impl Nx86App {
                 screens::TestAction::PickFile => self.pick_synthetic_test_file(),
                 screens::TestAction::LoadPath => self.load_synthetic_test_from_state(),
                 screens::TestAction::RenderDemoFrame => self.render_demo_frame(),
+                screens::TestAction::CompileSampleShader => self.compile_sample_shader(),
             },
             AppScreen::Scheduler => match screens::scheduler(ui, &mut self.scheduler_ui) {
                 screens::SchedulerAction::None => {}
@@ -740,6 +741,40 @@ impl Nx86App {
         self.test_ui.renderer_backend = Some(self.renderer.backend().label());
         self.test_ui.framebuffer = Some((frame.width, frame.height, frame.bytes));
         self.test_ui.framebuffer_texture = None;
+    }
+
+    /// Translate the built-in sample shader to a placeholder and cache it
+    /// (Phase 49), surfacing a status line. Caches into the configured shader
+    /// cache dir when storage is available, else a temp dir.
+    fn compile_sample_shader(&mut self) {
+        self.test_ui.shader_status = Some(
+            self.try_compile_sample_shader()
+                .unwrap_or_else(|error| format!("shader compile/cache failed: {error}")),
+        );
+    }
+
+    fn try_compile_sample_shader(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let shader = nx86_testsuite::SyntheticShader::sample();
+        let stage: nx86_shader::ShaderStage = shader.metadata.stage.parse()?;
+        let translated =
+            nx86_shader::translate(stage, &shader.source.bytes, &shader.metadata.entry);
+
+        // A stable demo cache dir keyed by process id avoids cross-run clashes
+        // without needing a title context for this skeleton demonstration.
+        let dir = std::env::temp_dir().join(format!("nx86-shader-demo-{}", std::process::id()));
+        let cache = nx86_shader::ShaderCache::open(dir)?;
+        let entry = cache.insert(&translated.to_object())?;
+        let check = cache.full_check(translated.metadata.source_hash)?;
+        let cached = cache.scan()?.object_count();
+
+        Ok(format!(
+            "{stage} '{}' -> {:?}, cached {} ({} B, check={:?}, {cached} object(s))",
+            shader.metadata.name,
+            translated.metadata.status,
+            entry.file_name,
+            entry.size_bytes,
+            check,
+        ))
     }
 
     fn load_synthetic_test_from_state(&mut self) {
@@ -1040,6 +1075,26 @@ mod tests {
                 .as_deref()
                 .is_some_and(|backend| !backend.is_empty()),
             "the backend label must be recorded"
+        );
+    }
+
+    #[test]
+    fn compile_sample_shader_populates_shader_status() {
+        let mut app = Nx86App::new_for_test(AppConfig::default());
+        app.compile_sample_shader();
+
+        let status = app
+            .test_ui
+            .shader_status
+            .as_deref()
+            .expect("shader compile should set a status line");
+        assert!(
+            status.contains("vertex") && status.contains("Placeholder"),
+            "status should describe the translated placeholder: {status}"
+        );
+        assert!(
+            status.contains("check=Ok"),
+            "the cached shader should pass its integrity check: {status}"
         );
     }
 

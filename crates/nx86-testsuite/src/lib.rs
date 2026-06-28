@@ -165,6 +165,75 @@ pub struct MemoryDiff {
     pub actual: Vec<u8>,
 }
 
+/// A synthetic, clean-room shader used to exercise the Phase 49 shader
+/// translation/cache path. The `stage` is a free-form string (parsed into
+/// `nx86-shader`'s `ShaderStage` at the boundary, exactly as `entry_point` is
+/// parsed for synthetic ARM64 tests), so this crate stays free of a shader-model
+/// dependency. The source is opaque hex bytes; the legal boundary forbids real
+/// game shaders, so these are placeholder inputs only.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct SyntheticShader {
+    pub metadata: SyntheticShaderMetadata,
+    pub source: SyntheticShaderSource,
+}
+
+impl SyntheticShader {
+    pub fn parse(source: &str) -> Result<Self, SyntheticTestError> {
+        let mut shader: Self = toml::from_str(source).map_err(SyntheticTestError::Toml)?;
+        shader.source.bytes = decode_hex(&shader.source.source_hex)?;
+        Ok(shader)
+    }
+
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, SyntheticTestError> {
+        let path = path.as_ref();
+        let source = fs::read_to_string(path).map_err(|source| SyntheticTestError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Self::parse(&source)
+    }
+
+    /// A built-in sample shader for the worker/GUI demonstration paths.
+    #[must_use]
+    pub fn sample() -> Self {
+        // `bytes` and `source-hex` are kept consistent by construction (and
+        // pinned by `synthetic_shader_sample_decodes_its_source`), so no fallible
+        // hex decode is needed here.
+        Self {
+            metadata: SyntheticShaderMetadata {
+                name: "sample triangle vertex".to_owned(),
+                description: "synthetic placeholder vertex shader".to_owned(),
+                stage: "vertex".to_owned(),
+                entry: "main".to_owned(),
+            },
+            source: SyntheticShaderSource {
+                source_hex: "766f6964206d61696e2829207b7d".to_owned(),
+                bytes: b"void main() {}".to_vec(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct SyntheticShaderMetadata {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub stage: String,
+    #[serde(default)]
+    pub entry: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct SyntheticShaderSource {
+    pub source_hex: String,
+    #[serde(skip)]
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Debug, Error)]
 pub enum SyntheticTestError {
     #[error("failed to read synthetic test {path}: {source}")]
@@ -288,6 +357,31 @@ mod tests {
         assert_eq!(framebuffer.height, 2);
         assert_eq!(framebuffer.byte_len(), 4 * 2 * 4);
         assert_eq!(framebuffer.format, super::FramebufferFormat::Rgba8);
+    }
+
+    #[test]
+    fn synthetic_shader_parses_stage_and_decodes_hex_source() {
+        let source = r#"
+            [metadata]
+            name = "demo fragment"
+            stage = "fragment"
+            entry = "main"
+
+            [source]
+            source-hex = "00 11 22 33"
+        "#;
+
+        let shader = super::SyntheticShader::parse(source).expect("shader should parse");
+        assert_eq!(shader.metadata.stage, "fragment");
+        assert_eq!(shader.metadata.entry, "main");
+        assert_eq!(shader.source.bytes, vec![0x00, 0x11, 0x22, 0x33]);
+    }
+
+    #[test]
+    fn synthetic_shader_sample_decodes_its_source() {
+        let shader = super::SyntheticShader::sample();
+        assert_eq!(shader.metadata.stage, "vertex");
+        assert_eq!(shader.source.bytes, b"void main() {}");
     }
 
     #[test]

@@ -19,6 +19,9 @@ nx86-core = { path = "../nx86-core" }
 nx86-debug = { path = "../nx86-debug" }
 nx86-gpu = { path = "../nx86-gpu" }
 nx86-gui = { path = "../nx86-gui", default-features = false }
+nx86-shader = { path = "../nx86-shader" }
+nx86-testsuite = { path = "../nx86-testsuite" }
+tempfile.workspace = true
 tracing.workspace = true
 
 [lints]

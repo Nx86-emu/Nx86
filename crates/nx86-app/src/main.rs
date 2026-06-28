@@ -159,6 +159,13 @@ fn run_worker(worker: WorkerMode) -> Result<(), Box<dyn std::error::Error>> {
         emit_event(&IpcEvent::Log(render_demo_report()))?;
     }
 
+    // The initial compile pipeline compiles shaders where possible (SPEC §14.1).
+    // Phase 49 exercises that as a skeleton: translate a synthetic shader to a
+    // placeholder and cache it, reporting the result over the JSON-line IPC.
+    if matches!(kind, WorkerKind::CompilerSmoke) {
+        emit_event(&IpcEvent::Log(shader_compile_report()))?;
+    }
+
     emit_event(&IpcEvent::Completed(CompletedEvent {
         job_id: kind.label().to_owned(),
         success: true,
@@ -186,6 +193,35 @@ fn render_demo_report() -> LogEvent {
             renderer.backend().label(),
         ),
     }
+}
+
+/// Translate + cache a synthetic shader to a placeholder and summarize it as a
+/// log event (Phase 49). Caches into a temporary directory because the smoke
+/// worker has no title context; failures degrade to a status string rather than
+/// aborting the worker.
+fn shader_compile_report() -> LogEvent {
+    let message = compile_sample_shader()
+        .unwrap_or_else(|error| format!("shader compile/cache failed: {error}"));
+    LogEvent {
+        level: LogLevel::Info,
+        message,
+    }
+}
+
+fn compile_sample_shader() -> Result<String, Box<dyn std::error::Error>> {
+    let shader = nx86_testsuite::SyntheticShader::sample();
+    let stage: nx86_shader::ShaderStage = shader.metadata.stage.parse()?;
+    let translated = nx86_shader::translate(stage, &shader.source.bytes, &shader.metadata.entry);
+
+    let dir = tempfile::tempdir()?;
+    let cache = nx86_shader::ShaderCache::open(dir.path())?;
+    let entry = cache.insert(&translated.to_object())?;
+    let status = cache.full_check(translated.metadata.source_hash)?;
+
+    Ok(format!(
+        "compiled {stage} shader '{}' to {:?} placeholder, cached {} ({} bytes, check={:?})",
+        shader.metadata.name, translated.metadata.status, entry.file_name, entry.size_bytes, status,
+    ))
 }
 
 fn emit_event(event: &IpcEvent) -> Result<(), Box<dyn std::error::Error>> {
