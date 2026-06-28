@@ -8,9 +8,13 @@
 //! `cache/shaders/` folder.
 //!
 //! It is pure logic plus `std` file I/O, so it is host-independent and fully
-//! testable on the dev host. Phase 49 does **not** wire shader readiness into
-//! Native Coverage; that is Phase 50.
+//! testable on the dev host. Phase 50 adds the [`compile_shaders`] batch pass
+//! that compiles a whole shader set during initial compile and reports
+//! **shader readiness**;
+//! that readiness is folded into Native Coverage by `nx86-core`'s coverage
+//! combiner.
 
+mod aot;
 mod cache;
 mod object;
 
@@ -19,6 +23,10 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+pub use aot::{
+    ShaderAotInput, ShaderAotReport, ShaderHint, ShaderProfileHints, cached_readiness_bps,
+    compile_shaders,
+};
 pub use cache::{
     SHADER_MANIFEST_FILE, ShaderCache, ShaderCacheEntry, ShaderCacheError, ShaderCacheManifest,
     ShaderCacheStatus, ShaderCheckOutcome,

@@ -197,19 +197,60 @@ impl SyntheticShader {
     /// A built-in sample shader for the worker/GUI demonstration paths.
     #[must_use]
     pub fn sample() -> Self {
-        // `bytes` and `source-hex` are kept consistent by construction (and
-        // pinned by `synthetic_shader_sample_decodes_its_source`), so no fallible
-        // hex decode is needed here.
+        Self::synthetic(
+            "sample triangle vertex",
+            "synthetic placeholder vertex shader",
+            "vertex",
+            "main",
+            b"void main() {}",
+        )
+    }
+
+    /// A small clean-room set of placeholder shaders spanning every stage, for
+    /// the Phase 50 batch shader-AOT demonstration. The bytes are opaque
+    /// stand-ins (no real game shaders); each has a distinct source so they hash
+    /// and cache to distinct `.nxshader` objects.
+    #[must_use]
+    pub fn sample_set() -> Vec<Self> {
+        vec![
+            Self::synthetic(
+                "sample triangle vertex",
+                "synthetic placeholder vertex shader",
+                "vertex",
+                "main",
+                b"void vert() {}",
+            ),
+            Self::synthetic(
+                "sample solid fragment",
+                "synthetic placeholder fragment shader",
+                "fragment",
+                "main",
+                b"void frag() {}",
+            ),
+            Self::synthetic(
+                "sample reduce compute",
+                "synthetic placeholder compute shader",
+                "compute",
+                "main",
+                b"void comp() {}",
+            ),
+        ]
+    }
+
+    /// Build a synthetic shader from raw placeholder bytes, keeping `bytes` and
+    /// `source-hex` consistent by construction (no fallible hex decode needed).
+    #[must_use]
+    fn synthetic(name: &str, description: &str, stage: &str, entry: &str, source: &[u8]) -> Self {
         Self {
             metadata: SyntheticShaderMetadata {
-                name: "sample triangle vertex".to_owned(),
-                description: "synthetic placeholder vertex shader".to_owned(),
-                stage: "vertex".to_owned(),
-                entry: "main".to_owned(),
+                name: name.to_owned(),
+                description: description.to_owned(),
+                stage: stage.to_owned(),
+                entry: entry.to_owned(),
             },
             source: SyntheticShaderSource {
-                source_hex: "766f6964206d61696e2829207b7d".to_owned(),
-                bytes: b"void main() {}".to_vec(),
+                source_hex: encode_hex(source),
+                bytes: source.to_vec(),
             },
         }
     }
@@ -253,6 +294,16 @@ pub enum SyntheticTestError {
     InvalidEntryPoint { value: String },
     #[error("invalid memory address `{value}`")]
     InvalidMemoryAddress { value: String },
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        // Writing to a String is infallible; the result is discarded.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 fn decode_hex(source: &str) -> Result<Vec<u8>, SyntheticTestError> {
@@ -382,6 +433,31 @@ mod tests {
         let shader = super::SyntheticShader::sample();
         assert_eq!(shader.metadata.stage, "vertex");
         assert_eq!(shader.source.bytes, b"void main() {}");
+        // The encoded hex must round-trip back to the same opaque bytes.
+        assert_eq!(
+            super::decode_hex(&shader.source.source_hex).expect("hex"),
+            shader.source.bytes
+        );
+    }
+
+    #[test]
+    fn synthetic_shader_sample_set_spans_distinct_stages() {
+        let set = super::SyntheticShader::sample_set();
+        assert_eq!(set.len(), 3);
+        let stages: Vec<&str> = set.iter().map(|s| s.metadata.stage.as_str()).collect();
+        assert_eq!(stages, ["vertex", "fragment", "compute"]);
+        // Each shader's source-hex round-trips to its opaque bytes, and the
+        // bytes are all distinct so they hash/cache to distinct objects.
+        for shader in &set {
+            assert!(!shader.source.bytes.is_empty());
+            assert_eq!(
+                super::decode_hex(&shader.source.source_hex).expect("hex"),
+                shader.source.bytes
+            );
+        }
+        let unique: std::collections::BTreeSet<&[u8]> =
+            set.iter().map(|s| s.source.bytes.as_slice()).collect();
+        assert_eq!(unique.len(), set.len());
     }
 
     #[test]

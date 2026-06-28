@@ -548,7 +548,7 @@ impl Nx86App {
                 screens::TestAction::PickFile => self.pick_synthetic_test_file(),
                 screens::TestAction::LoadPath => self.load_synthetic_test_from_state(),
                 screens::TestAction::RenderDemoFrame => self.render_demo_frame(),
-                screens::TestAction::CompileSampleShader => self.compile_sample_shader(),
+                screens::TestAction::CompileShaderSet => self.compile_shader_set(),
             },
             AppScreen::Scheduler => match screens::scheduler(ui, &mut self.scheduler_ui) {
                 screens::SchedulerAction::None => {}
@@ -746,34 +746,60 @@ impl Nx86App {
     /// Translate the built-in sample shader to a placeholder and cache it
     /// (Phase 49), surfacing a status line. Caches into the configured shader
     /// cache dir when storage is available, else a temp dir.
-    fn compile_sample_shader(&mut self) {
+    fn compile_shader_set(&mut self) {
         self.test_ui.shader_status = Some(
-            self.try_compile_sample_shader()
-                .unwrap_or_else(|error| format!("shader compile/cache failed: {error}")),
+            self.try_compile_shader_set()
+                .unwrap_or_else(|error| format!("shader AOT failed: {error}")),
         );
     }
 
-    fn try_compile_sample_shader(&self) -> Result<String, Box<dyn std::error::Error>> {
-        let shader = nx86_testsuite::SyntheticShader::sample();
-        let stage: nx86_shader::ShaderStage = shader.metadata.stage.parse()?;
-        let translated =
-            nx86_shader::translate(stage, &shader.source.bytes, &shader.metadata.entry);
+    fn try_compile_shader_set(&self) -> Result<String, Box<dyn std::error::Error>> {
+        // Batch-compile the clean-room sample set, with the first shader hinted
+        // hot so the shared-profile ordering is exercised.
+        let shaders = nx86_testsuite::SyntheticShader::sample_set();
+        let mut inputs = Vec::with_capacity(shaders.len());
+        for shader in &shaders {
+            let stage: nx86_shader::ShaderStage = shader.metadata.stage.parse()?;
+            inputs.push(nx86_shader::ShaderAotInput::new(
+                stage,
+                shader.source.bytes.clone(),
+                shader.metadata.entry.clone(),
+            ));
+        }
+        let hints = match inputs.first() {
+            Some(first) => {
+                nx86_shader::ShaderProfileHints::from_entries(vec![nx86_shader::ShaderHint {
+                    source_hash: first.source_hash(),
+                    stage: first.stage,
+                    hot: true,
+                }])
+            }
+            None => nx86_shader::ShaderProfileHints::new(),
+        };
 
         // A stable demo cache dir keyed by process id avoids cross-run clashes
         // without needing a title context for this skeleton demonstration.
         let dir = std::env::temp_dir().join(format!("nx86-shader-demo-{}", std::process::id()));
         let cache = nx86_shader::ShaderCache::open(dir)?;
-        let entry = cache.insert(&translated.to_object())?;
-        let check = cache.full_check(translated.metadata.source_hash)?;
-        let cached = cache.scan()?.object_count();
+        let report = nx86_shader::compile_shaders(&inputs, &hints, &cache)?;
+
+        // Fold shader readiness into Native Coverage. A fully CPU-ready title is
+        // assumed so the headline is gated purely by the shader axis (min-gate).
+        let coverage = nx86_core::coverage::NativeCoverage::new(
+            nx86_core::coverage::COVERAGE_FULL_BPS,
+            report.readiness_bps,
+        );
 
         Ok(format!(
-            "{stage} '{}' -> {:?}, cached {} ({} B, check={:?}, {cached} object(s))",
-            shader.metadata.name,
-            translated.metadata.status,
-            entry.file_name,
-            entry.size_bytes,
-            check,
+            "compiled {}/{} shaders (readiness {:.2}%, hot {}/{}); \
+             Native Coverage {:.2}% [{}] (CPU 100% assumed)",
+            report.cached_ok,
+            report.total,
+            report.readiness_percent(),
+            report.hot_cached_ok,
+            report.hot_total,
+            coverage.combined_percent(),
+            coverage.band().label(),
         ))
     }
 
@@ -1079,22 +1105,24 @@ mod tests {
     }
 
     #[test]
-    fn compile_sample_shader_populates_shader_status() {
+    fn compile_shader_set_populates_shader_status() {
         let mut app = Nx86App::new_for_test(AppConfig::default());
-        app.compile_sample_shader();
+        app.compile_shader_set();
 
         let status = app
             .test_ui
             .shader_status
             .as_deref()
-            .expect("shader compile should set a status line");
+            .expect("shader AOT should set a status line");
+        // The whole sample set compiles, so readiness is full and — with a
+        // fully CPU-ready title assumed — the gated Native Coverage is Perfect.
         assert!(
-            status.contains("vertex") && status.contains("Placeholder"),
-            "status should describe the translated placeholder: {status}"
+            status.contains("compiled 3/3 shaders"),
+            "status should report the batch result: {status}"
         );
         assert!(
-            status.contains("check=Ok"),
-            "the cached shader should pass its integrity check: {status}"
+            status.contains("readiness 100.00%") && status.contains("Perfect"),
+            "full shader readiness should gate coverage to Perfect: {status}"
         );
     }
 

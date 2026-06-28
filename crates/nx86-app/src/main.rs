@@ -135,6 +135,14 @@ fn run_worker(worker: WorkerMode) -> Result<(), Box<dyn std::error::Error>> {
 
     for (index, phase) in phases.iter().enumerate() {
         let percent = (index as f32 / (phases.len().saturating_sub(1) as f32)) * 100.0;
+        // Shaders lag CPU compilation early in the run; the min-gated headline
+        // (Phase 50) is therefore gated by the shader axis until it catches up.
+        let cpu_functional = percent.min(100.0);
+        let shader_readiness = (percent * 0.8).min(100.0);
+        let coverage = nx86_core::coverage::NativeCoverage::new(
+            (cpu_functional * 100.0) as u16,
+            (shader_readiness * 100.0) as u16,
+        );
         emit_event(&IpcEvent::Progress(CompileProgress {
             title_id: None,
             phase: (*phase).to_owned(),
@@ -142,11 +150,15 @@ fn run_worker(worker: WorkerMode) -> Result<(), Box<dyn std::error::Error>> {
             current_module: Some("smoke".to_owned()),
             functions_discovered: (index as u64) * 8,
             functions_compiled: (index as u64) * 5,
-            native_coverage_estimate: percent.min(100.0),
+            native_coverage_estimate: coverage.combined_percent(),
             native_coverage_static: (percent * 0.9).min(100.0),
             native_coverage_executed: percent.min(100.0),
             fastmem_coverage: (100.0 - (index as f32 * 3.0)).max(0.0),
             slowmem_penalty: (index as f32 * 3.0).min(100.0),
+            // Report the bps-derived shader axis (not the raw `shader_readiness`
+            // local) so it is consistent with the bps-truncated headline; this
+            // keeps the GUI's "gated by" comparison exact.
+            shader_readiness: coverage.shader_readiness_percent(),
             cache_size_bytes: (index as u64) * 4096,
         }))?;
         thread::sleep(Duration::from_millis(120));
@@ -195,32 +207,74 @@ fn render_demo_report() -> LogEvent {
     }
 }
 
-/// Translate + cache a synthetic shader to a placeholder and summarize it as a
-/// log event (Phase 49). Caches into a temporary directory because the smoke
-/// worker has no title context; failures degrade to a status string rather than
-/// aborting the worker.
+/// Batch-compile a title's shader set during initial compile and summarize how
+/// shader readiness gates Native Coverage (Phase 50). Caches into a temporary
+/// directory because the smoke worker has no title context; failures degrade to
+/// a status string rather than aborting the worker.
 fn shader_compile_report() -> LogEvent {
-    let message = compile_sample_shader()
-        .unwrap_or_else(|error| format!("shader compile/cache failed: {error}"));
+    let message =
+        compile_shader_set().unwrap_or_else(|error| format!("shader AOT failed: {error}"));
     LogEvent {
         level: LogLevel::Info,
         message,
     }
 }
 
-fn compile_sample_shader() -> Result<String, Box<dyn std::error::Error>> {
-    let shader = nx86_testsuite::SyntheticShader::sample();
-    let stage: nx86_shader::ShaderStage = shader.metadata.stage.parse()?;
-    let translated = nx86_shader::translate(stage, &shader.source.bytes, &shader.metadata.entry);
+fn compile_shader_set() -> Result<String, Box<dyn std::error::Error>> {
+    use nx86_core::coverage::{COVERAGE_FULL_BPS, NativeCoverage};
+
+    // Build the AOT input set from the clean-room sample shaders, hinting the
+    // first one hot so the shared-profile ordering is exercised.
+    let shaders = nx86_testsuite::SyntheticShader::sample_set();
+    let mut inputs = Vec::with_capacity(shaders.len());
+    for shader in &shaders {
+        let stage: nx86_shader::ShaderStage = shader.metadata.stage.parse()?;
+        inputs.push(nx86_shader::ShaderAotInput::new(
+            stage,
+            shader.source.bytes.clone(),
+            shader.metadata.entry.clone(),
+        ));
+    }
+    let hints = match inputs.first() {
+        Some(first) => {
+            nx86_shader::ShaderProfileHints::from_entries(vec![nx86_shader::ShaderHint {
+                source_hash: first.source_hash(),
+                stage: first.stage,
+                hot: true,
+            }])
+        }
+        None => nx86_shader::ShaderProfileHints::new(),
+    };
+    let known: Vec<nx86_shader::ShaderHash> =
+        inputs.iter().map(|input| input.source_hash()).collect();
 
     let dir = tempfile::tempdir()?;
     let cache = nx86_shader::ShaderCache::open(dir.path())?;
-    let entry = cache.insert(&translated.to_object())?;
-    let status = cache.full_check(translated.metadata.source_hash)?;
+
+    // Assume a fully CPU-ready title so the headline is gated purely by the
+    // shader axis (min-gate), making the shader contribution visible.
+    let cpu_bps = COVERAGE_FULL_BPS;
+
+    // Before the AOT pass, no shaders are cached: readiness 0% gates the
+    // combined Native Coverage to 0% even though the CPU axis is full.
+    let before_bps = nx86_shader::cached_readiness_bps(&cache, &known)?;
+    let before = NativeCoverage::new(cpu_bps, before_bps);
+
+    let report = nx86_shader::compile_shaders(&inputs, &hints, &cache)?;
+    let after = NativeCoverage::new(cpu_bps, report.readiness_bps);
 
     Ok(format!(
-        "compiled {stage} shader '{}' to {:?} placeholder, cached {} ({} bytes, check={:?})",
-        shader.metadata.name, translated.metadata.status, entry.file_name, entry.size_bytes, status,
+        "shader AOT: compiled {}/{} shaders (readiness {:.2}%, hot {}/{}); \
+         Native Coverage {:.2}% [{}] -> {:.2}% [{}] (CPU 100% assumed)",
+        report.cached_ok,
+        report.total,
+        report.readiness_percent(),
+        report.hot_cached_ok,
+        report.hot_total,
+        before.combined_percent(),
+        before.band().label(),
+        after.combined_percent(),
+        after.band().label(),
     ))
 }
 

@@ -25,7 +25,7 @@ motion/rumble, or Switch rendering.
 
 - `nx86-app`: binary entrypoint, logging setup, config load, GUI launch.
 - `nx86-gui`: egui shell, wizard, theme, navigation, title list, worker progress, synthetic test display, decode display, tiny interpreter status, framebuffer rendering, NxIR/native dump agreement, Inspector views, input settings/status, and audio backend status.
-- `nx86-core`: shared config, storage layout, IPC model, guest CPU state, flag (NZCV) and condition-code semantics, Linux XDG-backed persistence, input config, and the experimental native-patch-chaining preference.
+- `nx86-core`: shared config, storage layout, IPC model, guest CPU state, flag (NZCV) and condition-code semantics, Linux XDG-backed persistence, input config, the experimental native-patch-chaining preference, and the combined Native Coverage model (`coverage::NativeCoverage` min-gate + §15.4 bands).
 - `nx86-title-db`: SQLite title database, deterministic title folder creation, TOML sidecars, synthetic-program title content for the Inspector, and homebrew module content persistence.
 - `nx86-import`: simple `.nxhb.toml` homebrew descriptor parsing, validation, and guest-memory mapping.
 - `nx86-arm64-decode`: narrow decoder for MOV/ADD/SUB/logical/loads/stores/B/B.cond/ADDS/SUBS/SVC.
@@ -67,10 +67,13 @@ motion/rumble, or Switch rendering.
   device when present, else a deterministic CPU test-card fallback, and yields
   the shared `nx86_testsuite::Framebuffer` RGBA8 bytes for the GUI framebuffer
   view.
-- `nx86-shader`: shader translation skeleton — `ShaderStage`/`ShaderMetadata`
-  model, FNV-1a `ShaderHash`, a deterministic placeholder `translate` path, the
+- `nx86-shader`: shader model + AOT — `ShaderStage`/`ShaderMetadata` model,
+  FNV-1a `ShaderHash`, a deterministic placeholder `translate` path, the
   integrity-checked `.nxshader` object container, and a `ShaderCache` (mirroring
-  `nx86-cache`) over a title's `cache/shaders/` folder. No real SPIR-V/GPU yet.
+  `nx86-cache`) over a title's `cache/shaders/` folder. Phase 50 adds the
+  `compile_shaders` batch AOT pass with `ShaderProfileHints` (hot-first ordering)
+  and shader-readiness reporting that folds into Native Coverage. No real
+  SPIR-V/GPU yet.
 
 ## Skeleton Crates
 

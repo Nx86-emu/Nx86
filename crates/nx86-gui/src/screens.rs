@@ -99,7 +99,8 @@ pub struct TestUiState {
     /// Backend label from the last Phase 48 demo render (Vulkan device or the
     /// software fallback reason), shown next to the render control.
     pub renderer_backend: Option<String>,
-    /// Status line from the last Phase 49 sample-shader translate/cache action.
+    /// Status line from the last Phase 50 batch shader-AOT action (readiness +
+    /// gated Native Coverage).
     pub shader_status: Option<String>,
     /// Whether NxIR evaluation agreed with the interpreter, as a status line.
     pub nxir_status: Option<String>,
@@ -117,7 +118,7 @@ pub enum TestAction {
     PickFile,
     LoadPath,
     RenderDemoFrame,
-    CompileSampleShader,
+    CompileShaderSet,
 }
 
 pub struct SchedulerUiState {
@@ -397,6 +398,7 @@ pub fn compile(ui: &mut egui::Ui, state: &mut CompileUiState) -> CompileAction {
         native_coverage_executed: 0.0,
         fastmem_coverage: 0.0,
         slowmem_penalty: 0.0,
+        shader_readiness: 0.0,
         cache_size_bytes: 0,
     });
 
@@ -446,6 +448,25 @@ pub fn compile(ui: &mut egui::Ui, state: &mut CompileUiState) -> CompileAction {
         );
     });
 
+    ui.columns(2, |columns| {
+        metric(
+            &mut columns[0],
+            "Shader readiness",
+            &format!("{:.2}%", progress.shader_readiness),
+        );
+        // The headline Native Coverage is min-gated by shader readiness
+        // (SPEC §15.5); surface the gating axis for clarity.
+        metric(
+            &mut columns[1],
+            "Coverage gated by",
+            if progress.shader_readiness <= progress.native_coverage_estimate {
+                "shaders"
+            } else {
+                "CPU"
+            },
+        );
+    });
+
     ui.add_space(18.0);
     ui.separator();
     ui.add_space(12.0);
@@ -489,9 +510,9 @@ pub fn tests(ui: &mut egui::Ui, state: &mut TestUiState) -> TestAction {
     });
 
     ui.add_space(8.0);
-    ui.strong("Shaders (Phase 49)");
-    if ui.button("Translate & cache sample shader").clicked() {
-        action = TestAction::CompileSampleShader;
+    ui.strong("Shaders (Phase 50)");
+    if ui.button("Compile & cache shader set").clicked() {
+        action = TestAction::CompileShaderSet;
     }
     if let Some(status) = &state.shader_status {
         ui.monospace(status);

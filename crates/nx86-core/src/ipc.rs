@@ -73,6 +73,10 @@ pub struct CompileProgress {
     pub fastmem_coverage: f32,
     #[serde(default)]
     pub slowmem_penalty: f32,
+    /// Shader readiness percentage (SPEC §15.2 category 3), folded into
+    /// `native_coverage_estimate` via the min-gate in [`crate::coverage`].
+    #[serde(default)]
+    pub shader_readiness: f32,
     pub cache_size_bytes: u64,
 }
 
@@ -174,6 +178,7 @@ mod tests {
             native_coverage_executed: 20.0,
             fastmem_coverage: 90.0,
             slowmem_penalty: 10.0,
+            shader_readiness: 60.0,
             cache_size_bytes: 4096,
         });
 
